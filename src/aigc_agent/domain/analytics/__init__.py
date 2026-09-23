@@ -248,7 +248,8 @@ class Reviewer:
 class Feedback:
     """复盘 → 账号层记忆（DATA 来源）。同一个包只提炼一次（按 origin_ref 去重）。"""
 
-    def __init__(self, memories: MemoryStore, min_samples: int = 3) -> None:
+    # 样本门槛：之前 3 个样本就提炼进账号层 —— 一条偶然爆款就能改写账号偏好（2026-09-23 审查）
+    def __init__(self, memories: MemoryStore, min_samples: int = 8) -> None:
         self.memories = memories
         self.min_samples = min_samples
 
@@ -285,7 +286,8 @@ class Feedback:
                 ],
                 origin_ref=ref,
                 source=Source.DATA,  # 数据验证过的才能进账号层
-                confidence=0.8,
+                # 样本越多越可信；单条作品的强弱只是一条建议（PREFERENCE），不是禁令
+                confidence=min(0.8, 0.3 + 0.04 * review.samples),
                 weight=1.5 if p.verdict == "strong" else 1.0,
             )
             self.memories.put(mem)

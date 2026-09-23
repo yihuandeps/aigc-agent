@@ -139,20 +139,36 @@ def test_空库出空简报():
 def test_近似重复只留一条():
     """按批提取常把同一句话记成措辞略有出入的两条，简报里不该各占一行。"""
     s = MemoryStore()
+    human = Source.HUMAN  # 避雷只收人说的（推测的只进建议，见下一条）
     s.put(_mem("科技短视频开头不要写成硬广式的震惊腔调，用户明确讨厌这种风格", ["硬广"],
-               polarity=Polarity.NEGATIVE))
-    s.put(_mem("科技短视频开头不要写成硬广式震惊腔调", ["硬广"], polarity=Polarity.NEGATIVE))
-    s.put(_mem("结尾不要喊口号", ["口号"], polarity=Polarity.NEGATIVE))
+               polarity=Polarity.NEGATIVE, source=human))
+    s.put(_mem("科技短视频开头不要写成硬广式震惊腔调", ["硬广"], polarity=Polarity.NEGATIVE,
+               source=human))
+    s.put(_mem("结尾不要喊口号", ["口号"], polarity=Polarity.NEGATIVE, source=human))
     b = build_brief(s, "p1")
     assert len(b.must_not) == 2
     assert any("口号" in x for x in b.must_not)
 
 
+def test_推测出来的避雷只进建议():
+    """2026-09-23 审查：「需逐镜 gen_video 传 image_urls（推测）」进了 must_not，每轮 pin 着，
+    和「镜头只能走 drama_render_shots」正面冲突。"""
+    s = MemoryStore()
+    s.put(_mem("不要用 drama_render_shots，要逐镜 gen_video", ["渲染"],
+               polarity=Polarity.NEGATIVE))
+    s.put(_mem("开头不要太平", ["开头"], polarity=Polarity.NEGATIVE, source=Source.HUMAN))
+    b = build_brief(s, "p1")
+    assert b.must_not == ["开头不要太平"]
+    assert any(x.startswith("避免：") and "（推测）" in x for x in b.should)
+    assert "drama_render_shots" not in b.pin_text(), "推测的不 pin"
+
+
 def test_标点与修饰不同仍算同一条():
     s = MemoryStore()
     s.put(_mem("科技短视频文案开头不要写成硬广式的“震惊！”腔调，用户明确讨厌这种风格", ["硬广"],
-               polarity=Polarity.NEGATIVE))
-    s.put(_mem('科技短视频开头不要写成硬广式"震惊！"腔调', ["硬广"], polarity=Polarity.NEGATIVE))
+               polarity=Polarity.NEGATIVE, source=Source.HUMAN))
+    s.put(_mem('科技短视频开头不要写成硬广式"震惊！"腔调', ["硬广"], polarity=Polarity.NEGATIVE,
+               source=Source.HUMAN))
     assert len(build_brief(s, "p1").must_not) == 1
 
 

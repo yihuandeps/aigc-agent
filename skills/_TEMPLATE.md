@@ -2,7 +2,7 @@
 name: your-skill-name
 description: 一句话说清「什么情况下该用它」，20-40字。这是唯一影响是否被选中的字段，重点打磨。
 scope: content_type          # global | content_type | pipeline_stage | account
-applies_to: []               # 短视频 | 图文 | 文案 | 图像
+applies_to: []               # 短剧 | 抖音 | 广告 | 短视频（=前三者）| 图文 | 文案 | 图像
 stage: []                    # 选题 | 策划 | 脚本 | 分镜 | 正文 | 配图 | 排版 | 审核
 priority: 50                 # 0-100，冲突时数字大的优先
 version: 0.1.0

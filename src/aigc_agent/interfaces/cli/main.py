@@ -966,12 +966,26 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                 for m in agent.registry.catalog():
                     console.print(f"  [dim]{m.permission.value:12}[/] {m.name} — {m.summary}")
                 continue
+            if text in ("/brief full", "/brief 整理"):
+                # 完整模式：规则版简报再交给子代理合并重复、标出矛盾（花一次模型调用）
+                if agent.mem_agent is None:
+                    console.print("[dim]没有装配记忆代理[/]")
+                    continue
+                with board.running():
+                    b = await agent.mem_agent.consolidate()
+                if b.empty:
+                    console.print("[dim]简报为空[/]")
+                else:
+                    console.print(Panel(Text(b.render()), title="Memory Brief（整理后）",
+                                        border_style="magenta"))
+                continue
             if text == "/brief":
                 b = agent.mem_agent.brief() if agent.mem_agent else None
                 if b is None or b.empty:
                     console.print("[dim]简报为空：没有约束、打回记录或偏好[/]")
                 else:
-                    console.print(Panel(b.render(), title="Memory Brief", border_style="magenta"))
+                    console.print(Panel(Text(b.render()), title="Memory Brief",
+                                        border_style="magenta"))
                 continue
             if text == "/skills":
                 if agent.allocator is None:

@@ -18,6 +18,7 @@ mark_published() 把链接记回来，M17 的数据回流靠这条链接对上�
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import time
@@ -27,7 +28,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from ..assets.store import Asset, AssetStore, AssetType
+from ..assets.store import Asset, AssetStore, AssetType, local_copy
 from ..compliance import ComplianceReport, report_to_params
 
 
@@ -199,24 +200,43 @@ class Packager:
         (folder / "content.md").write_text(content, encoding="utf-8")
         files["content"] = "content.md"
 
+        generated = _is_generated(content_asset) or any(_is_generated(a) for a in media)
+        generators = sorted(
+            {a.creator for a in [content_asset, *media] if a.creator.startswith("model:")}
+        )
+        mark = json.dumps(
+            {"AIGC": generated, "producer": "aigc-agent", "content_asset": content_asset_id,
+             "generators": generators},
+            ensure_ascii=False,
+        )
+
         media_dir = folder / "media"
         media_refs: list[str] = []
         for a in media:
+            # 本地副本优先（产物目录 / Agent 自留的 blobs）：生成媒体的 uri 多是会过期的链接，
+            # 之前只看 uri，本地成片根本没进包（2026-09-23 审查）
+            src = local_copy(a)
             uri = a.uri or ""
-            if uri and not uri.startswith(("http://", "https://")) and Path(uri).exists():
+            if src is not None:
                 media_dir.mkdir(exist_ok=True)
-                dest = media_dir / f"{a.id}{Path(uri).suffix}"
-                shutil.copy2(uri, dest)
+                dest = media_dir / f"{a.id}{src.suffix}"
+                # 隐式标识写进文件本身：之前只在 manifest.json 里，实际上传的 mp4 不带
+                if not (generated and _embed_mark(src, dest, mark)):
+                    shutil.copy2(src, dest)
+                    if generated and dest.suffix.lower() in (".mp4", ".png", ".jpg", ".jpeg"):
+                        issues.append(
+                            f"[info] 没能把 AIGC 隐式标识写进 {dest.name}（已记在 manifest）"
+                        )
                 files[a.id] = f"media/{dest.name}"
                 media_refs.append(f"{a.id} → media/{dest.name}")
             else:
                 files[a.id] = uri
                 media_refs.append(f"{a.id} → {uri or '（无文件）'}")
-
-        generated = _is_generated(content_asset) or any(_is_generated(a) for a in media)
-        generators = sorted(
-            {a.creator for a in [content_asset, *media] if a.creator.startswith("model:")}
-        )
+                if uri.startswith(("http://", "https://")):
+                    issues.append(
+                        f"[warn] {a.id} 只有远端链接（约 24 小时过期），包里没有文件"
+                        " —— 先下载到本地"
+                    )
         aigc = {
             "generated": generated,
             "generators": generators,
@@ -301,6 +321,37 @@ class Packager:
             if a.gen_params.get("manifest"):
                 out.append((a, self.manifest_of(a)))
         return out
+
+
+def _embed_mark(src: Path, dest: Path, mark: str) -> bool:
+    """把 AIGC 隐式标识写进文件元数据，写成功返回 True（dest 已生成）。
+    mp4：ffmpeg 流拷贝加 comment；png：文本块；jpg：注释段。其余格式不处理。"""
+    suffix = src.suffix.lower()
+    try:
+        if suffix in (".mp4", ".mov", ".m4v"):
+            import subprocess
+
+            r = subprocess.run(  # noqa: S603, S607 — 固定命令
+                ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-map", "0", "-c", "copy",
+                 "-metadata", f"comment={mark}", "-metadata", "description=AIGC", str(dest)],
+                capture_output=True, timeout=180,
+            )
+            return r.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+        if suffix in (".png", ".jpg", ".jpeg"):
+            from PIL import Image, PngImagePlugin
+
+            with Image.open(src) as img:
+                if suffix == ".png":
+                    info = PngImagePlugin.PngInfo()
+                    info.add_text("AIGC", mark)
+                    img.save(dest, pnginfo=info)
+                else:
+                    img.save(dest, quality=95, comment=mark.encode("utf-8"))
+            return dest.exists()
+    except Exception:  # noqa: BLE001 — 写不进去就退回原样拷贝，manifest 里仍有记录
+        dest.unlink(missing_ok=True)
+        return False
+    return False
 
 
 def _kind_of(media: list[Asset]) -> str:

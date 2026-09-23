@@ -29,6 +29,27 @@ from .store import Category, Layer, Memory, MemoryStore, Polarity, Source
 
 _ASSET_RE = re.compile(r"\bas_[0-9a-f]{10}\b")
 INFERRED_TAG = "（推测）"
+# 一次性的事实：报错码、余额、限流 —— 过两天就不成立了（「seedance 402 余额不足」之前永久生效）
+_ERROR_FACT = re.compile(r"(?<!\d)(40[0-9]|42[0-9]|5\d\d)(?!\d)|余额不足|额度用尽|限流|宕机|超时")
+ERROR_TTL = 2 * 86400
+ASSET_TTL = 14 * 86400  # 指着具体资产 id 的推测：资产会被替代，两周后多半过期
+
+
+def transient_ttl(content: str) -> float | None:
+    """这条记忆多久后作废（秒）。不是一次性事实返回 None。"""
+    if _ERROR_FACT.search(content or ""):
+        return ERROR_TTL
+    if _ASSET_RE.search(content or ""):
+        return ASSET_TTL
+    return None
+
+
+def _stale(m: Memory, now: float) -> bool:
+    """老数据没设 valid_until 的：推测来源的一次性事实按创建时间算过期。人说的不动。"""
+    if m.source is not Source.INFERRED or m.valid_until is not None:
+        return False
+    ttl = transient_ttl(m.content)
+    return ttl is not None and now - m.created_at > ttl
 
 
 _PUNCT = re.compile(r"[\s“”\"'‘’「」『』（）()《》【】\[\]！!？?，,。.、；;：:…—\-]+")
@@ -130,7 +151,7 @@ def build_brief(
     pool = [
         m
         for m in store.all()
-        if m.layer is Layer.ACCOUNT or m.project_id in ("", project_id)
+        if (m.layer is Layer.ACCOUNT or m.project_id in ("", project_id)) and not _stale(m, now)
     ]
     if not pool:
         return MemoryBrief()
@@ -177,7 +198,13 @@ def build_brief(
                 refs.append(aid)
 
         if neg:
-            must_not.append((m, text))
+            # 避雷只认人说的（打回理由）和数据验证过的。推测出来的「别这么做」只当建议 ——
+            # 2026-09-23 审查：「需逐镜 gen_video 传 image_urls（推测）」进了 must_not，
+            # 和「镜头只能走 drama_render_shots」正面冲突，每轮 pin 着误导模型
+            if m.source in (Source.HUMAN, Source.DATA):
+                must_not.append((m, text))
+            elif relevant is None or m.id in relevant:
+                should.append((m, "避免：" + text))
         elif Category.CONSTRAINT in cats:
             # 硬约束只认人说的和数据验证过的；推测出的只能当建议 —— 推测不得晋升
             if m.source in (Source.HUMAN, Source.DATA):

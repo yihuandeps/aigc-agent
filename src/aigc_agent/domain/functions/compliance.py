@@ -39,13 +39,16 @@ def run_check(
     target = assets.get(asset_id)
     content = assets.content(asset_id)
     media_rights = [(mid, rights_of(assets.get(mid))) for mid in (media_asset_ids or [])]
+    # 整集剧本按剧本审：多数整集是 save_draft(kind="outline") 存的，按存储类型会被当成广告
+    # 文案查极限词 —— 库里约 100 份「第N集·合规修订版」台词被按广告法改写（2026-09-23 审查）
+    asset_type = "script" if AssetStore._looks_like_script(target) else target.type.value
     report = checker.check(
         content,
         platform=platform,
         generated=rights_of(target) == "generated",
         media_rights=media_rights,
         asset_id=asset_id,
-        asset_type=target.type.value,
+        asset_type=asset_type,
     )
     c = report.counts()
     verdict = "通过" if report.passed else f"block {c['block']}"

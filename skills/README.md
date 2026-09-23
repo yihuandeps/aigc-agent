@@ -69,7 +69,11 @@ Skill Hub 采用**两级披露**：
 ## 命名与组织
 
 - 文件名 = `name` + `.md`，kebab-case，用英文（便于引用），中文写在正文里
-- 平铺存放，不建子目录 —— Skill Hub 靠 frontmatter 的 `scope`/`applies_to`/`stage` 做筛选，不靠目录结构
+- 一般平铺存放（`name.md`）；大型多阶段的 skill 用目录形态 `name/SKILL.md` + `name/references/*.md`
+  （主文档讲流程、参考文档讲细节、按需拉，见 drama-script / seedance-prompting）。
+  筛选只看 frontmatter 的 `scope`/`applies_to`/`stage`，不看目录结构
+- `applies_to` 的词：短剧 / 抖音 / 广告（这三个都属于「短视频」，写 `短视频` 就三条视频产线都生效）/
+  图文 / 文案 / 图像
 - 以 `_` 开头的文件不会被加载（如 `_TEMPLATE.md`）
 
 ---

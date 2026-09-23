@@ -236,6 +236,8 @@ class MemoryStore:
         for m in picked:
             m.hit_count += 1
             m.last_hit_at = now
+            # 落盘：之前只改内存，重启就清零，「哪些记忆真的有用」永远统计不出来
+            self.put(m)
         return picked
 
     def render_brief(self, memories: list[Memory]) -> str:

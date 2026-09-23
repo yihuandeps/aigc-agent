@@ -31,10 +31,11 @@ import asyncio
 import contextlib
 import json
 import re
+import time
 from typing import Any
 
 from ..subagents import SubAgentDef, SubAgentRunner
-from .brief import MemoryBrief, build_brief
+from .brief import MemoryBrief, _similar, build_brief, transient_ttl
 from .store import Category, Keyword, Layer, Memory, MemoryStore, Polarity, Source
 
 EXTRACT_ROLE = "memory_extract"
@@ -100,10 +101,14 @@ def parse_memories(raw: str, origin_ref: str, project_id: str = "") -> list[Memo
         except (TypeError, ValueError):
             conf = 0.6
 
+        ttl = transient_ttl(content)
         out.append(
             Memory(
                 layer=Layer.PROJECT,
                 content=content,
+                # 一次性事实（报错码、余额、某份资产）设过期：之前永久有效，两天前的
+                # 「余额不足」到今天还 pin 着（2026-09-23 审查）
+                valid_until=(time.time() + ttl) if ttl else None,
                 keywords=[
                     Keyword(term=t, polarity=pol, category=cat, origin_quote=quote)
                     for t in dict.fromkeys(terms)
@@ -257,10 +262,24 @@ class MemoryAgent:
             EXTRACT_ROLE, [{"role": "user", "content": extract_prompt(transcript)}]
         )
         mems = parse_memories(resp.text, origin_ref, self.project_id)
+        kept = 0
+        existing = [
+            m for m in self.store.all() if m.project_id in ("", self.project_id)
+        ]
         for m in mems:
+            # 写入去重：同一件事之前记过（措辞略有出入）就不再存一条，给旧的加点分量 ——
+            # 之前每批提取都新存，同一句「开头别写硬广」在简报里出现两三遍
+            dup = next((old for old in existing if _similar(old.content, m.content)), None)
+            if dup is not None:
+                dup.weight = min(3.0, dup.weight + 0.2)
+                dup.hit_count += 1
+                self.store.put(dup)
+                continue
             self.store.put(m)
-        self.extracted += len(mems)
-        return len(mems)
+            existing.append(m)
+            kept += 1
+        self.extracted += kept
+        return kept
 
     async def extract_now(self, transcript: str, origin_ref: str = "") -> int:
         """同步提取，给测试和 CLI 用。主循环不要调这个。"""

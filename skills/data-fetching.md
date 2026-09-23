@@ -1,3 +1,18 @@
+---
+name: data-fetching
+description: 用户给了抖音分享链接或口令却没给完整素材时，按这里把视频、文案、转写、互动数据拿全再分析
+scope: content_type
+applies_to: [抖音]
+stage: [选题]
+priority: 40
+version: 0.1.0
+owner: 运营
+# draft：流程依赖项目外的脚本（~/.claude/skills/... 下的 dy_fetch.py），Agent 读不到那个目录，
+# 加载了只会让模型去跑一个不存在的命令。要启用先把脚本搬进项目，再改成 active。
+# （2026-09-23 审查：之前这篇没有 frontmatter，被静默忽略，没人知道它不生效）
+status: draft
+---
+
 # 数据获取流水线
 
 本文件记录如何从一个抖音分享链接 / 短链 / 口令出发，自动拿到分析所需的全部数据。

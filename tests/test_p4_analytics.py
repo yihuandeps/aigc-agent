@@ -88,7 +88,9 @@ def test_样本不足不判定不提炼():
 
 def test_提炼进账号层记忆且去重():
     store = MetricsStore()
-    for pid, v in (("a", 100), ("b", 100), ("c", 400), ("d", 20)):
+    # 样本门槛是 8（少了一条偶然爆款就改写账号偏好）
+    for pid, v in (("a", 100), ("b", 100), ("c", 400), ("d", 20),
+                   ("e", 100), ("f", 100), ("g", 100), ("h", 100)):
         store.add(_metric(pid, v, title=f"露营{pid}", tags=["露营", "装备"]))
     memories = MemoryStore()
     fb = Feedback(memories)
@@ -129,7 +131,10 @@ async def test_完整闭环_存稿到账号层记忆(tmp_path: Path):
     reg.register(ComplianceFunctions(checker, store, bus))
     reg.register(DistributionFunctions(packager, checker, store, bus))
     reg.register(
-        AnalyticsFunctions(metrics, Reviewer(metrics), Feedback(memories), packager, store, bus)
+        # 这条测闭环的机制，样本门槛放低到 3（默认 8，见 test_提炼进账号层记忆且去重）
+    AnalyticsFunctions(
+        metrics, Reviewer(metrics), Feedback(memories, min_samples=3), packager, store, bus
+    )
     )
     reg.register(RetrievalFunctions(RetrievalHub([AssetSource(store), MemorySource(memories)])))
     await reg.refresh()
