@@ -170,7 +170,9 @@ async def test_只检查不重生成():
     assert "仍有字幕/文字" in r.content
 
 
-async def test_检查做不了只记备注不拦生成():
+async def test_字幕查不成_照常生成但不进成片_等人放行():
+    """2026-09-23 审查：字幕是用户定的最高优先级 —— 查不成（没本地副本 / 抽不出帧 / 判读
+    不出结果）之前只记一句备注就放行，现在算没过：照常生成，不进成片，人看过再 accept。"""
     store = AssetStore()
     fns, reg, _ = _fns(store, {})
 
@@ -179,8 +181,10 @@ async def test_检查做不了只记备注不拦生成():
 
     fns._check_subtitles = cannot  # type: ignore[method-assign]
     r = await fns._fn_drama_render_shots(_shots(store))
-    assert r.ok and len(reg.calls) == 2
-    assert "跳过字幕检查" in r.content and "仍有字幕" not in r.content
+    assert r.ok and len(reg.calls) == 2, "查不成不会反复重生成（重生成也查不成）"
+    assert "字幕没查成" in r.content and "仍有字幕" not in r.content
+    assert "未成片：2 段没过质检门" in r.content and "accept" in r.content
+    assert r.meta["complete"] is False and r.meta["blocked"] == 2
 
 
 async def test_没有文本网关就不检查():

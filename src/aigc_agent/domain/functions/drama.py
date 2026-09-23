@@ -88,6 +88,7 @@ from ..media.naming import (
     episode_export_name,
     library_reference_names,
     parse_scene,
+    unique_path,
 )
 from ..media.no_text import no_text_retry, parse_subtitle_verdict, subtitle_check_messages
 from ..realism import (
@@ -416,6 +417,13 @@ class DramaFunctions:
                         "description": "reuse 时强制重渲这几段（写场次或镜头，如 "
                         "\"第1集-2场 镜5-9\" 或 \"镜5-9\"）—— 人复核后不满意的段用它",
                     },
+                    "accept": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "上次被质检门标 ⛔（仍有字幕 / 人物漂移 / 字幕没查成）"
+                        "没进成片的段，**用户亲自看过说可以**才写进来放行（写法同 redo）。"
+                        "不要替用户决定",
+                    },
                 },
                 "required": ["shots_id"],
             },
@@ -720,7 +728,12 @@ class DramaFunctions:
         return (a.uri or "").startswith(("http://", "https://"))
 
     def _previous_clips(
-        self, shots_id: str, episode: int, pack_id: str = "", redo: list[str] | None = None
+        self,
+        shots_id: str,
+        episode: int,
+        pack_id: str = "",
+        redo: list[str] | None = None,
+        accept: list[str] | None = None,
     ) -> dict[tuple[str, str], str]:
         """这份提示词此前渲过、**过了质检门**的片段：(场次, 镜头范围) → 片段资产 id，最新的优先。
 
@@ -745,11 +758,19 @@ class DramaFunctions:
             tags = (a.gen_params or {}).get("tags") or {}
             if not isinstance(tags, dict) or tags.get("shots_id") != shots_id:
                 continue
-            if not tags.get("accepted"):
-                continue  # 没过质检门（带字幕 / 变脸）或半路被拒的版本不复用
             if pack_id and tags.get("pack") and tags.get("pack") != pack_id:
                 continue
-            offer((str(tags.get("scene") or ""), str(tags.get("name") or "")), a.seq, a.id)
+            key = (str(tags.get("scene") or ""), str(tags.get("name") or ""))
+            if not tags.get("accepted"):
+                # 没过质检门（带字幕 / 变脸）的段不复用 —— 除非用户看过后点名放行；
+                # 被换掉的废片（rejected）永远不复用
+                if tags.get("rejected") or not _label_hit(key, accept):
+                    continue
+                tags["accepted"] = True
+                tags["accepted_by"] = "human"
+                a.gen_params["tags"] = tags
+                self.store.put(a)
+            offer(key, a.seq, a.id)
 
         # ② 老口径：整批跑完落的片段索引
         for a in self.store.find(creator="tool:drama_render_shots"):
@@ -771,14 +792,9 @@ class DramaFunctions:
                 offer(key, a.seq, str(row.get("asset") or ""))
 
         out = {k: v[1] for k, v in cand.items()}
-        for want in redo or []:
-            w = str(want or "").strip()
-            if not w:
-                continue
-            for key in list(out):
-                label = f"{key[0]} {key[1]}"
-                if w in label or w == key[1]:
-                    out.pop(key, None)
+        for key in list(out):
+            if _label_hit(key, redo):
+                out.pop(key, None)
         return out
 
     def _video_retries(self) -> int:
@@ -818,6 +834,38 @@ class DramaFunctions:
             await asyncio.sleep(3)
         return r
 
+    def _gate_cfg(self) -> dict[str, Any]:
+        """质检门的公共配置（media_models.yaml drama.*）。
+
+        gate_block      哪些门没过就不许进成片（逗号分隔：subtitle / identity / cut）。
+                        默认 subtitle,identity —— 字幕是用户定的最高优先级；人物漂移是
+                        用户最在意的一致性问题；镜头超 3 秒只标出来。
+        gate_max_regen  一段视频因质检最多重生成几次（所有门合计，每次合并各门的修正）。
+                        没配时取各门 *_retries 里最大的那个。
+        check_frames    抽几帧给视觉模型看（字幕 / 一致性）。
+        """
+        cfg = getattr(self.catalog, "drama", {}) or {}
+        block = str(cfg.get("gate_block", "subtitle,identity"))
+        per_gate: list[int] = []
+        for key in ("subtitle_retries", "identity_retries", "cut_retries"):
+            try:
+                per_gate.append(max(0, int(cfg.get(key, 1))))
+            except (TypeError, ValueError):
+                per_gate.append(1)
+        try:
+            regen = max(0, int(cfg["gate_max_regen"]))
+        except (KeyError, TypeError, ValueError):
+            regen = max(per_gate) if per_gate else 1
+        try:
+            frames = max(2, min(12, int(cfg.get("check_frames", 6))))
+        except (TypeError, ValueError):
+            frames = 6
+        return {
+            "block": {x.strip() for x in block.split(",") if x.strip()},
+            "max_regen": regen,
+            "frames": frames,
+        }
+
     async def _gen_clip(
         self,
         args: dict[str, Any],
@@ -826,50 +874,177 @@ class DramaFunctions:
         sub_retries: int,
         id_refs: list[tuple[str, str]] | None = None,
     ) -> tuple[Any, list[str]]:
-        """生成一段视频：网络重试 + 人物一致性门 + 字幕门。
+        """生成一段视频并过质检门。返回 (最终采用的工具结果, 给人看的备注)。
 
-        一致性门：把参考图和抽帧一起给视觉模型，不是同一个人就把差异写进提示词重生成
-        （次数见 drama.identity_retries），都没过留分最高的并标「仍与参考图不符」。
-        字幕门：画面里出现字幕/文字就用更硬的提示词重生成。
-        返回 (工具结果, 给人看的备注)。检查本身做不了（没本地副本、没 ffmpeg、
-        模型输出不可解析）只记备注，不拦生成。
+        2026-09-23 审查后重写成**一个循环**（之前是三道门串着各跑各的）：
+          · 每一版都**全量**过门：镜头门（ffmpeg，免费）→ 字幕门 → 人物一致性门。
+            之前后面的门重生成之后不回查前面的门 —— 为了消字幕重生成的那版可能变了脸，
+            照样放行。
+          · 几道门同时不过，修正**合并**进同一次重生成（之前每道门拿原始提示词重来，
+            前一道门的修正丢了）；总次数封顶（gate_max_regen），各门另有自己的上限。
+          · 字幕是用户定的最高优先级：**查不成也算不过**（没本地副本、抽不出帧、判读
+            不出结果）—— 之前这些情况只记一句备注就放行，最高优先级的规则只剩提示词一道。
+          · 到上限还没过：留问题最少的那一版（一致性分高的优先），备注里标 ⛔ ——
+            ⛔ 的段不进成片，人看过后用 accept 放行或 redo 重渲。
+          · 被换掉的版本挪进 废弃/ 子目录，主文件名留给最终采用的那版（之前废片占着
+            主文件名，按文件名剪片会剪进带字幕 / 变脸的版本）。
         """
         notes: list[str] = []
         r = await self._invoke_video(args, retries)
         if not r.ok:
             return r, notes
-        if id_refs:
-            r = await self._identity_gate_clip(args, retries, id_refs, r, notes)
-        if sub_gate:
-            r = await self._subtitle_gate_clip(args, retries, sub_retries, r, notes)
-        # 镜头门（2026-09-20）：每个镜头 ≤3 秒，ffmpeg 量最长镜头，超了重生成
-        r = await self._cut_gate_clip(args, retries, r, notes)
-        return r, notes
-
-    async def _subtitle_gate_clip(
-        self, args: dict[str, Any], retries: int, sub_retries: int, r: Any, notes: list[str]
-    ) -> Any:
-        """字幕门：画面里出现字幕/文字就用更硬的提示词重生成。返回最终采用的工具结果。"""
-        for k in range(sub_retries + 1):
-            found, why = await self._check_subtitles(r.asset_ref)
-            if why:
-                notes.append(why)
-                return r
-            if not found:
-                if k:
-                    notes.append("重生成后无字幕")
-                return r
-            if k >= sub_retries:
-                notes.append("⚠ 仍有字幕/文字")
-                return r
-            notes.append("画面出现字幕，已重生成")
-            again = {**args, "prompt": no_text_retry(args["prompt"])}
-            r2 = await self._invoke_video(again, retries)
+        gc = self._gate_cfg()
+        cut_on, cut_n, thr, tol = self._cut_cfg()
+        id_on, id_n, pass_score = self._identity_cfg()
+        id_on = id_on and bool(id_refs)
+        limit = float(self.fmt.max_cut_seconds)
+        budget = {"subtitle": sub_retries, "identity": id_n, "cut": cut_n}
+        base = args["prompt"]
+        prompt = base
+        # 每一版：(结果, 排序键, 这一版的问题)
+        versions: list[tuple[Any, tuple[int, int, int, int], dict[str, Any]]] = []
+        regen = 0
+        while True:
+            issues: dict[str, Any] = {}
+            cut_len: float | None = None
+            if cut_on:
+                longest, why = await self._check_cuts(r.asset_ref, thr)
+                if why:
+                    notes.append(why)
+                elif longest is not None:
+                    cut_len = longest
+                    if longest > limit + tol:
+                        issues["cut"] = longest
+            if sub_gate:
+                found, why = await self._check_subtitles(r.asset_ref)
+                if why:
+                    issues["subtitle_unchecked"] = why
+                elif found:
+                    issues["subtitle"] = True
+            score = 10
+            if id_on:
+                v = await self._check_identity(
+                    r.asset_ref, id_refs or [], is_video=True, pass_score=pass_score
+                )
+                if v.note:
+                    notes.append(v.note)
+                elif not v.passed:
+                    issues["identity"] = v
+                    score = int(v.score)
+                else:
+                    score = int(v.score)
+                    notes.append(f"人物一致 {v.score}/10" + ("（重生成后）" if regen else ""))
+            blocking = sum(1 for g in issues if _gate_blocks(g, gc["block"]))
+            # 排序：拦成片的问题少 → 问题总数少 → 一致性分高 → 越新越好
+            versions.append((r, (blocking, len(issues), -score, -len(versions)), issues))
+            if regen and not any(k in issues for k in ("subtitle", "subtitle_unchecked")) and (
+                versions[-2][2].get("subtitle")
+            ):
+                notes.append("重生成后无字幕")
+            if regen and "cut" not in issues and "cut" in versions[-2][2] and cut_len is not None:
+                notes.append(f"重生成后镜头达标（最长 {cut_len:.1f}s）")
+            if not issues:
+                break
+            # 还能针对哪些问题重生成（「查不成」重生成也查不成，不算）
+            fixable = [g for g in ("subtitle", "cut", "identity") if g in issues and budget[g] > 0]
+            if not fixable or regen >= gc["max_regen"]:
+                break
+            for g in fixable:
+                budget[g] -= 1
+            if "subtitle" in fixable:
+                notes.append("画面出现字幕，已重生成")
+                prompt = no_text_retry(prompt)
+            if "cut" in fixable:
+                notes.append(f"有镜头长 {issues['cut']:.1f}s，超过 {limit:g}s，已重生成")
+                prompt = fast_cut_retry(prompt, issues["cut"], limit)
+            if "identity" in fixable:
+                v = issues["identity"]
+                why = "；".join(v.issues)[:120] or "与参考图不符"
+                notes.append(f"人物与参考图不符（{v.score}/10：{why}），已重生成")
+                prompt = identity_retry_prompt(prompt, v.issues)
+            r2 = await self._invoke_video({**args, "prompt": prompt}, retries)
+            regen += 1
             if not r2.ok:
-                notes.append(f"重生成失败：{(r2.error or '')[:60]}，保留第一版")
-                return r
+                notes.append(f"重生成失败：{(r2.error or '')[:60]}，保留已有的版本")
+                break
             r = r2
-        return r
+
+        # 选问题最少的一版（一致性分高的优先）；其余挪进 废弃/，主文件名留给它
+        chosen, _, final = min(versions, key=lambda x: x[1])
+        for other, _, why in versions:
+            if other is not chosen and other.asset_ref:
+                self._retire_version(other.asset_ref, "、".join(why) or "被新版本替换")
+        if len(versions) > 1 and chosen.asset_ref:
+            self._reclaim_name(chosen.asset_ref, versions[0][0].asset_ref)
+
+        if "subtitle" in final:
+            mark = "⛔ " if _gate_blocks("subtitle", gc["block"]) else "⚠ "
+            notes.append(mark + "仍有字幕/文字")
+        if "subtitle_unchecked" in final:
+            notes.append(
+                ("⛔ " if _gate_blocks("subtitle_unchecked", gc["block"]) else "⚠ ")
+                + f"字幕没查成（{final['subtitle_unchecked']}）"
+            )
+        if "cut" in final:
+            notes.append(
+                ("⛔ " if _gate_blocks("cut", gc["block"]) else "⚠ ")
+                + f"仍有超过 {limit:g} 秒的镜头（最长 {final['cut']:.1f}s）"
+            )
+        if "identity" in final:
+            v = final["identity"]
+            why = "；".join(v.issues)[:120] or "与参考图不符"
+            notes.append(
+                ("⛔ " if _gate_blocks("identity", gc["block"]) else "⚠ ")
+                + f"仍与参考图不符（{v.score}/10：{why}），保留分最高的一版"
+            )
+        return chosen, notes
+
+    def _retire_version(self, asset_id: str, reason: str) -> None:
+        """被质检门换掉的那一版：标签记下原因（不复用、不进成片），本地文件挪进 废弃/。"""
+        try:
+            a = self.store.get(asset_id)
+        except KeyError:
+            return
+        tags = dict((a.gen_params or {}).get("tags") or {})
+        tags["accepted"] = False
+        tags["rejected"] = reason[:120]
+        a.gen_params["tags"] = tags
+        local = str(a.gen_params.get("local") or "")
+        if local and Path(local).exists():
+            p = Path(local)
+            try:
+                dest_dir = p.parent / "废弃"
+                dest_dir.mkdir(exist_ok=True)
+                dest = unique_path(dest_dir, p.name)
+                shutil.move(str(p), str(dest))
+                a.gen_params["local"] = str(dest)
+            except OSError:
+                pass
+        self.store.put(a)
+
+    def _reclaim_name(self, asset_id: str, first_id: str | None) -> None:
+        """最终采用的版本拿回第一版的文件名（重渲时它被命名成 -v2，第一版挪走后名字空出来了）。"""
+        try:
+            a = self.store.get(asset_id)
+            first = self.store.get(first_id) if first_id else None
+        except KeyError:
+            return
+        mine = Path(str(a.gen_params.get("local") or ""))
+        if first is None or not mine.exists():
+            return
+        want = Path(str(first.gen_params.get("local") or "")).name
+        if not want or first.id == a.id:
+            return
+        target = mine.parent / want
+        if target.exists() or target == mine:
+            return
+        # 第一版原来在同一个目录（挪进 废弃/ 之前）：名字空出来了才拿
+        try:
+            mine.rename(target)
+            a.gen_params["local"] = str(target)
+            self.store.put(a)
+        except OSError:
+            pass
 
     # ---------- 镜头门：每个镜头不超过 3 秒（2026-09-20 用户定的硬性要求） ----------
 
@@ -905,37 +1080,6 @@ class DramaFunctions:
         if err:
             return None, f"镜头时长检查失败：{err[:60]}"
         return longest_shot(info.duration, times), ""
-
-    async def _cut_gate_clip(
-        self, args: dict[str, Any], retries: int, r: Any, notes: list[str]
-    ) -> Any:
-        """镜头门：最长镜头超过上限 + 容差就用更硬的提示词重生成；都超就标出来交人复核。"""
-        on, n, thr, tol = self._cut_cfg()
-        if not on:
-            return r
-        limit = float(self.fmt.max_cut_seconds)
-        for k in range(n + 1):
-            longest, why = await self._check_cuts(r.asset_ref, thr)
-            if why:
-                notes.append(why)
-                return r
-            if longest is None:
-                return r
-            if longest <= limit + tol:
-                if k:
-                    notes.append(f"重生成后镜头达标（最长 {longest:.1f}s）")
-                return r
-            if k >= n:
-                notes.append(f"⚠ 仍有超过 {limit:g} 秒的镜头（最长 {longest:.1f}s）")
-                return r
-            notes.append(f"有镜头长 {longest:.1f}s，超过 {limit:g}s，已重生成")
-            again = {**args, "prompt": fast_cut_retry(args["prompt"], longest, limit)}
-            r2 = await self._invoke_video(again, retries)
-            if not r2.ok:
-                notes.append(f"重生成失败：{(r2.error or '')[:60]}，保留上一版")
-                return r
-            r = r2
-        return r
 
     # ---------- 引用门：没有引用成功的镜头不许生成（2026-09-20 用户定的规则） ----------
 
@@ -1103,44 +1247,6 @@ class DramaFunctions:
             return IdentityVerdict(note=f"一致性校验调用失败：{type(e).__name__}")
         return parse_identity_verdict(resp.text, pass_score)
 
-    async def _identity_gate_clip(
-        self,
-        args: dict[str, Any],
-        retries: int,
-        id_refs: list[tuple[str, str]],
-        r: Any,
-        notes: list[str],
-    ) -> Any:
-        """人物一致性门（视频）：不是同一个人就把差异写进提示词重生成，都没过留分最高的。"""
-        on, id_retries, pass_score = self._identity_cfg()
-        if not on:
-            return r
-        best, best_score = r, -1
-        for k in range(id_retries + 1):
-            v = await self._check_identity(
-                r.asset_ref, id_refs, is_video=True, pass_score=pass_score
-            )
-            if v.note:
-                notes.append(v.note)
-                return r
-            if v.passed:
-                notes.append(f"人物一致 {v.score}/10" + ("（重生成后）" if k else ""))
-                return r
-            if v.score > best_score:
-                best, best_score = r, v.score
-            why = "；".join(v.issues)[:120] or "与参考图不符"
-            if k >= id_retries:
-                notes.append(f"⚠ 仍与参考图不符（{v.score}/10：{why}），保留分最高的一版")
-                return best
-            notes.append(f"人物与参考图不符（{v.score}/10：{why}），已重生成")
-            again = {**args, "prompt": identity_retry_prompt(args["prompt"], v.issues)}
-            r2 = await self._invoke_video(again, retries)
-            if not r2.ok:
-                notes.append(f"重生成失败：{(r2.error or '')[:60]}，保留上一版")
-                return best
-            r = r2
-        return best
-
     def _stale_refs(
         self, resolved: dict[str, Any], images: dict[str, dict[str, str]], vcfg: dict[str, Any]
     ) -> list[str]:
@@ -1191,10 +1297,12 @@ class DramaFunctions:
         return local_copy(a)
 
     async def _frames_of(self, video: Path, count: int = 4) -> list[bytes]:
-        """抽几帧 jpg 给视觉模型看。抽不出来返回空。"""
+        """抽几帧 jpg 给视觉模型看。抽不出来返回空。
+
+        宽 512（之前 384）：字幕条上的小字在 384 宽的低清帧里经常认不出来。"""
         tmp = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="subcheck_"))
         try:
-            paths = await ffmpeg.extract_frames(video, tmp, count=count)
+            paths = await ffmpeg.extract_frames(video, tmp, count=count, width=512)
             return await asyncio.to_thread(lambda: [p.read_bytes() for p in paths])
         except Exception:  # noqa: BLE001
             return []
@@ -1206,20 +1314,22 @@ class DramaFunctions:
         local = self._local_video(asset_id)
         if local is None:
             return False, "片段没有本地副本，跳过字幕检查"
-        frames = await self._frames_of(local)
+        frames = await self._frames_of(local, self._gate_cfg()["frames"])
         if not frames:
             return False, "抽不出画面帧（检查 ffmpeg），跳过字幕检查"
         urls = ["data:image/jpeg;base64," + base64.b64encode(b).decode() for b in frames]
-        try:
-            resp = await self.gateway.chat(REALISM_ROLE, subtitle_check_messages(urls))
-        except KeyError:
-            return False, f"models.yaml 没配 {REALISM_ROLE} 角色，跳过字幕检查"
-        except Exception as e:  # noqa: BLE001
-            return False, f"字幕检查调用失败：{type(e).__name__}"
-        found, note = parse_subtitle_verdict(resp.text)
-        if found is None:
-            return False, note
-        return found, ""
+        note = ""
+        for _ in range(2):  # 判读输出不是 JSON / 缺字段：再问一次，还不行才算查不成
+            try:
+                resp = await self.gateway.chat(REALISM_ROLE, subtitle_check_messages(urls))
+            except KeyError:
+                return False, f"models.yaml 没配 {REALISM_ROLE} 角色，跳过字幕检查"
+            except Exception as e:  # noqa: BLE001
+                return False, f"字幕检查调用失败：{type(e).__name__}"
+            found, note = parse_subtitle_verdict(resp.text)
+            if found is not None:
+                return found, ""
+        return False, note or "字幕检查没给出结论"
 
     def _library_for(self, shots_id: str, pack_id: str) -> Any:
         """渲染时找回资产库（音色卡在里面）：分镜提示词的 parents[1]，或参考图包的 parents[0]。"""
@@ -2463,6 +2573,7 @@ class DramaFunctions:
         episode: int = 0,
         reuse: bool = True,
         redo: list[str] | None = None,
+        accept: list[str] | None = None,
     ) -> ToolResult:
         try:
             raw = self.store.content(shots_id)
@@ -2517,7 +2628,9 @@ class DramaFunctions:
             )
         lib = self._library_for(shots_id, pack_id)
         # 增量重跑：上次已成功的段直接复用，只生成失败/缺的 —— 引用门只查这次要生成的段
-        prev_clips = self._previous_clips(shots_id, episode, pack_id, redo) if reuse else {}
+        prev_clips = (
+            self._previous_clips(shots_id, episode, pack_id, redo, accept) if reuse else {}
+        )
         todo = [
             i for i, s in enumerate(shots)
             if not prev_clips.get((s.scene_index, s.video_name), "")
@@ -2666,9 +2779,10 @@ class DramaFunctions:
                 layers.append([])
             layers[lv].append(i)
 
-        done: dict[int, dict[str, str]] = {}
+        done: dict[int, dict[str, Any]] = {}
         n_refs: dict[int, tuple[int, int]] = {}
         failed: list[str] = []
+        blocked: list[str] = []  # 生成出来了但被质检门判 ⛔（不进成片，等人 accept 或 redo）
         by_scene: dict[str, str] = {}  # 场次 → 已成功的视频 url，供 {前序} 引入
         vlimit = self._max_concurrency("video")
         vmax = vcfg["max_videos"]
@@ -2685,7 +2799,7 @@ class DramaFunctions:
                     done_v += 1
                     label = f"{s.scene_index} {s.video_name}（复用）"
                     await self._progress("渲染分镜视频", done_v, len(shots), label)
-                    return i, prev_id, (0, 0), "", True, []
+                    return i, prev_id, (0, 0), "", True, [], False
                 # 引用到的资产图当参考：人物/服装优先（脸最要紧），再场景道具 ——
                 # 接口若截断参考图数，先丢的是最不影响一致性的
                 people: list[str] = []
@@ -2785,19 +2899,23 @@ class DramaFunctions:
                 r, clip_notes = await self._gen_clip(
                     args, retries, sub_gate, sub_retries, id_refs=id_refs
                 )
+                blocked = False
                 if r.ok and r.asset_ref:
-                    self._mark_clip(r.asset_ref, clip_notes)
+                    blocked = not self._mark_clip(r.asset_ref, clip_notes)
                 done_v += 1
                 await self._progress(
                     "渲染分镜视频", done_v, len(shots), f"{s.scene_index} {s.video_name}"
                 )
                 counts = (len(refs), len(videos))
                 err = "" if r.ok else (r.error or "")
-                return i, r.asset_ref if r.ok else "", counts, err, False, trim_notes + clip_notes
+                return (
+                    i, r.asset_ref if r.ok else "", counts, err, False,
+                    trim_notes + clip_notes, blocked,
+                )
 
             # 层内按下标升序结算：by_scene 的「最新一段」语义与旧串行完全一致
             results = await _run_parallel(layer, gen, vlimit)
-            for i, aid, counts, err, was_reused, clip_notes in results:
+            for i, aid, counts, err, was_reused, clip_notes, was_blocked in results:
                 s = shots[i]
                 tag = f"{s.scene_index} {s.video_name}"
                 if clip_notes:
@@ -2805,10 +2923,14 @@ class DramaFunctions:
                 if err:
                     failed.append(f"{tag}：{err[:90]}")
                     continue
+                if was_blocked:
+                    blocked.append(tag)
                 # 只有远端且未过期的链接能当后面镜头的参考（前序引入 / 音色锚点）
                 url, _ = self._clip_ref_url(aid, vcfg)
                 by_scene[s.scene_index.strip("[]")] = url
                 done[i] = {"scene": s.scene_index, "name": s.video_name, "asset": aid}
+                if was_blocked:
+                    done[i]["flagged"] = True  # 被质检门拦下：进索引备查，不进成片、不复用
                 n_refs[i] = counts
                 if was_reused:
                     reused.append(i)
@@ -2844,6 +2966,11 @@ class DramaFunctions:
             "refs_missing": len(missing),
             "voice_locked": sum(1 for sp in speakers_by_shot if sp),
             "anchors_born": len(new_anchors),
+            # 这一集能不能成片：没有失败段、也没有被质检门拦下的段。按集流水靠它判断
+            # 「这一集渲完了」—— 之前有失败段也落索引，流水线就当渲完了（2026-09-23 审查）
+            "complete": not failed and not blocked,
+            "failed": len(failed),
+            "blocked": len(blocked),
         }
         if episode:
             rgp["episode"] = episode  # 按集流水：pipeline 按它认出「第N集片段已渲」
@@ -2889,7 +3016,7 @@ class DramaFunctions:
         ]
         if drifted:
             warn += (
-                "\n\n⚠ 这些段重生成后人物仍与参考图不符（人物漂移），需人工复核或单独重渲："
+                "\n\n⚠ 这些段重生成后人物仍与参考图不符（人物漂移），需人工复核："
                 f"{'；'.join(drifted)}"
             )
         still_text = [
@@ -2899,8 +3026,8 @@ class DramaFunctions:
         ]
         if still_text:
             warn += (
-                "\n\n⚠ 这些段重生成后画面里仍检测到字幕/文字，需人工复核或单独重渲"
-                f"（reuse 时把它们从上次结果里去掉）：{'；'.join(still_text)}"
+                "\n\n⚠ 这些段重生成后画面里仍检测到字幕/文字，需人工复核："
+                f"{'；'.join(still_text)}"
             )
         too_long = [
             f"{shots[i].scene_index} {shots[i].video_name}"
@@ -2921,24 +3048,41 @@ class DramaFunctions:
             head += f"（复用 {len(reused)}，新生成 {fresh}）"
         head += "：\n" + "\n".join(lines) + notes + warn
 
-        if failed:
+        state = {"complete": not failed and not blocked, "failed": len(failed),
+                 "blocked": len(blocked)}
+        if failed or blocked:
             # 缺段不成片（2026-09-20）：拼一个"看起来完整"的成片会让人以为渲完了 —— 真实事故里
-            # 模型接着自己无参考补段、再拼成片。缺的段修好原因后重跑本工具
-            # （reuse=true 只补失败的段）
+            # 模型接着自己无参考补段、再拼成片。被质检门判 ⛔ 的段同样不进成片（2026-09-23：
+            # 之前只提一句「需人工复核」照样拼，带字幕 / 变脸的段进了成片）。
             clips = " ".join(d["asset"] for d in ordered)
+            why: list[str] = []
+            if failed:
+                why.append(
+                    f"未成片：{len(failed)} 段没生成出来，这一集不完整，没有拼接 —— "
+                    "修好失败原因后再跑一次 drama_render_shots(reuse=true)，只会补这些段"
+                )
+            if blocked:
+                why.append(
+                    f"未成片：{len(blocked)} 段没过质检门（{'；'.join(blocked[:6])}），"
+                    "没有拼接 —— 请用户看一下这几段（本地文件在 videos/，被换掉的版本在 "
+                    "videos/废弃/）：用户说可以就 drama_render_shots(reuse=true, accept=[…]) "
+                    "放行，不行就 redo=[…] 重渲。不要替用户决定放行"
+                )
             return ToolResult(
                 content=(
-                    f"{head}\n\n⚠ 未成片：{len(failed)} 段没生成出来，这一集不完整，没有拼接。"
-                    "修好失败原因后再跑一次 drama_render_shots(reuse=true)，只会补这些段；"
-                    "不要用 gen_video / gen_videos 自己补（没有参考图，人物会变脸）。\n"
+                    f"{head}\n\n⚠ "
+                    + "\n⚠ ".join(why)
+                    + "\n不要用 gen_video / gen_videos 自己补（没有参考图，人物会变脸）。\n"
                     f"片段资产：{clips}\n资产 {asset.id}"
                 ),
                 asset_ref=asset.id,
+                meta=state,
             )
         if not compose:
             clips = " ".join(d["asset"] for d in ordered)
             return ToolResult(
-                content=f"{head}\n\n片段资产：{clips}\n资产 {asset.id}", asset_ref=asset.id
+                content=f"{head}\n\n片段资产：{clips}\n资产 {asset.id}", asset_ref=asset.id,
+                meta=state,
             )
 
         # 片段**自带音轨** —— seedance 原生出声，台词和环境音都在里面。
@@ -2953,8 +3097,13 @@ class DramaFunctions:
             },
         )
         if not res.ok:
-            return ToolResult(content=f"{head}\n\n⚠ 拼接失败：{res.error}", asset_ref=asset.id)
-        return ToolResult(content=f"{head}\n\n{res.content}", asset_ref=res.asset_ref)
+            return ToolResult(
+                content=f"{head}\n\n⚠ 拼接失败：{res.error}", asset_ref=asset.id,
+                meta={**state, "complete": False},
+            )
+        return ToolResult(
+            content=f"{head}\n\n{res.content}", asset_ref=res.asset_ref, meta=state
+        )
 
 
     # ---------- 参考图包定位与引用匹配 ----------
@@ -3147,13 +3296,28 @@ def _format_note(problems: list[str], fmt: EpisodeFormat) -> str:
     )
 
 
+def _label_hit(key: tuple[str, str], wants: list[str] | None) -> bool:
+    """(场次, 镜头范围) 是否被 redo / accept 列表点到：写全称、只写场次或只写镜头都认。"""
+    label = f"{key[0]} {key[1]}"
+    for want in wants or []:
+        w = str(want or "").strip()
+        if w and (w in label or w == key[1] or w == key[0].strip("[]")):
+            return True
+    return False
+
+
+def _gate_blocks(gate: str, block: set[str]) -> bool:
+    """这道门没过是不是就不许进成片。subtitle_unchecked 跟着 subtitle 走。"""
+    return (gate.removesuffix("_unchecked") if gate.endswith("_unchecked") else gate) in block
+
+
 def _blocking_note(note: str) -> bool:
     """这条质检结论是否意味着这段不能进成片 / 不能被复用。
 
-    ⛔ 开头的是质检门判的「不通过」；「仍有字幕」是用户定的最高优先级约束，
-    查出来了就不算过（2026-09-23 审查：之前只在结果里提一句，照样拼进成片）。
+    ⛔ 开头的是质检门判的「不通过」（哪些门会判 ⛔ 由 drama.gate_block 定，默认字幕与
+    人物一致性）。2026-09-23 审查：之前「仍有字幕」只在结果里提一句，照样拼进成片。
     """
-    return note.startswith("⛔") or "仍有字幕" in note
+    return note.startswith("⛔")
 
 
 def _voice_note(

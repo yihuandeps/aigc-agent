@@ -266,7 +266,10 @@ class EpisodePipeline:
             elif a.creator == "tool:drama_shots" and ep:
                 _keep_latest(shots, int(ep), a)
             elif a.creator == "tool:drama_render_shots" and ep:
-                _keep_latest(rendered, int(ep), a)
+                # 只有完整的一集才算渲完（有失败段 / 被质检门拦下的段 → complete=False）。
+                # 之前有索引就算完，缺段的集也打「✅ 完成」（2026-09-23 审查）
+                if a.gen_params.get("complete", True):
+                    _keep_latest(rendered, int(ep), a)
         return {
             "scripts": {k: v[1] for k, v in scripts.items()},
             "storyboards": {k: v[1] for k, v in storyboards.items()},
@@ -374,6 +377,8 @@ class EpisodePipeline:
     async def _refs(self, assets_id: str) -> None:
         self._say("⚙ 资产库完成，开始渲参考图（几分钟）…")
         r = await self.registry.invoke("drama_render_assets", {"assets_id": assets_id})
+        if self._needs_human("refs", r, "渲参考图"):
+            return
         if not r.ok:
             self._fail("refs", f"参考图渲染失败：{r.error}")
             return
@@ -395,10 +400,31 @@ class EpisodePipeline:
             "drama_render_shots",
             {"shots_id": shots_id, "rendered_id": refs_id, "episode": ep},
         )
+        if self._needs_human(f"render:{ep}", r, f"渲第 {ep} 集"):
+            return
         if not r.ok:
             self._fail(f"render:{ep}", f"第 {ep} 集渲染失败：{r.error}")
             return
+        meta = r.meta or {}
+        if meta.get("complete") is False:
+            # 有段没生成出来 / 没过质检门：不算完成，也不自动重派（重派会反复花钱），等人处理
+            self._fail(
+                f"render:{ep}",
+                f"第 {ep} 集没渲完整（没生成 {meta.get('failed', 0)} 段，"
+                f"质检没过 {meta.get('blocked', 0)} 段），没有拼成片 —— 看一下这几段，"
+                "在对话里让我 accept 放行或 redo 重渲",
+            )
+            return
         self._say(f"✅ 第 {ep} 集.mp4 完成")
+
+    def _needs_human(self, key: str, r: Any, what: str) -> bool:
+        """工具挂起要人拍板（比如换生图模型、角色面容冲突）：流水线在后台没法替人答，
+        停下这一步、把问题说清楚。之前无视 suspend，问题没人看见（2026-09-23 审查）。"""
+        if not getattr(r, "suspend", False):
+            return False
+        q = str((getattr(r, "suspend_payload", None) or {}).get("question") or "")[:200]
+        self._fail(key, f"{what}需要你拍板：{q or r.content[:200]} —— 在对话里告诉我怎么定")
+        return True
 
     # ---------- 小工具 ----------
 

@@ -341,7 +341,9 @@ async def burn_subtitle(video: Path, srt: Path, out: Path, font_size: int = 16) 
     return True, ""
 
 
-async def extract_frames(video: Path, out_dir: Path, count: int = 12) -> list[Path]:
+async def extract_frames(
+    video: Path, out_dir: Path, count: int = 12, width: int = 384
+) -> list[Path]:
     """按时间均匀抽 count 张关键帧，用于给视觉模型看参考视频。
 
     **均匀抽而不是按场景抽**：这里要的是"这段片子的节奏和构图长什么样"，
@@ -364,7 +366,7 @@ async def extract_frames(video: Path, out_dir: Path, count: int = 12) -> list[Pa
         f = out_dir / f"frame{i:02d}.jpg"
         code, _ = await run(
             ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(video),
-             "-frames:v", "1", "-vf", "scale=384:-2", "-q:v", "7", str(f)]
+             "-frames:v", "1", "-vf", f"scale={int(width)}:-2", "-q:v", "7", str(f)]
         )
         if code == 0 and f.exists():
             paths.append(f)
