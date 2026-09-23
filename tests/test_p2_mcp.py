@@ -152,7 +152,8 @@ async def test_MCP工具与内置工具走同一个注册表():
     r1 = await registry.invoke("now", {})
     r2 = await registry.invoke("lib__search", {"q": "露营"})
     assert r1.ok and r2.ok
-    assert r2.content == "找到 3 条"
+    # 返回内容前面带来源标注（不可信数据，2026-09-23），正文原样
+    assert r2.content.endswith("\n找到 3 条") and "外部 Server「lib」" in r2.content
     assert clients["lib"].calls == [("search", {"q": "露营"})]  # 原始名传给 server
 
 

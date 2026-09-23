@@ -76,7 +76,9 @@ class PermissionGate:
         return await self._budget(meta, args, why)
 
     async def _policy(self, meta: ToolMeta, args: dict[str, Any]) -> tuple[bool, str]:
-        if meta.name in self._session_allow:
+        # 会话提权只免 L-write / L-compute 的询问。L-external（含按参数提上来的，比如改
+        # Agent 自己的配置）永远逐次问 —— 否则提权一次 fs_write，改配置也跟着静默放行了
+        if meta.name in self._session_allow and meta.permission is not PermissionLevel.EXTERNAL:
             return True, "本次会话已提权"
 
         decision = self.policy.get(meta.permission, Decision.ASK)

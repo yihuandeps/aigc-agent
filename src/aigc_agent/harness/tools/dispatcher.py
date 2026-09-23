@@ -48,7 +48,8 @@ class ToolDispatcher:
                 results[call.id] = ToolResult(ok=False, error=err)
                 continue
 
-            meta = self.registry.meta(call.name)
+            # 按参数算等级：同一个工具写产物目录和写 Agent 自己的配置，风险不是一回事
+            meta = self.registry.meta_for_call(call.name, args)
             if meta is None:
                 results[call.id] = ToolResult(ok=False, error=f"未知工具 {call.name!r}")
                 continue

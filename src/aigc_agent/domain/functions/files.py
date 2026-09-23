@@ -5,9 +5,14 @@
 
 **边界**（config/filesystem.yaml）：
   · roots  能碰的目录白名单。项目目录、workspace、产物目录永远在；其余在配置里加
-  · deny   永远不碰的模式：凭据（.env / *.pem / *.key）、.venv、.git、系统目录
+  · deny   永远不碰的模式：凭据（.env / *.pem / *.key / 私钥目录 …）、.venv、.git、
+    系统目录。_HARD_DENY 写死在代码里，配置只能往上加、删不掉
   · 所有写操作可回滚：覆盖前把旧文件备份到 workspace/trash/，删除 = 移到 trash/，
     从不真删 —— 所以它们是 L-write 级（自动放行），不是 L-external
+  · **例外：改 Agent 自己**（代码、配置、skill、台账、记忆、资产库）要人确认
+    （permission_for 按参数把这次调用提到 L-external）。2026-09-23 审查：之前模型不经
+    确认就能改 models.yaml 的预算、往 mcp_servers.yaml 加任意命令（下次启动就执行）、
+    写一个最高优先级的 skill、清零台账 —— 等于它能改自己的规则
 
 **阻塞 I/O 全部丢到线程**：目录扫描和大文件读会卡事件循环，批量渲染的进度事件
 就会断流；所以 _fn_* 只做参数整理，真正的读写在 *_sync 里跑在 to_thread。
@@ -62,6 +67,39 @@ _DEFAULT_DENY = [
     "**/.venv/**", "**/.git/**", "**/__pycache__/**", "**/node_modules/**",
     "C:/Windows/**", "C:/Program Files/**", "C:/Program Files (x86)/**",
 ]
+# 永远生效、配置删不掉的拒绝规则（2026-09-23 审查）：配置里写了 deny 列表时，
+# 上面的默认值会被整个替换掉 —— 凭据不能靠配置记得写。fs_read 读到的东西会原样
+# 发给文本模型（第三方），私钥、登录凭据、浏览器数据一旦读出来就收不回。
+_HARD_DENY = [
+    *_DEFAULT_DENY,
+    "**/.ssh/**", "**/.gnupg/**", "**/.aws/**", "**/.azure/**", "**/.kube/**",
+    "**/.docker/**", "**/.config/gcloud/**", "**/.claude/**",
+    "**/.git-credentials", "**/.netrc", "**/_netrc", "**/.npmrc", "**/.pypirc",
+    "**/*credential*", "**/*.kdbx", "**/*.p12", "**/*.ppk",
+    "**/id_ed25519*", "**/id_ecdsa*", "**/id_dsa*",
+    # 应用配置与浏览器数据（登录态、Cookie、保存的密码）。AppData/Local/Temp 与 Programs 不拦 ——
+    # 临时文件和装在那里的程序（用户的 agent.cmd 就在 Programs 下）是正常要碰的
+    "**/AppData/Roaming/**", "**/AppData/LocalLow/**", "**/User Data/**",
+    "**/AppData/Local/Microsoft/**", "**/AppData/Local/Google/**", "**/AppData/Local/Packages/**",
+]
+# workspace 里 Agent 自己的状态（写它们 = 改 Agent 的账本/记忆/资产库）
+_STATE_DIRS = {
+    "assets": "资产库",
+    "costs": "成本台账",
+    "memory": "记忆与会话快照",
+    "logs": "会话日志",
+    "skills_history": "skill 版本记录",
+    "trash": "回收站",
+}
+# 写操作工具 → 哪些参数是「会被改动的路径」
+_WRITE_TARGETS: dict[str, tuple[str, ...]] = {
+    "fs_write": ("path",),
+    "fs_mkdir": ("path",),
+    "fs_move": ("src", "dst"),
+    "fs_copy": ("dst",),
+    "fs_delete": ("path",),
+    "fs_export": ("path",),
+}
 
 
 @dataclass
@@ -69,7 +107,7 @@ class FsPolicy:
     """能碰哪些目录、永远不碰哪些、单次读多大。"""
 
     roots: list[Path] = field(default_factory=list)
-    deny: list[str] = field(default_factory=lambda: list(_DEFAULT_DENY))
+    deny: list[str] = field(default_factory=lambda: list(_HARD_DENY))
     max_read_bytes: int = 2_000_000
     max_list: int = 500
     max_search_files: int = 5000
@@ -83,7 +121,8 @@ class FsPolicy:
             return cls()
         raw: dict[str, Any] = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         roots = [Path(str(r)).expanduser() for r in (raw.get("roots") or []) if str(r).strip()]
-        deny = [str(d) for d in (raw.get("deny") or [])] or list(_DEFAULT_DENY)
+        # 配置只能往上加：写了 deny 也不会把凭据规则挤掉
+        deny = list(dict.fromkeys([str(d) for d in (raw.get("deny") or [])] + _HARD_DENY))
         materials = [
             Path(str(r)).expanduser() for r in (raw.get("material_dirs") or []) if str(r).strip()
         ]
@@ -203,11 +242,59 @@ class FileFunctions:
 
     def denied(self, p: Path) -> bool:
         s = _norm(p).lower()
-        for pat in self.policy.deny:
+        extra = [d for d in _HARD_DENY if d not in self.policy.deny]  # 手搓的 FsPolicy 也兜住
+        for pat in list(self.policy.deny) + extra:
             q = pat.replace("\\", "/").lower()
             if fnmatch.fnmatch(s, q) or fnmatch.fnmatch(s, q.removeprefix("**/")):
                 return True
         return False
+
+    def protected(self, p: Path) -> str:
+        """写到这里等于改 Agent 自己？是就返回是什么（给人看的），否则空串。
+
+        产物目录永远不算（生成的东西本来就该写那儿，哪怕它恰好在项目里）；
+        workspace 里只有 Agent 的状态目录算；项目目录里 workspace 以外的都算
+        （代码、配置、skill、测试、脚本、文档）。
+        """
+        try:
+            p = p.resolve()
+            project = self.project_root.resolve()
+            ws = self.workspace.resolve()
+            out = self.output_root.resolve()
+        except OSError:
+            return ""
+        if out != project and (p == out or p.is_relative_to(out)):
+            return ""
+        for sub, label in _STATE_DIRS.items():
+            base = ws / sub
+            if p == base or p.is_relative_to(base):
+                return f"Agent 的{label}"
+        if (p == project or p.is_relative_to(project)) and not (p == ws or p.is_relative_to(ws)):
+            return "Agent 的代码 / 配置 / skill"
+        return ""
+
+    def permission_for(self, tool: str, args: dict[str, Any]) -> tuple[PermissionLevel, str] | None:
+        """注册表的提权钩子：写操作落在 Agent 自己的文件上 → 这次按 L-external 过闸门。"""
+        keys = _WRITE_TARGETS.get(tool)
+        if not keys:
+            return None
+        hits: list[str] = []
+        for k in keys:
+            raw = str(args.get(k) or "").strip()
+            if not raw:
+                continue
+            p, _ = self.resolve(raw)
+            if p is None:
+                continue  # 越界 / 命中 deny 的由工具自己拒，这里不用提权
+            what = self.protected(p)
+            if what:
+                hits.append(f"{what}：{_norm(p)}")
+        if not hits:
+            return None
+        return (
+            PermissionLevel.EXTERNAL,
+            "要改动 " + "；".join(hits[:2]) + " —— 这是 Agent 自己的文件，需要你确认",
+        )
 
     def _trash_path(self, p: Path) -> Path:
         folder = self.trash / time.strftime("%Y%m%d-%H%M%S")

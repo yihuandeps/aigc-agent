@@ -69,6 +69,29 @@ def _workspace() -> Path:
     return Path(__file__).resolve().parents[4] / "workspace"
 
 
+# 导入源的拒绝模式：和主进程 fs_* 的 _HARD_DENY 同一批（这里是独立进程，不引主包）
+_SENSITIVE = (
+    "*/.env", "*/.env.*", "*.pem", "*.key", "*.pfx", "*.p12", "*.ppk", "*.kdbx",
+    "*/id_rsa*", "*/id_ed25519*", "*/id_ecdsa*", "*/id_dsa*",
+    "*/.ssh/*", "*/.gnupg/*", "*/.aws/*", "*/.azure/*", "*/.kube/*", "*/.docker/*",
+    "*/.claude/*", "*credential*", "*/.git-credentials", "*/.netrc", "*/_netrc",
+    "*/.npmrc", "*/.pypirc", "*/appdata/roaming/*", "*/appdata/locallow/*", "*/user data/*",
+    "*/appdata/local/microsoft/*", "*/appdata/local/google/*", "*/appdata/local/packages/*",
+    "*/.venv/*", "*/.git/*",
+    "c:/windows/*", "c:/program files/*", "c:/program files (x86)/*",
+)
+
+
+def _sensitive(p: Path) -> bool:
+    import fnmatch
+
+    try:
+        s = str(p.resolve()).replace("\\", "/").lower()
+    except OSError:
+        return True
+    return any(fnmatch.fnmatch(s, pat) for pat in _SENSITIVE)
+
+
 def root() -> Path:
     raw = os.environ.get("MATERIAL_LIB_ROOT", "")
     if not raw and len(sys.argv) > 1:
@@ -180,6 +203,10 @@ def import_material(source: str, folder: str = "") -> dict[str, Any]:
     src = Path(source).expanduser()
     if not src.is_file():
         raise ToolError(f"源文件不存在：{source}")
+    if _sensitive(src):
+        # 2026-09-23 审查：源路径之前不受任何约束 —— 私钥/凭据复制进素材库后，
+        # 主进程的 fs_read 就能从素材库这边读出来发给模型，绕过了 fs_* 的 deny
+        raise ToolError(f"拒绝导入：{source} 是凭据/系统/私有目录下的文件")
     dest_dir = safe(folder) if folder else root()
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / src.name

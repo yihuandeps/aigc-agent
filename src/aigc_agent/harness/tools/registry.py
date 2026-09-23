@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from ..events.bus import EventBus, EventType
-from .provider import ProviderHealth, ToolMeta, ToolProvider, ToolResult
+from .provider import PermissionLevel, ProviderHealth, ToolMeta, ToolProvider, ToolResult
 
 NAMESPACE_SEP = "__"
 
@@ -193,6 +193,36 @@ class ToolRegistry:
     def meta(self, name: str) -> ToolMeta | None:
         return self._catalog.get(name)
 
+    def meta_for_call(self, name: str, args: dict[str, Any]) -> ToolMeta | None:
+        """这一次调用该按什么等级过闸门。
+
+        静态等级写在目录里；但有些工具的风险取决于参数 —— 同一个 fs_write，写进产物目录
+        是可回滚的 L-write，写进 Agent 自己的配置/代码/台账就等于让模型改自己的规则
+        （2026-09-23 审查：模型能改 models.yaml 的预算、往 mcp_servers.yaml 加任意命令、
+        清零台账，全都不经确认）。Provider 可选实现 permission_for(tool, args)，
+        返回 (等级, 原因) 就按那个等级过闸门，原因写进询问提示。L0 不认识「路径」，
+        只认这个钩子。
+        """
+        meta = self._catalog.get(name)
+        if meta is None or name not in self._origin:
+            return meta
+        pname, orig = self._origin[name]
+        hook = getattr(self._providers.get(pname), "permission_for", None)
+        if hook is None:
+            return meta
+        try:
+            raised = hook(orig, args)
+        except Exception:  # noqa: BLE001 — 钩子出错按静态等级走，不能让它拖垮调用
+            return meta
+        if not raised:
+            return meta
+        level, why = raised
+        if level == meta.permission:
+            return meta
+        return meta.model_copy(
+            update={"permission": PermissionLevel(level), "summary": f"{why}（{meta.summary}）"}
+        )
+
     async def invoke(self, name: str, args: dict[str, Any]) -> ToolResult:
         """公开入口，**过权限闸门**，并发 TOOL_CALL / TOOL_RESULT 事件。
 
@@ -201,7 +231,7 @@ class ToolRegistry:
         跑完一条短视频，/trace 里一个节点都没有。Dispatcher 走 invoke_ungated()
         并自己发事件，两条路各发各的，不会重复。
         """
-        meta = self._catalog.get(name)
+        meta = self.meta_for_call(name, args)
         if meta is not None and self.gate is not None:
             ok, reason = await self.gate.check(meta, args)
             if not ok:
@@ -288,6 +318,9 @@ class ScopedRegistry:
     def meta(self, name: str) -> ToolMeta | None:
         return self.parent.meta(name) if name in self.names else None
 
+    def meta_for_call(self, name: str, args: dict[str, Any]) -> ToolMeta | None:
+        return self.parent.meta_for_call(name, args) if name in self.names else None
+
     def expand(self, name: str) -> tuple[bool, str]:
         if name not in self.names:
             return False, f"子代理无权使用 {name!r}"
@@ -298,7 +331,7 @@ class ScopedRegistry:
         return [n for n in self.parent.pending_expansion if n in self.names]
 
     async def invoke(self, name: str, args: dict[str, Any]) -> ToolResult:
-        meta = self.meta(name)
+        meta = self.meta_for_call(name, args)
         if meta is None:
             return self._forbidden(name)
         if self.gate is not None:
