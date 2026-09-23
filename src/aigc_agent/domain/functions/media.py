@@ -366,6 +366,56 @@ class MediaFunctions:
         n_i, n_v = len(self.catalog.image), len(self.catalog.video)
         return ProviderHealth(ok=True, detail=f"图 {n_i} 个 / 视频 {n_v} 个模型")
 
+    def estimate_cost(self, tool: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        """这次调用要花多少（给闸门事前拦用）：{"units", "seconds", "money"}。
+
+        模型没指定就按锁定的算；目录没填单价 money 就是 None（只按段数 / 秒数拦）。
+        """
+        def model_for(kind: MediaKind, want: str) -> str:
+            lock = self.video_lock if kind is MediaKind.VIDEO else self.image_lock
+            chosen = want or lock
+            if not chosen:
+                chosen, _ = self.catalog.choose(kind, "", str(args.get("prefer") or "balanced"))
+            return chosen or ""
+
+        def add(total: dict[str, Any], money: float | None) -> None:
+            if money is None:
+                total["unpriced"] = True
+            else:
+                total["money"] = round((total.get("money") or 0.0) + money, 4)
+
+        total: dict[str, Any] = {"units": 0, "seconds": 0.0}
+        if tool in ("gen_video", "gen_videos"):
+            jobs = (
+                [j for j in (args.get("jobs") or []) if isinstance(j, dict)]
+                if tool == "gen_videos"
+                else [args]
+            )
+            for job in jobs:
+                p = {**args, **job}
+                model = model_for(MediaKind.VIDEO, str(p.get("model") or ""))
+                total["units"] += 1
+                total["seconds"] += self.catalog.seconds_of(model, p)
+                add(total, self.catalog.price_of(MediaKind.VIDEO, model, p))
+        elif tool in ("gen_image", "gen_images"):
+            jobs = (
+                [j for j in (args.get("jobs") or []) if isinstance(j, dict)]
+                if tool == "gen_images"
+                else [args]
+            )
+            for job in jobs:
+                p = {**args, **job}
+                n = max(1, min(int(p.get("n") or 1), 4))
+                model = model_for(MediaKind.IMAGE, str(p.get("model") or ""))
+                total["units"] += n
+                add(total, self.catalog.price_of(MediaKind.IMAGE, model, p, n=n))
+        else:
+            return None
+        if total.get("unpriced"):
+            total.pop("money", None)  # 有一项算不出钱，金额就不装作知道
+        total.pop("unpriced", None)
+        return total if total["units"] else None
+
     async def invoke(self, tool: str, args: dict[str, Any]) -> ToolResult:
         started = time.perf_counter()
         try:
@@ -412,6 +462,7 @@ class MediaFunctions:
         lines: list[str] = []
         ok_ids: list[str] = []
         failed = 0
+        refund = {"refund_units": 0, "refund_seconds": 0.0}
         for item in results:
             if isinstance(item, BaseException):
                 failed += 1
@@ -425,15 +476,26 @@ class MediaFunctions:
             else:
                 failed += 1
                 lines.append(f"  ✗ {name}：{(r.error or '未知原因')[:100]}")
+                if (r.meta or {}).get("charged") is False:
+                    # 这一项没提交出去（被拦 / 被拒收），闸门按整批记的账要退回这部分
+                    job = {**shared, **jobs[i]}
+                    if kind is MediaKind.VIDEO:
+                        refund["refund_units"] += 1
+                        model = str(job.get("model") or self.video_lock or "")
+                        refund["refund_seconds"] += self.catalog.seconds_of(model, job)
+                    else:
+                        refund["refund_units"] += max(1, min(int(job.get("n") or 1), 4))
         dt = time.perf_counter() - started
         head = (
             f"批量生成{label} {len(jobs)} 个：成功 {len(ok_ids)}，失败 {failed}"
             f"（并发上限 {limit or '不限'}，耗时 {dt / 60:.1f} 分钟）"
         )
         if not ok_ids:
-            return ToolResult(ok=False, error=head + "\n" + "\n".join(lines))
+            return ToolResult(ok=False, error=head + "\n" + "\n".join(lines), meta=refund)
         tail = f"\n\n按顺序的资产 id：{' '.join(ok_ids)}"
-        return ToolResult(content=head + "\n" + "\n".join(lines) + tail, asset_ref=ok_ids[0])
+        return ToolResult(
+            content=head + "\n" + "\n".join(lines) + tail, asset_ref=ok_ids[0], meta=refund
+        )
 
     async def _fn_gen_images(
         self,
@@ -619,7 +681,7 @@ class MediaFunctions:
     ) -> ToolResult:
         bad = _not_public(list(image or []))
         if bad:
-            return ToolResult(ok=False, error=_local_ref_error(bad))
+            return ToolResult(ok=False, error=_local_ref_error(bad), meta={"charged": False})
         # 生图模型锁：留空用锁定的；要换先挂起问人（2026-09-22 用户定的规则）
         chosen, lock_note, gate = self._image_model_gate(model, prefer, summary)
         if gate is not None:
@@ -666,13 +728,13 @@ class MediaFunctions:
         pics = list(image or image_urls or [])
         bad = _not_public(pics + list(video_urls or []) + list(audio_urls or []))
         if bad:
-            return ToolResult(ok=False, error=_local_ref_error(bad))
+            return ToolResult(ok=False, error=_local_ref_error(bad), meta={"charged": False})
         # 参考图门（2026-09-20 用户定的规则）：短剧镜头没带参考图不许生成，在提交前拦，
         # 不能生成完再说"没引用成功"。拦截规则由 DramaFunctions.reference_guard 提供。
         if not pics and not allow_no_refs and self.ref_guard is not None:
             why = self.ref_guard(prompt, summary)
             if why:
-                return ToolResult(ok=False, error=why)
+                return ToolResult(ok=False, error=why, meta={"charged": False})
         # 画面里不许有字幕/文字（用户 2026-09-18 定的最高优先级约束）：
         # 所有视频统一在这里包一层，短剧/配方/手动调用都逃不掉；allow_text 才放开
         if not allow_text:
@@ -690,6 +752,7 @@ class MediaFunctions:
         if limit and len(pics) + n_vid + n_aud > limit:
             return ToolResult(
                 ok=False,
+                meta={"charged": False},
                 error=(
                     f"参考素材 {len(pics) + n_vid + n_aud} 个超过 {chosen} 的上限 {limit}"
                     f"（图 {len(pics)} + 视频 {n_vid} + 音频 {n_aud}），没有提交。"
@@ -748,7 +811,8 @@ class MediaFunctions:
     ) -> ToolResult:
         chosen, why = self.catalog.choose(kind, model, prefer)
         if not chosen:
-            return ToolResult(ok=False, error=why)  # 不静默替换成别的模型
+            # 不静默替换成别的模型
+            return ToolResult(ok=False, error=why, meta={"charged": False})
 
         spec = self.catalog.get(kind, chosen)
         clamp_note = ""
@@ -786,6 +850,11 @@ class MediaFunctions:
                     "task_id": task.task_id,
                     "stage": task.stage,
                     "status": task.status.value,
+                    # 提交阶段被拒收 / 请求没送到 / 请求本身有错（4xx）：服务端没建任务、没计费
+                    "charged": not (
+                        task.stage == "submit"
+                        and (task.retryable or 400 <= task.http_status < 500)
+                    ),
                 },
             )
 
@@ -843,15 +912,8 @@ class MediaFunctions:
             self.store.put(a)
             assets.append(a)
 
-        if price is not None and assets:
-            # 走 COST 事件补金额。次数已经在闸门处记过，这里不重复计次。
-            await self.gateway.bus.emit(
-                EventType.COST,
-                modality=kind.value,
-                model=chosen,
-                cost=price * len(assets),
-                outputs=len(assets),
-            )
+        # 金额在闸门**放行时**就按目录单价记过了（提交即计费，2026-09-23），这里不再补
+        # COST —— 否则同一笔记两遍。gen_cost 仍写在资产上，成本归因照旧。
 
         # 本地副本：落一份到用户产物目录。uri 保持远端 URL 不动 —— 后续镜头的
         # 参考图链要的是 URL；本地路径记进 gen_params["local"]。

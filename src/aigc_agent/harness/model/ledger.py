@@ -35,6 +35,7 @@ class LedgerEntry(BaseModel):
     tokens: int = 0
     role: str = ""
     model: str = ""
+    seconds: float = 0.0  # 生成的视频秒数（退还时为负）
 
 
 class CostLedger:
@@ -56,6 +57,8 @@ class CostLedger:
         self._money_by_project: dict[str, float] = defaultdict(float)
         self._calls_by_day: dict[tuple[str, str], int] = defaultdict(int)
         self._calls_by_project: dict[tuple[str, str], int] = defaultdict(int)
+        self._seconds_by_day: dict[str, float] = defaultdict(float)
+        self._seconds_by_project: dict[str, float] = defaultdict(float)
         self.entries = 0
         self._offset = 0  # 已经读进聚合的字节数
 
@@ -95,6 +98,9 @@ class CostLedger:
             self._money_by_project[e.project] += e.cost
         self._calls_by_day[(e.day, e.kind)] += e.calls
         self._calls_by_project[(e.project, e.kind)] += e.calls
+        if e.seconds:
+            self._seconds_by_day[e.day] += e.seconds
+            self._seconds_by_project[e.project] += e.seconds
 
     def append(self, e: LedgerEntry) -> LedgerEntry:
         self._load()  # 先把别的进程追加的读进来，再记自己这行
@@ -125,6 +131,15 @@ class CostLedger:
         if project:
             return self._calls_by_project.get((project, kind), 0)
         return sum(n for (_, k), n in self._calls_by_day.items() if k == kind)
+
+    def seconds(self, day: str = "", project: str = "") -> float:
+        """生成的视频秒数合计（按天 / 按项目）。"""
+        self._load()
+        if day:
+            return self._seconds_by_day.get(day, 0.0)
+        if project:
+            return self._seconds_by_project.get(project, 0.0)
+        return sum(self._seconds_by_day.values())
 
     def today_money(self) -> float:
         return self.money(day=today())

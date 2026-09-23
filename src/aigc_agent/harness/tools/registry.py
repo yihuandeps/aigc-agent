@@ -207,21 +207,30 @@ class ToolRegistry:
         if meta is None or name not in self._origin:
             return meta
         pname, orig = self._origin[name]
-        hook = getattr(self._providers.get(pname), "permission_for", None)
-        if hook is None:
-            return meta
-        try:
-            raised = hook(orig, args)
-        except Exception:  # noqa: BLE001 — 钩子出错按静态等级走，不能让它拖垮调用
-            return meta
-        if not raised:
-            return meta
-        level, why = raised
-        if level == meta.permission:
-            return meta
-        return meta.model_copy(
-            update={"permission": PermissionLevel(level), "summary": f"{why}（{meta.summary}）"}
-        )
+        provider = self._providers.get(pname)
+        update: dict[str, Any] = {}
+        # 花钱的工具：按参数预估这次要几段 / 几秒 / 多少钱，闸门据此事前拦
+        est_hook = getattr(provider, "estimate_cost", None)
+        if meta.cost_kind and est_hook is not None:
+            try:
+                est = est_hook(orig, args)
+            except Exception:  # noqa: BLE001 — 预估失败就按次数口径走
+                est = None
+            if est:
+                update["estimate"] = dict(est)
+        hook = getattr(provider, "permission_for", None)
+        raised = None
+        if hook is not None:
+            try:
+                raised = hook(orig, args)
+            except Exception:  # noqa: BLE001 — 钩子出错按静态等级走，不能让它拖垮调用
+                raised = None
+        if raised:
+            level, why = raised
+            if level != meta.permission:
+                update["permission"] = PermissionLevel(level)
+                update["summary"] = f"{why}（{meta.summary}）"
+        return meta.model_copy(update=update) if update else meta
 
     async def invoke(self, name: str, args: dict[str, Any]) -> ToolResult:
         """公开入口，**过权限闸门**，并发 TOOL_CALL / TOOL_RESULT 事件。
@@ -240,6 +249,9 @@ class ToolRegistry:
         call_id = f"direct_{uuid.uuid4().hex[:8]}"
         await self.bus.emit(EventType.TOOL_CALL, tool=name, args=args, call_id=call_id)
         result = await self.invoke_ungated(name, args)
+        settle = getattr(self.gate, "settle", None)
+        if meta is not None and callable(settle):
+            settle(meta, args, result)  # 没真花钱的（被拦 / 挂起 / 提交被拒）退回额度
         await self.bus.emit(
             EventType.TOOL_RESULT if result.ok else EventType.TOOL_ERROR,
             tool=name,
@@ -338,7 +350,11 @@ class ScopedRegistry:
             ok, reason = await self.gate.check(meta, args)
             if not ok:
                 return ToolResult(ok=False, error=reason)
-        return await self.parent.invoke_ungated(name, args)
+        result = await self.parent.invoke_ungated(name, args)
+        settle = getattr(self.gate, "settle", None)
+        if callable(settle):
+            settle(meta, args, result)
+        return result
 
     async def invoke_ungated(self, name: str, args: dict[str, Any]) -> ToolResult:
         if name not in self.names:

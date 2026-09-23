@@ -97,7 +97,8 @@ def test_单日媒体次数没单价也拦(tmp_path: Path):
 def test_单任务口径先于日级报():
     g = CostGuard(money_limit=1.0, daily_limit=100, ledger=CostLedger())
     g.usage.add_cost(1.5)
-    assert "单次任务上限" in g.check().reason
+    v = g.check()
+    assert v.level == "task" and "本次开工" in v.reason
 
 
 def test_没有台账时只剩单任务口径():
@@ -131,7 +132,9 @@ def test_brief含今日与项目(tmp_path: Path):
 def test_真实配置三级都有值():
     cg = ModelsConfig.load(ROOT / "config" / "models.yaml").cost_guard
     assert cg.per_task_limit == 200 and cg.per_project_limit == 400 and cg.daily_limit == 800
-    assert cg.daily_call_limits["video"] == 60 and cg.call_limits["video"] == 14
+    # 次数上限按一集的规格留余量（2026-09-23：之前 14 段每集渲到第 15 段必停），加了秒数口径
+    assert cg.daily_call_limits["video"] == 60 and cg.call_limits["video"] == 60
+    assert cg.seconds_limit == 600 and cg.daily_seconds_limit == 3000
 
 
 def test_Agent装配把台账接进了闸门():

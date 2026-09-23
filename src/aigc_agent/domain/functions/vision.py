@@ -98,7 +98,7 @@ class VisionFunctions:
             name="view_image",
             summary="看一张图片：描述内容、人物、场景、画面文字、生成瑕疵，或回答关于它的问题",
             permission=PermissionLevel.COMPUTE,
-            cost_kind="text",
+            # 不设 cost_kind：看图走文本网关，花费由 COST 事件记（闸门再记一次就重了）
             description=(
                 "把图片交给视觉模型看。用途：核对参考图/角色图对不对、看用户给的素材是什么、"
                 "检查生成图有没有文字水印或瑕疵。question 留空就全面描述。"
@@ -122,7 +122,7 @@ class VisionFunctions:
             name="view_video",
             summary="看一段视频：抽帧后按时间顺序描述内容、人物一致性、字幕/文字、穿帮，可选转写音轨",
             permission=PermissionLevel.COMPUTE,
-            cost_kind="text",
+            # 不设 cost_kind：同 view_image
             description=(
                 "把视频按时间均匀抽帧交给视觉模型看。用途：审刚渲出来的片段（变脸？字幕？穿帮？）、"
                 "了解用户素材讲了什么。frames 默认 8，最多 24；transcribe=true 会把音轨转写"

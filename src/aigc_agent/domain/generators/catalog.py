@@ -32,8 +32,15 @@ class MediaModel(BaseModel):
     max_refs: int | None = None
     supports_edit: bool = False
     # 元/张（图）或 元/段（视频），**参考价**。填了 Cost Guard 才能按金额记，
-    # 没填只按次数拦。网关不回传单价，只能靠这里。
+    # 没填只按次数 / 秒数拦。网关不回传单价，只能靠这里。
     price: float | None = None
+    # 视频按秒计价（元/秒，720p 口径）：填了就按「秒数 × 单价 × 分辨率系数」算，
+    # 比按段计准 —— 5 秒和 15 秒一段的价钱差三倍（2026-09-23）
+    price_per_second: float | None = None
+    # 分辨率系数（相对 720p）：如 {"480p": 0.5, "1080p": 2.0}；没写的分辨率按 1
+    resolution_factor: dict[str, float] = Field(default_factory=dict)
+    # 没传时长时按几秒估（视频）
+    default_duration: int | None = None
 
     def brief(self) -> str:
         """进上下文的形态，约 20 token。模型照着这个自己挑。"""
@@ -242,6 +249,44 @@ class MediaCatalog(BaseModel):
             self.polling.max_wait_image
             if kind is MediaKind.IMAGE
             else self.polling.max_wait_video
+        )
+
+    def price_of(
+        self, kind: MediaKind, model_id: str, params: dict | None = None, n: int = 1
+    ) -> float | None:
+        """一次生成的参考价（元）。目录没填单价返回 None（金额口径看不见它）。"""
+        m = self.get(kind, model_id)
+        if m is None:
+            return None
+        params = params or {}
+        if kind is MediaKind.VIDEO and m.price_per_second is not None:
+            secs = self.seconds_of(model_id, params)
+            factor = float(m.resolution_factor.get(str(params.get("resolution") or ""), 1.0))
+            return round(m.price_per_second * secs * factor * max(1, n), 4)
+        if m.price is not None:
+            return round(m.price * max(1, n), 4)
+        return None
+
+    def seconds_of(self, model_id: str, params: dict | None = None) -> float:
+        """一段视频按几秒算（传了 duration 用它，受模型上限约束；没传用目录默认 / 5 秒）。"""
+        m = self.get(MediaKind.VIDEO, model_id)
+        params = params or {}
+        try:
+            secs = float(params.get("duration") or 0)
+        except (TypeError, ValueError):
+            secs = 0.0
+        if secs <= 0:
+            secs = float((m.default_duration if m else None) or 5)
+        if m is not None and m.max_duration:
+            secs = min(secs, float(m.max_duration))
+        return secs
+
+    @property
+    def priced(self) -> bool:
+        """图 / 视频目录里有没有任何一个模型填了单价（没有 = 金额护栏看不见媒体）。"""
+        return any(
+            m.price is not None or m.price_per_second is not None
+            for m in list(self.image) + list(self.video)
         )
 
     def max_concurrency(self, kind: str) -> int:

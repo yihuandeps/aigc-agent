@@ -88,7 +88,6 @@ from ..media.naming import (
     episode_export_name,
     library_reference_names,
     parse_scene,
-    safe_name,
 )
 from ..media.no_text import no_text_retry, parse_subtitle_verdict, subtitle_check_messages
 from ..realism import (
@@ -424,13 +423,13 @@ class DramaFunctions:
 
         self._specs["drama_refresh_refs"] = ToolSpec(
             name="drama_refresh_refs",
-            summary="参考图链接过期时，用本地副本复刻一张新图刷新链接（不换脸）",
-            permission=PermissionLevel.COMPUTE,
-            cost_kind="image",
+            summary="参考图链接过期时，把本地副本重新上传图床换新链接（图不变、不花生成的钱）",
+            permission=PermissionLevel.WRITE,
             description=(
                 "生成接口返回的图片链接约 24 小时失效，之后渲视频时模型拿不到参考图 —— "
-                "表面上「参考 N 图」，实际零参考，人物必漂。这个工具拿本地副本当参考图让生图模型"
-                "逐像素复刻一张（不改脸不改装），得到新链接并生成新的参考图包。"
+                "表面上「参考 N 图」，实际零参考，人物必漂。这个工具把参考图的本地副本重新上传"
+                "到素材托管（config/hosting.yaml 配的图床），换成新链接并生成新的参考图包。"
+                "没配托管就刷不了（生成接口只收公网链接）。"
                 "渲染前看到「链接超过 N 小时」的提示就先跑它。"
             ),
             parameters={
@@ -1279,38 +1278,26 @@ class DramaFunctions:
             )
             if only_stale and not stale:
                 continue
-            # 配了托管：直接把本地副本重新上传 —— 链接换新，图一个像素都不变
-            if self.hosting is not None and self.hosting.enabled:
-                url, err = await self.hosting.ensure_asset(self.store, a, ttl, force=True)
-                if url and not err:
-                    new_images[key].update({"url": url})
-                    refreshed += 1
-                    lines.append(f"  ✓ {key} 重新托管 → {url[:70]}")
-                    continue
-                lines.append(f"  ⚠ {key} 重新托管失败（{err}），改用复刻")
-            payload = self._image_payload(a.id, "")
-            if not payload:
-                lines.append(f"  ✗ {key}：没有本地副本，刷不了")
+            # 只走托管：把本地副本重新上传 —— 链接换新，图一个像素都不变。
+            # 2026-09-23 审查后去掉了「托管不了就让生图模型复刻一张」的退路：生成接口只收
+            # 公网链接，本地图的 data URL 在提交前就会被拒（这条路其实从没走通过）；
+            # 真走通了也是重新生成一张不过任何质检门的图，脸可能变。
+            if self.hosting is None or not self.hosting.enabled:
+                lines.append(
+                    f"  ✗ {key}：没配素材托管，刷不了 —— 生成接口只收公网链接，"
+                    "先按 hosting_status 配好图床（config/hosting.yaml）"
+                )
                 continue
-            kind = str(entry.get("kind") or "")
-            ratio = "3:4" if kind == "角色" else "16:9"
-            aid, url, err = await self._gen_once(
-                {
-                    "prompt": "完全复刻这张参考图：构图、人物长相与发型、服装、背景逐一相同，"
-                    "不做任何改动、不美化、不加文字。",
-                    "model": self.image_model,
-                    "aspect_ratio": ratio,
-                    "summary": f"刷新·{key}",
-                    "local_name": f"参考图-刷新_{safe_name(key)}",
-                    "image": [payload],
-                }
-            )
-            if err:
-                lines.append(f"  ✗ {key}：{err[:100]}")
+            if local_copy(a) is None:
+                lines.append(f"  ✗ {key}：没有本地副本，刷不了（只能重新渲这张参考图）")
                 continue
-            new_images[key].update({"asset": aid, "url": url})
-            refreshed += 1
-            lines.append(f"  ✓ {key} → {aid}")
+            url, err = await self.hosting.ensure_asset(self.store, a, ttl, force=True)
+            if url and not err:
+                new_images[key].update({"url": url})
+                refreshed += 1
+                lines.append(f"  ✓ {key} 重新托管 → {url[:70]}")
+                continue
+            lines.append(f"  ✗ {key}：重新托管失败（{err}）")
         if not refreshed:
             detail = "\n".join(lines) if lines else "  没有需要刷新的（链接都还新鲜）"
             return ToolResult(ok=False, error="一张都没刷新：\n" + detail)

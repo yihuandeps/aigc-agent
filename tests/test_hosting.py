@@ -335,14 +335,15 @@ async def test_刷新参考图_优先重新上传不复刻(tmp_path: Path):
     assert new_pack["陆离"]["asset"] == portrait_id and "重新托管" in r.content
     assert new_pack["陆离"]["url"] == f"https://cdn.example.com/{portrait_id}.png"
 
-    # 上传挂了 → 退回复刻（另起一个库，别让上面已托管的资产干扰）
+    # 上传挂了 → 如实报失败，**不再退回复刻**（2026-09-23：生成接口不收本地图的 data URL，
+    # 复刻这条路从没走通过；真走通了也是一张不过任何质检门、可能换脸的新图）
     store2 = AssetStore()
     h2, _ = _hosting(fail=True)
     fns2 = _drama(store2, tmp_path, h2)
     _, pack2 = _stale_pack(store2, local)
     r2 = await fns2._fn_drama_refresh_refs(rendered_id=pack2)
-    assert r2.ok and "改用复刻" in r2.content
-    assert [a for n, a in fns2.registry.calls if n == "gen_image"]  # type: ignore[attr-defined]
+    assert not r2.ok and "重新托管失败" in (r2.error or "")
+    assert not [a for n, a in fns2.registry.calls if n == "gen_image"]  # type: ignore[attr-defined]
 
 
 def test_钩子_属性():

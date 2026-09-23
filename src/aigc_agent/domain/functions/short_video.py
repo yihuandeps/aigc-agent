@@ -90,7 +90,7 @@ class ShortVideoFunctions:
             name="short_video_brief",
             summary="把抓到的抖音/小红书热点分析归纳成新内容，定切入角度、时长、口播、分镜与素材来源",
             permission=PermissionLevel.COMPUTE,
-            cost_kind="text",
+            # 不设 cost_kind：文本花费由模型调用的 COST 事件记，闸门再记一次就重了（2026-09-23）
             description=(
                 "热点抓完后调。sources 传热点资产 id（douyin_hot_rpa / xhs_collect / "
                 "browse_and_copy / douyin_hot_list 的产物），模型会交叉比对归纳成一段新内容，"
@@ -162,7 +162,7 @@ class ShortVideoFunctions:
             name="short_video_produce",
             summary="按简报出片：缺的镜头并发生成（网络失败重试、重跑复用），配音、字幕、快切合成",
             permission=PermissionLevel.COMPUTE,
-            cost_kind="video",
+            # 不设 cost_kind：它里面每段 gen_video 都单独过闸门计次计秒，外层再记一次就重了
             timeout=7200,
             description=(
                 "素材都定了再调。materials 传 {镜头序号: 资产id}（用户给的或素材站下的；"

@@ -150,7 +150,8 @@ class EpisodePipeline:
                 view["assets_lib"]
                 and not view["refs"]
                 and not self._skip("refs")
-                and await self._budget_ok()
+                and await self._budget_ok("image", self._refs_need(view["assets_lib"]), 0.0,
+                                          "渲参考图")
             ):
                 self._spawn("refs", self._refs(view["assets_lib"]), self._render_sem)
 
@@ -175,25 +176,63 @@ class EpisodePipeline:
             key = f"render:{ep}"
             if self._skip(key) or ep in view["rendered"]:
                 continue
-            if not await self._budget_ok():
+            units, seconds = self._render_need(ep, shots_id)
+            if not await self._budget_ok("video", units, seconds, f"渲第 {ep} 集"):
                 break
             self._spawn(key, self._render(ep, shots_id, view["refs"]), self._render_sem)
 
-    async def _budget_ok(self) -> bool:
-        """花钱的环节（参考图/视频渲染）派发前查预算闸。
+    async def _budget_ok(
+        self, kind: str = "", units: int = 1, seconds: float = 0.0, what: str = "渲染"
+    ) -> bool:
+        """花钱的环节（参考图/视频渲染）派发前查预算闸：按这一步**要花多少**查。
 
-        超支：刹住（_render_paused），打提示 + WARNING —— 不自动烧钱的刹车。
-        恢复（/budget reset）：下一次 reconcile 自动解除。没装闸就放行。
+        之前只查金额口径，而视频没有单价、金额口径看不见它 —— /auto 按集流水一集
+        几十段视频没有任何刹车（2026-09-23 审查）。现在按这一集的段数和秒数查
+        （参考图按张数）。不够：刹住（_render_paused）、说清差多少 —— 后台不弹问题
+        （会和输入框抢输入），人用 /budget set 或 /budget allow 调完额度后自动续派。
+        没装闸就放行。
         """
-        if self.guard is None or self.guard.check():
+        if self.guard is None:
+            return True
+        verdict = self.guard.check(kind, units=max(1, units), seconds=seconds)
+        if verdict:
             self._render_paused = False
             return True
         if not self._render_paused:
             self._render_paused = True
-            msg = "预算护栏触发，流水线渲染暂停派发"
-            self._say(f"⛔ {msg}（/budget reset 清零后自动续派）")
+            need = f"要 {units} 个" + (f"、{seconds:.0f} 秒" if seconds else "")
+            msg = f"额度不够{what}（{need}；{verdict.reason}），流水线暂停派发"
+            self._say(
+                f"⛔ {msg} —— /budget set 调额度或 /budget allow 追加后自动续派"
+            )
             await self.bus.emit(EventType.WARNING, message=msg)
         return False
+
+    def _render_need(self, ep: int, shots_id: str) -> tuple[int, float]:
+        """渲这一集要几段、几秒（按提示词算；读不出来按 1 段 15 秒保守估）。"""
+        try:
+            from ..drama import parse_shots
+
+            shots, err = parse_shots(self.assets.content(shots_id))
+        except Exception:  # noqa: BLE001
+            return 1, 15.0
+        if err or not shots:
+            return 1, 15.0
+        mine = [s for s in shots if s.scene_index.strip("[]").startswith(f"第{ep}集-")] or shots
+        return len(mine), float(sum((s.seconds or 15) for s in mine))
+
+    def _refs_need(self, assets_id: str) -> int:
+        """渲参考图要几张：角色主形象 + 各套服装 + 场景 + 道具。"""
+        try:
+            from ..drama import parse_assets
+
+            lib, err = parse_assets(self.assets.content(assets_id))
+        except Exception:  # noqa: BLE001
+            return 1
+        if err:
+            return 1
+        costumes = sum(len(c.costumes) for c in lib.characters)
+        return max(1, len(lib.characters) + costumes + len(lib.scenes) + len(lib.props))
 
     def _skip(self, key: str) -> bool:
         return key in self._inflight or key in self._failed

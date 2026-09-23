@@ -346,13 +346,8 @@ class Agent:
 
         # 会话现场快照：同名 session 重启后接着上次聊。资产与长期记忆本来就
         # 落盘，会丢的只有滑窗原文。每个 LOOP_END 存一次，读写失败都不打断对话。
+        # （订阅放在 loop 建好之后：挂起中的人审要一起存）
         session_store = SessionSnapshot(workspace / "memory" / "sessions", session_id or "default")
-
-        def _snapshot(ev: Any) -> None:
-            if ev.type is EventType.LOOP_END:
-                session_store.save(memory)
-
-        bus.subscribe(_snapshot)
 
         # 模型锁：会话记住的 > 短剧配置里用户指定的（media_models.yaml drama.video_model /
         # image_model）。留空的 gen_video / gen_image 一律用它；要换的请求挂起问人，
@@ -382,10 +377,21 @@ class Agent:
             role=role,
             guard=guard,
             budget_hint=(
-                "要继续：/budget allow 50 追加 50 元（数字可改）；/budget reset 清零；"
-                "/budget 看用量。"
+                "要继续：/budget allow 50 临时追加 50 元（数字可改）；"
+                "/budget set 金额 300 视频秒 900 改本次开工的额度；/budget 看各级用量。"
+                "（/budget reset 只清零本次开工的用量，台账里的单日 / 单项目累计不清）"
             ),
         )
+
+        def _snapshot(ev: Any) -> None:
+            if ev.type is EventType.LOOP_END:
+                session_store.save(
+                    memory,
+                    pending_review=loop.pending_review,
+                    active_skills=list(getattr(allocator, "active", []) or []),
+                )
+
+        bus.subscribe(_snapshot)
         agent = cls(
             bus, config, gateway, registry, dispatcher, assembler, memory, loop, trace,
             assets, memories, skills, catalog, mem_agent, guard,
@@ -451,6 +457,59 @@ class Agent:
                 await self.mcp.close_all()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---------- 会话恢复（2026-09-23 审查后补的三样） ----------
+
+    async def restore_session(self) -> int:
+        """装回上次的轮次；没结案的人审挂回去；上次加载过的 skill 重新激活。返回装回几轮。
+
+        之前只装轮次：挂起的人审只在内存里，重启后被悄悄补成「已中断」；已加载的 skill
+        没了，历史里却写着「正文已常驻系统区」，模型以为方法论还在。
+        """
+        store = self.session_store
+        if store is None:
+            return 0
+        n = store.load_into(self.memory)
+        pr = store.pending_review
+        if pr and any(t.index == pr.get("turn_index") for t in self.memory.turns):
+            self.loop.pending_review = dict(pr)
+        if self.allocator is not None:
+            for name in store.active_skills:
+                skill = self.skills.get(name)
+                if skill is None:
+                    continue  # 某篇 skill 被删了 / 改名了，跳过
+                try:
+                    await self.allocator.activate_skill(skill)
+                except Exception:  # noqa: BLE001
+                    continue
+        return n
+
+    # ---------- 开工额度（用户规则：每次开工前确认上限 —— 金额 / 次数 / 视频秒数） ----------
+
+    def budget_defaults(self) -> dict[str, Any]:
+        """这次开工拿来问的默认额度：上次确认过的优先，其次配置里的。"""
+        base: dict[str, Any] = dict(self.guard.limits()) if self.guard is not None else {}
+        saved = getattr(self.session_store, "budget", None) or {}
+        base.update({k: v for k, v in saved.items() if v is not None})
+        return base
+
+    def apply_budget(self, limits: dict[str, Any]) -> None:
+        """应用人确认过的额度，并记进会话快照（下次开工当默认值）。"""
+        if self.guard is None:
+            return
+        self.guard.set_limits(
+            money=limits.get("money"),
+            video_calls=limits.get("video_calls"),
+            video_seconds=limits.get("video_seconds"),
+            image_calls=limits.get("image_calls"),
+        )
+        if self.session_store is not None:
+            self.session_store.set_budget(self.guard.limits())
+
+    @property
+    def media_priced(self) -> bool:
+        """媒体目录有没有填单价（没有 = 金额上限看不见视频，只能靠段数 / 秒数拦）。"""
+        return bool(getattr(self.catalog, "priced", False))
 
     async def prepare_turn(self, user_input: str = "") -> None:
         """每轮开始前的两件事：

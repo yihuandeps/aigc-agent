@@ -12,7 +12,9 @@ skill 目录由分配器装配 —— 复活旧 pin 只会把过期约束带回�
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from typing import Any
 
 from ...harness.context.window import ShortTermMemory, Turn
 from ...harness.model.gateway import estimate_tokens
@@ -40,6 +42,12 @@ class SessionSnapshot:
         self.image_model: str = ""
         # 用户选的产线标签（2026-09-23：短剧 / 抖音短视频 / 广告 / 设计；空 = 不限定）
         self.content_line: str = ""
+        # 上次开工确认的额度（金额 / 视频段数 / 视频秒数 / 图片张数），下次开工拿来当默认
+        self.budget: dict[str, Any] = {}
+        # 挂起中的人审（重启前没结案的）。之前只在内存里，重启后被悄悄补成「已中断」
+        self.pending_review: dict[str, Any] | None = None
+        # 上次加载过的 skill：重启后要重新激活，否则历史里写着「正文已常驻」其实没了
+        self.active_skills: list[str] = []
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -47,6 +55,12 @@ class SessionSnapshot:
                 self.video_model = str(data.get("video_model") or "")
                 self.image_model = str(data.get("image_model") or "")
                 self.content_line = str(data.get("content_line") or "")
+                b = data.get("budget")
+                self.budget = dict(b) if isinstance(b, dict) else {}
+                pr = data.get("pending_review")
+                self.pending_review = dict(pr) if isinstance(pr, dict) else None
+                sk = data.get("active_skills")
+                self.active_skills = [str(x) for x in sk] if isinstance(sk, list) else []
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -70,7 +84,12 @@ class SessionSnapshot:
         self.content_line = key
         self._patch({"content_line": key})
 
-    def _patch(self, fields: dict[str, str]) -> None:
+    def set_budget(self, limits: dict[str, Any]) -> None:
+        """记住这次开工确认的额度，下次开工当默认值拿出来问。"""
+        self.budget = {k: v for k, v in limits.items() if v is not None}
+        self._patch({"budget": self.budget})
+
+    def _patch(self, fields: dict[str, Any]) -> None:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
@@ -78,9 +97,15 @@ class SessionSnapshot:
         except (OSError, json.JSONDecodeError):
             data = {}
         data.update({"format": FORMAT, "name": self.name, **fields})
+        self._write(data)
+
+    def _write(self, data: dict[str, Any]) -> None:
+        """原子写：先写临时文件再替换 —— 写一半断电/被杀，旧快照还在（2026-09-23 审查）。"""
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.path)
         except OSError:
             pass  # 记不住不挡聊天
 
@@ -126,30 +151,45 @@ class SessionSnapshot:
                     break
                 picked.append(t)
                 total += size
+            dropped = turns[: len(turns) - len(picked)]
             turns = list(reversed(picked))
+            # 截掉的轮次之前是直接丢 —— 它们从没进过记忆提取（2026-09-23 审查），
+            # 下一次快照一覆盖就永久没了。先交给记忆提取再丢。
+            if dropped and memory.on_evict is not None:
+                try:
+                    memory.on_evict(dropped)
+                except Exception:  # noqa: BLE001 — 提取失败不挡会话恢复
+                    pass
         memory.turns = turns
         # 轮次编号接续旧会话，新开的轮不会和装回的撞车
         memory._next_index = max(int(data.get("next_index") or 0), turns[-1].index + 1)
         return len(turns)
 
-    def save(self, memory: ShortTermMemory) -> None:
+    def save(
+        self,
+        memory: ShortTermMemory,
+        pending_review: dict[str, Any] | None = None,
+        active_skills: list[str] | None = None,
+    ) -> None:
         """落盘当前窗口。写失败不上抛 —— 快照是锦上添花，不该打断对话。"""
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "format": FORMAT,
-                "name": self.name,
-                "next_index": memory._next_index,
-                # 产物目录、两个模型锁跟着轮次一起存 —— save 是整体重写，不带就丢了
-                "output_dir": self.output_dir,
-                "video_model": self.video_model,
-                "image_model": self.image_model,
-                "content_line": self.content_line,
-                "turns": [
-                    {"index": t.index, "tokens": t.tokens, "messages": t.messages}
-                    for t in memory.turns
-                ],
-            }
-            self.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
+        self.pending_review = dict(pending_review) if pending_review else None
+        if active_skills is not None:
+            self.active_skills = list(active_skills)
+        payload = {
+            "format": FORMAT,
+            "name": self.name,
+            "next_index": memory._next_index,
+            # 产物目录、模型锁、产线、额度跟着轮次一起存 —— save 是整体重写，不带就丢了
+            "output_dir": self.output_dir,
+            "video_model": self.video_model,
+            "image_model": self.image_model,
+            "content_line": self.content_line,
+            "budget": self.budget,
+            "pending_review": self.pending_review,
+            "active_skills": self.active_skills,
+            "turns": [
+                {"index": t.index, "tokens": t.tokens, "messages": t.messages}
+                for t in memory.turns
+            ],
+        }
+        self._write(payload)

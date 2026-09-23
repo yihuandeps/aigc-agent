@@ -28,6 +28,25 @@ def _cost_units(meta: ToolMeta, args: dict[str, Any]) -> int:
     return max(1, len(value)) if isinstance(value, (list, tuple)) else 1
 
 
+def _charge(meta: ToolMeta, args: dict[str, Any]) -> tuple[int, float, float | None]:
+    """这次调用记多少：(次数, 视频秒数, 金额)。provider 给了预估用预估，没有就只按次数。"""
+    est = meta.estimate or {}
+    try:
+        units = int(est.get("units") or 0) or _cost_units(meta, args)
+    except (TypeError, ValueError):
+        units = _cost_units(meta, args)
+    try:
+        seconds = float(est.get("seconds") or 0.0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    money = est.get("money")
+    try:
+        money = float(money) if money is not None else None
+    except (TypeError, ValueError):
+        money = None
+    return max(1, units), max(0.0, seconds), money
+
+
 class Decision(StrEnum):
     ALLOW = "allow"
     ASK = "ask"
@@ -131,12 +150,14 @@ class PermissionGate:
         ):
             return True, why
 
-        # 批量工具一次生成 N 个就要记 N 次，否则 gen_videos 跑 20 段只算 1 次，
-        # 预算护栏等于没有（2026-09-19）。
-        units = _cost_units(meta, args)
-        verdict = self.guard.check(meta.cost_kind, units=units)
+        # 这次调用要花多少：provider 按参数给的预估（段数 / 视频秒数 / 金额），没有就只按
+        # 次数算。批量工具一次生成 N 个就要记 N 次，否则 gen_videos 跑 20 段只算 1 次，
+        # 预算护栏等于没有（2026-09-19）；秒数和金额在**放行前**就算进去 —— 并发的一批
+        # 完成前互相看不见，事后记账拦不住一整批（2026-09-23 审查）。
+        units, seconds, money = _charge(meta, args)
+        verdict = self.guard.check(meta.cost_kind, units=units, money=money or 0.0, seconds=seconds)
         if verdict:
-            self.guard.record_call(meta.cost_kind, n=units)
+            self.guard.record_call(meta.cost_kind, n=units, seconds=seconds, money=money)
             return True, why
 
         await self.bus.emit(
@@ -144,6 +165,8 @@ class PermissionGate:
             tool=meta.name,
             kind=meta.cost_kind,
             reason=verdict.reason,
+            dimension=verdict.dimension,
+            level=verdict.level,
             usage=self.guard.usage.brief(),
         )
         if self.guard.on_exceed != "pause_and_ask" or self.asker is None:
@@ -154,8 +177,7 @@ class PermissionGate:
 
         asked = meta.model_copy(
             update={
-                "summary": f"⚠ 预算护栏：{verdict.reason}",
-                # 结构化标记给 auto 模式的询问器：次数口径可自动放行，金额口径仍问人
+                "summary": f"⚠ 预算护栏：超出开工时确认的额度 —— {verdict.reason}",
                 "budget_ask": True,
                 "budget_money": verdict.money,
             }
@@ -168,6 +190,37 @@ class PermissionGate:
             )
             return False, f"预算护栏拦下 {meta.name}：{verdict.reason}（用户未放行）"
 
-        self.guard.allow_more(meta.cost_kind, n=units)
-        self.guard.record_call(meta.cost_kind, n=units)
+        self.guard.allow_more(meta.cost_kind, n=units, seconds=seconds)
+        if money:
+            self.guard.allow_more_money(money)
+        self.guard.record_call(meta.cost_kind, n=units, seconds=seconds, money=money)
         return True, "超预算，用户已确认本次放行"
+
+    def settle(self, meta: ToolMeta, args: dict[str, Any], result: Any) -> None:
+        """执行完结算：放行时记的账里，**没真花出去**的退回来。
+
+        之前闸门一放行就计次，模型切换挂起问人、参考图门拦下、提交被服务端拒收这些
+        一分钱没花的调用也占着额度，重新调一次再记一遍 —— 次数护栏误报（2026-09-23 审查）。
+        工具在 result.meta 里说明：charged=False（整次没花）或 refund_units / refund_seconds /
+        refund_money（批量里没花出去的那部分）。挂起问人一律全退。
+        """
+        if (
+            self.guard is None
+            or meta.permission is not PermissionLevel.COMPUTE
+            or not meta.cost_kind
+            or result is None
+        ):
+            return
+        rmeta = getattr(result, "meta", None) or {}
+        units, seconds, money = _charge(meta, args)
+        if getattr(result, "suspend", False) or rmeta.get("charged") is False:
+            self.guard.refund(meta.cost_kind, n=units, seconds=seconds, money=money)
+            return
+        ru = int(rmeta.get("refund_units") or 0)
+        rs = float(rmeta.get("refund_seconds") or 0.0)
+        rm = rmeta.get("refund_money")
+        if ru or rs or rm:
+            self.guard.refund(
+                meta.cost_kind, n=min(ru, units), seconds=min(rs, seconds),
+                money=float(rm) if rm else None,
+            )

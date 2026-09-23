@@ -51,13 +51,14 @@ class Kind(StrEnum):
     AUDIO = "audio"
 
 
-# 各类媒体调用的默认次数上限（单次任务内）。
-# 取值依据是实际链路的用量：一集短剧 6 段视频 + 7 张资产图，
-# 一条短视频 6 段视频。**留一倍余量**，正常跑不会撞到，
-# 跑飞了（模型反复重试、循环调用）会。可在 models.yaml 的 cost_guard.call_limits 覆盖。
+# 各类媒体调用的默认次数上限（单次开工内）。
+# 2026-09-23 审查：之前按「一集 6 段视频 + 7 张图」定成 14 / 24，而一集 4 分钟是 16–28 段、
+# 一套参考图包 40 张上下 —— 每集渲到第 15 段必停，还提示「多半是循环调用」，真实会话里
+# 36 分钟弹了 40 次，人被训练成一路点「是」。现在按一集的规格 + 质检重生成留余量；
+# 开工时会让人确认/改（CLI），可在 models.yaml 的 cost_guard.call_limits 覆盖。
 DEFAULT_CALL_LIMITS: dict[str, int] = {
-    Kind.IMAGE: 24,
-    Kind.VIDEO: 14,
+    Kind.IMAGE: 80,
+    Kind.VIDEO: 60,
     Kind.AUDIO: 40,
 }
 
@@ -69,6 +70,9 @@ class Usage:
     money: float = 0.0  # 已知单价的部分，元
     unpriced: int = 0  # 算不出钱的调用次数（文本没 pricing，或媒体目录没填单价）
     calls: dict[str, int] = field(default_factory=dict)
+    # 生成的视频总秒数。**不依赖单价**的视频刹车：媒体目录没填价格时金额口径看不见视频，
+    # 段数又不反映长短，秒数才是视频花费的自然单位（2026-09-23 审查）
+    seconds: float = 0.0
 
     def add_call(self, kind: str) -> None:
         self.calls[kind] = self.calls.get(kind, 0) + 1
@@ -86,6 +90,8 @@ class Usage:
 
     def brief(self) -> str:
         parts = [f"{k} {n} 次" for k, n in sorted(self.calls.items()) if n]
+        if self.seconds:
+            parts.append(f"视频 {self.seconds:.0f} 秒")
         head = f"¥{self.money:.4f}" if self.money else "金额未知"
         tail = f"（{self.unpriced} 次调用无单价）" if self.unpriced else ""
         return f"{head} · {' / '.join(parts) if parts else '无调用'}{tail}"
@@ -95,9 +101,11 @@ class Usage:
 class Verdict:
     ok: bool
     reason: str = ""
-    # True = 金额口径超限（单次任务/项目/单日）。False = 次数口径。
-    # auto 模式据此区分：次数护栏可自动放行，金额护栏永远问人 —— 钱是最后一道闸。
+    # True = 金额口径超限（单次任务/项目/单日）。False = 次数 / 秒数口径。
     money: bool = False
+    # 哪一维撞线：money / calls / seconds；哪一级：task（本次开工）/ day / project
+    dimension: str = ""
+    level: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
@@ -120,6 +128,10 @@ class CostGuard:
     # 人在金额超限时批准的临时追加（元）。三级金额上限都加上它 —— 人说了
     # "继续"就是继续，不该换个口径再拦一次。reset() 清零，不改配置。
     extra_money: float = 0.0
+    # ---- 视频秒数口径（2026-09-23）----
+    seconds_limit: float | None = None  # 本次开工
+    daily_seconds_limit: float | None = None  # 单日（跨会话，靠台账）
+    extra_seconds: float = 0.0
     # ---- 跨会话（P5）----
     project_limit: float | None = None
     daily_limit: float | None = None
@@ -150,6 +162,8 @@ class CostGuard:
             on_exceed=str(getattr(cfg, "on_exceed", "pause_and_ask") or "pause_and_ask"),
             project_limit=getattr(cfg, "per_project_limit", None),
             daily_limit=getattr(cfg, "daily_limit", None),
+            seconds_limit=getattr(cfg, "seconds_limit", None),
+            daily_seconds_limit=getattr(cfg, "daily_seconds_limit", None),
             daily_call_limits=daily,
             ledger=ledger,
             project_id=project_id or "default",
@@ -199,14 +213,37 @@ class CostGuard:
         self.usage.add(kind, cost)
         self._ledger(kind, cost, calls=1)
 
-    def record_call(self, kind: str, n: int = 1) -> None:
-        """闸门放行媒体调用时记 n 次。金额（若目录有单价）由 COST 事件补。
+    def record_call(
+        self, kind: str, n: int = 1, seconds: float = 0.0, money: float | None = None
+    ) -> None:
+        """闸门放行媒体调用时记账：n 次、视频 seconds 秒、预估金额 money（目录有单价时）。
 
         n > 1 是批量工具：一次 gen_videos 生成几段就记几次，不然预算护栏拦不住。
+        金额在**放行时**按目录单价记（提交即计费），不再等生成完从 COST 事件补 ——
+        并发的一批在完成前都看不见彼此的花费，事后记账拦不住一整批。
         """
-        for _ in range(max(1, int(n))):
+        n = max(1, int(n))
+        for _ in range(n):
             self.usage.add_call(kind)
-        self._ledger(kind, None, calls=max(1, int(n)))
+        self.usage.seconds += max(0.0, float(seconds or 0.0))
+        if money is not None:
+            self.usage.money += max(0.0, float(money))
+        self._ledger(kind, money, calls=n, seconds=float(seconds or 0.0))
+
+    def refund(
+        self, kind: str, n: int = 0, seconds: float = 0.0, money: float | None = None
+    ) -> None:
+        """放行后发现没真花钱（被拦下、挂起问人、提交被拒）：把记的账退回来。"""
+        n = max(0, int(n))
+        if n:
+            self.usage.calls[kind] = max(0, self.usage.calls.get(kind, 0) - n)
+        self.usage.seconds = max(0.0, self.usage.seconds - max(0.0, float(seconds or 0.0)))
+        if money:
+            self.usage.money = max(0.0, self.usage.money - float(money))
+        if n or seconds or money:
+            self._ledger(
+                kind, -float(money) if money else None, calls=-n, seconds=-float(seconds or 0.0)
+            )
 
     # ---------- 判定 ----------
 
@@ -214,60 +251,123 @@ class CostGuard:
         base = self.call_limits.get(kind)
         return None if base is None else base + self.extra.get(kind, 0)
 
-    def check(self, kind: str = "", units: int = 1) -> Verdict:
+    def check(
+        self, kind: str = "", units: int = 1, money: float = 0.0, seconds: float = 0.0
+    ) -> Verdict:
         """**在发起调用之前**问。事后拦没有意义 —— 钱已经花了。
 
-        顺序：单任务 → 单日 → 单项目。哪一级先超就报哪一级。
-        units > 1 是批量调用：要一次性放得下这么多，不能放一半进去。
+        顺序：本次开工 → 单日 → 单项目。哪一级先超就报哪一级。
+        units / money / seconds 是**这次调用**的预估（批量调用按总量）：
+        要一次性放得下，不能放一半进去。
         """
         units = max(1, int(units))
+        money = max(0.0, float(money or 0.0))
+        seconds = max(0.0, float(seconds or 0.0))
         bonus = self.extra_money
-        if self.money_limit is not None and self.usage.money >= self.money_limit + bonus:
+        this = f"（这次预估 ¥{money:.2f}）" if money else ""
+        cap = (self.money_limit or 0.0) + bonus
+        if self.money_limit is not None and _over(self.usage.money, money, cap):
             return Verdict(
                 False,
-                f"已花 ¥{self.usage.money:.4f}，达到单次任务上限 ¥{self.money_limit + bonus:.2f}",
-                money=True,
+                f"本次开工已花 ¥{self.usage.money:.4f}{this}，"
+                f"超过上限 ¥{self.money_limit + bonus:.2f}",
+                money=True, dimension="money", level="task",
             )
         if kind:
             limit = self.limit_for(kind)
             used = self.usage.calls.get(kind, 0)
             if limit is not None and used + units > limit:
-                more = f"，本次要 {units} 个" if units > 1 else ""
+                more = f"，这次要 {units} 个" if units > 1 else ""
                 return Verdict(
                     False,
-                    f"{kind} 已调用 {used} 次{more}，达到单次任务上限 {limit} 次。"
-                    "正常链路用不到这么多，多半是循环调用或反复重试。",
+                    f"{_KIND_LABEL.get(kind, kind)}本次开工已用 {used} 次{more}，"
+                    f"超过确认的上限 {limit} 次",
+                    dimension="calls", level="task",
+                )
+        if seconds and self.seconds_limit is not None:
+            cap = self.seconds_limit + self.extra_seconds
+            if self.usage.seconds + seconds > cap:
+                return Verdict(
+                    False,
+                    f"视频本次开工已生成 {self.usage.seconds:.0f} 秒，这次要 {seconds:.0f} 秒，"
+                    f"超过确认的上限 {cap:.0f} 秒",
+                    dimension="seconds", level="task",
                 )
         if self.ledger is not None:
             day = today()
             spent_today = self.ledger.money(day=day)
-            if self.daily_limit is not None and spent_today >= self.daily_limit + bonus:
+            if self.daily_limit is not None and _over(spent_today, money, self.daily_limit + bonus):
                 return Verdict(
                     False,
-                    f"今日已花 ¥{spent_today:.4f}，达到单日上限 ¥{self.daily_limit + bonus:.2f}",
-                    money=True,
+                    f"今日已花 ¥{spent_today:.4f}{this}，达到单日上限 "
+                    f"¥{self.daily_limit + bonus:.2f}",
+                    money=True, dimension="money", level="day",
                 )
             spent_project = self.ledger.money(project=self.project_id)
-            if self.project_limit is not None and spent_project >= self.project_limit + bonus:
+            if self.project_limit is not None and _over(
+                spent_project, money, self.project_limit + bonus
+            ):
                 return Verdict(
                     False,
-                    f"项目 {self.project_id} 已花 ¥{spent_project:.4f}，"
+                    f"项目「{self.project_id}」已花 ¥{spent_project:.4f}{this}，"
                     f"达到单项目上限 ¥{self.project_limit + bonus:.2f}",
-                    money=True,
+                    money=True, dimension="money", level="project",
                 )
             if kind and kind in self.daily_call_limits:
                 used = self.ledger.calls(kind, day=day)
                 limit = self.daily_call_limits[kind]
-                if used >= limit + self.extra.get(f"day:{kind}", 0):
+                if used + units > limit + self.extra.get(f"day:{kind}", 0):
                     return Verdict(
-                        False, f"{kind} 今日已调用 {used} 次，达到单日上限 {limit} 次"
+                        False,
+                        f"{_KIND_LABEL.get(kind, kind)}今日已调用 {used} 次，"
+                        f"达到单日上限 {limit} 次",
+                        dimension="calls", level="day",
+                    )
+            if seconds and self.daily_seconds_limit is not None:
+                used_s = self.ledger.seconds(day=day)
+                cap = self.daily_seconds_limit + self.extra_seconds
+                if used_s + seconds > cap:
+                    return Verdict(
+                        False,
+                        f"视频今日已生成 {used_s:.0f} 秒，这次要 {seconds:.0f} 秒，"
+                        f"达到单日上限 {cap:.0f} 秒",
+                        dimension="seconds", level="day",
                     )
         return Verdict(True)
 
-    def allow_more(self, kind: str, n: int = 1) -> None:
-        """人确认后放行：只给这一类加 n 次额度，不动配置。日级次数同样临时加。"""
+    def allow_more(self, kind: str, n: int = 1, seconds: float = 0.0) -> None:
+        """人确认后放行：只给这一类加 n 次（视频再加 seconds 秒）额度，不动配置。"""
         self.extra[kind] = self.extra.get(kind, 0) + n
         self.extra[f"day:{kind}"] = self.extra.get(f"day:{kind}", 0) + n
+        self.extra_seconds += max(0.0, float(seconds or 0.0))
+
+    # ---------- 开工额度（2026-09-23：用户规则「每次开工前确认上限」）----------
+
+    def limits(self) -> dict[str, float | int | None]:
+        """当前的本次开工额度（给 CLI 展示 / 写进会话快照）。"""
+        return {
+            "money": self.money_limit,
+            "video_calls": self.call_limits.get(Kind.VIDEO),
+            "video_seconds": self.seconds_limit,
+            "image_calls": self.call_limits.get(Kind.IMAGE),
+        }
+
+    def set_limits(
+        self,
+        money: float | None = None,
+        video_calls: int | None = None,
+        video_seconds: float | None = None,
+        image_calls: int | None = None,
+    ) -> None:
+        """人确认过的本次开工额度。给了哪项改哪项。"""
+        if money is not None:
+            self.money_limit = float(money)
+        if video_calls is not None:
+            self.call_limits[Kind.VIDEO] = int(video_calls)
+        if video_seconds is not None:
+            self.seconds_limit = float(video_seconds)
+        if image_calls is not None:
+            self.call_limits[Kind.IMAGE] = int(image_calls)
 
     def allow_more_money(self, amount: float) -> float:
         """人确认后临时追加金额（元），三级上限一起抬。返回累计追加。
@@ -279,9 +379,11 @@ class CostGuard:
         return self.extra_money
 
     def reset(self) -> None:
+        """清零**本次开工**的用量（新开一段工）。台账里的单日 / 单项目累计不动。"""
         self.usage = Usage()
         self.extra = {}
         self.extra_money = 0.0
+        self.extra_seconds = 0.0
 
     @property
     def blind(self) -> bool:
@@ -295,7 +397,10 @@ class CostGuard:
         money = f"¥{self.money_limit:.2f}" if self.money_limit is not None else "未设"
         if self.extra_money:
             money += f"（临时追加 ¥{self.extra_money:.0f}）"
-        text = f"{self.usage.brief()} · 上限 金额 {money} · 次数 {limits}"
+        secs = ""
+        if self.seconds_limit is not None:
+            secs = f" · 视频 ≤{self.seconds_limit + self.extra_seconds:.0f} 秒"
+        text = f"本次开工 {self.usage.brief()} · 上限 金额 {money} · 次数 {limits}{secs}"
         if self.ledger is not None:
             s = self.ledger.summary(self.project_id)
             daily = f"¥{self.daily_limit:.2f}" if self.daily_limit is not None else "未设"
@@ -306,3 +411,11 @@ class CostGuard:
                 f"项目 {self.project_id} ¥{s['project_money']:.4f}（上限 {proj}）"
             )
         return text
+
+
+_KIND_LABEL = {"image": "生图", "video": "视频", "audio": "配音/转写", "text": "文本"}
+
+
+def _over(spent: float, this: float, cap: float) -> bool:
+    """已经花到上限（不管这次多少都拦），或者这次的预估会把它推过上限。"""
+    return spent >= cap or (this > 0 and spent + this > cap)

@@ -84,6 +84,7 @@ class ToolDispatcher:
                             args,
                             meta.timeout or self.timeout,
                             meta.max_result_chars or MAX_RESULT_CHARS,
+                            meta,
                         )
                     )
                     for call, args, meta in approved
@@ -102,6 +103,7 @@ class ToolDispatcher:
         args: dict[str, Any],
         timeout_s: float,
         max_chars: int = MAX_RESULT_CHARS,
+        meta: ToolMeta | None = None,
     ) -> ToolResult:
         await self.bus.emit(EventType.TOOL_CALL, tool=call.name, args=args, call_id=call.id)
         try:
@@ -120,6 +122,9 @@ class ToolDispatcher:
             )
         except Exception as e:  # noqa: BLE001 — 单个工具崩溃不能打断整轮
             result = ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
+        settle = getattr(self.gate, "settle", None)
+        if meta is not None and callable(settle):
+            settle(meta, args, result)  # 没真花钱的退回额度
         self._completed[call.id] = result
 
         if result.ok and len(result.content) > max_chars:

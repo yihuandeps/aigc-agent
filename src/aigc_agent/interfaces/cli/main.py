@@ -34,6 +34,7 @@ from ...harness.model.config import ModelsConfig  # noqa: E402
 from ...harness.tools.provider import ToolMeta  # noqa: E402
 from .analytics_cmd import app as analytics_app  # noqa: E402
 from .assets_cmd import app as assets_app  # noqa: E402
+from .budget_prompt import parse_budget, render_budget  # noqa: E402
 from .drama_cmd import app as drama_app  # noqa: E402
 from .graph_cmd import app as graph_app  # noqa: E402
 from .inputhub import InputHub  # noqa: E402
@@ -203,6 +204,31 @@ async def _ask_permission(meta: ToolMeta, args: dict[str, Any], hub: InputHub) -
     return answer.strip().lower() in {"y", "yes"}
 
 
+async def _confirm_budget(agent: Agent, hub: InputHub) -> None:
+    """开工额度确认：把这次开工的额度列出来，回车确认或当场改（用户 2026-09-13 定的规则）。"""
+    if agent.guard is None:
+        return
+    current = agent.budget_defaults()
+    console.print(
+        Panel(
+            render_budget(current, agent.media_priced),
+            title="开工额度（这次开工最多花这些，超了会停下来问你）",
+            border_style="yellow",
+        )
+    )
+    raw = (
+        await hub.ask(
+            "[bold yellow]回车按这个开工；要改就输入"
+            "（如：金额 300 视频秒 900 视频 80 图 100）：[/] "
+        )
+    ).strip()
+    changes = parse_budget(raw) if raw else {}
+    if raw and not changes:
+        console.print("[dim]没认出来，按上面的额度开工；/budget set 随时改[/]")
+    agent.apply_budget({**current, **changes})
+    console.print(f"[green]额度已确认[/] [dim]{agent.guard.brief()}[/]\n")
+
+
 async def _watched(hub: InputHub, coro: Any) -> LoopResult | None:
     """跑一轮并让输入枢纽盯着：期间能排队/停止/插队。被人停掉返回 None。"""
     try:
@@ -290,13 +316,21 @@ async def _decide_review(agent: Agent, board: ProgressBoard, hub: InputHub) -> L
     while True:
         raw = await hub.ask("> ")
         if raw.strip().lower() in {"/auto on", "/auto 开"}:
-            # 在决策口开 /auto：本次按采纳结案，后续人审也不再逐条问
+            # 在决策口开 /auto：后续小节点人审不再逐条问
             agent.loop.auto_review = True
             agent.pipeline.enabled = True
             agent.pipeline.on_enable()
+            if agent.loop._is_major_review(pending):  # noqa: SLF001
+                # 2026-09-23 审查：之前这里不分大小节点一律按采纳结案 —— 挂着的若是「视频模型
+                # 切换」，锁就被换了，而屏幕上说的是「大节点仍会问你」。大节点这条照样要人定。
+                console.print(
+                    "[green]自动模式已开[/]（之后的小节点自动采纳）。"
+                    "[yellow]但眼前这条是大节点，仍需你来定：[/]"
+                )
+                continue
             console.print(
                 "[green]自动模式已开[/]：本次按采纳结案，后续小节点人审自动采纳，"
-                "大节点（剧本/视频生成/图片生成）仍会停下来问你一次。"
+                "大节点（剧本/视频生成/图片生成/换模型）仍会停下来问你一次。"
             )
             return await _watched(hub, _resume("adopt", decided_by="auto"))
         parsed = _parse_decision(raw)
@@ -461,6 +495,12 @@ async def _doctor(cache: bool = False) -> None:
 
     agent = Agent.create()
     try:
+        if not agent.media_priced:
+            # 之前这里照样打绿勾（2026-09-23 审查）—— 可媒体没单价时金额上限根本看不见视频
+            console.print(
+                "[yellow]⚠[/] 媒体模型都没配单价（config/media_models.yaml 的 price / "
+                "price_per_second）：金额上限只管文本，视频靠「段数 / 秒数」上限管"
+            )
         await agent.setup()
         tools = agent.registry.catalog()
         console.print(f"[green]✓[/] 工具注册表：{len(tools)} 个")
@@ -575,11 +615,9 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
     hub.start()
 
     async def _asker(meta: ToolMeta, args: dict[str, Any]) -> bool:
-        # auto 模式：次数护栏自动放行（每次都打印，看得见）；
-        # 金额护栏（budget_money）仍停下来问人 —— 钱是最后一道闸。
-        if meta.budget_ask and not meta.budget_money and agent.loop.auto_review:
-            console.print(f"  [yellow]⚠ {meta.summary} —— auto 自动放行[/]")
-            return True
+        # 超出开工时确认的额度：一律停下来问人，/auto 也问（2026-09-23 审查：之前 /auto 下
+        # 次数超限自动放行，视频又没有单价 —— 视频花费等于没有刹车）。额度是人开工时
+        # 点过头的，超出它就得人再点一次头。
         # 进度窗开着的时候先暂停再提问 —— 否则输入提示和刷新区域叠在一起
         with board.paused():
             return await _ask_permission(meta, args, hub)
@@ -612,7 +650,7 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
     # 按集流水管线的派发/完成提示（/auto on 时才开始派发，提示随时可见）
     agent.pipeline.note = lambda m: console.print(f"[dim]{m}[/]")
     await agent.setup()
-    restored = agent.session_store.load_into(agent.memory) if agent.session_store else 0
+    restored = await agent.restore_session()
 
     # 产物目录（2026-09-22 用户定）：**默认就是他打开 Agent 的这个文件夹**，不再问一次 ——
     # 内容都在本地跑，生成的东西该落在他眼前的目录里。老 session 沿用记住的，/out 随时改。
@@ -645,6 +683,9 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
         elif not is_off(pick):
             console.print("[dim]没认出来，先不限定；/type 随时选[/]\n")
 
+    # 开工额度（用户规则：每次开工前确认上限 —— 金额 / 次数 / 视频秒数）
+    await _confirm_budget(agent, hub)
+
     provider, _ = agent.config.text.resolve(role)
     console.print(
         Panel(
@@ -660,12 +701,15 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
             f"生图模型 [bold]{getattr(agent.media_fns, 'image_lock', '') or '未锁定'}[/]"
             "（换模型会先问你：对话里说要换哪个，确认 a 才生效）\n"
             f"[dim]/exit 退出   /stat 状态   /tools 工具   /trace 痕迹   /mermaid 流程图\n"
-            f"/rollback <资产id> 回退到某版本重来   /budget 预算用量   /budget reset 清零\n"
-            f"/budget allow 50 金额超限后临时追加 50 元继续（撞上限时也会当场问你）\n"
+            f"/rollback <资产id> 回退到某版本重来   /budget 各级用量与额度\n"
+            f"/budget set 金额 300 视频秒 900 视频 80 图 100 改本次开工的额度"
+            f"   /budget allow 50 临时追加 50 元\n"
+            f"/budget reset 新开一段工（清零本次开工的用量；单日 / 单项目累计在台账里，不清）\n"
             f"/rename 把已生成的图/视频改成带序号的可读文件名（/rename dry 只看计划）\n"
             f"/brief 记忆简报   /skills 已加载的 skill 与能力区占用\n"
             f"模型请人审时会暂停等你决策：a 采纳（可带补充）· r 打回（必填理由）· j 退回\n"
-            f"/auto on 后小节点人审自动采纳、大节点（剧本/视频生成/图片生成）仍问你一次，\n"
+            f"/auto on 后小节点人审自动采纳、大节点（剧本/视频生成/图片生成）仍问你一次，"
+            f"超出开工额度也仍问你，\n"
             f"挂起/撞线的活当场接着跑不用再发话触发（长剧批量出稿用），Ctrl+C 随时叫停\n"
             f"生成过程中照样能打字：会排队、本轮结束后自动发送；/stop 立即停止当前一轮，\n"
             f"/now <消息> 停止当前并立即发送这条；/queue 看排队、/queue clear 清空\n"
@@ -679,6 +723,15 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
             f"[green]↺ 已恢复上次会话的 {restored} 轮对话[/]"
             "[dim]（换个 --session 名就是全新会话）[/]"
         )
+    if agent.loop.pending_review is not None:
+        # 上次退出前有一条人审没结案 —— 之前重启后被悄悄补成「已中断」，这里接着问
+        console.print("[yellow]上次退出前有一条人审还没结案，先把它定下来：[/]")
+        try:
+            pending_result = await _decide_review(agent, board, hub)
+            if pending_result is not None:
+                _print_result(pending_result)
+        except KeyboardInterrupt:
+            console.print("[yellow]已中断 —— 下一条输入会先补这个决策[/]")
 
     # 上一轮怎么停下的。/auto on 要看它决定要不要把停下的活当场接着跑。
     last_result: LoopResult | None = None
@@ -769,7 +822,21 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                 elif arg == "reset":
                     agent.guard.reset()
                     agent.pipeline.kick()  # 预算恢复 → 流水线渲染刹车自动解除
-                    console.print("[dim]预算计数已清零（上限不变）[/]")
+                    console.print(
+                        "[dim]本次开工的用量已清零（额度不变）；"
+                        "台账里的单日 / 单项目累计不清 —— 撞的是那两级就用 /budget allow[/]"
+                    )
+                elif arg.startswith("set"):
+                    changes = parse_budget(arg[len("set"):])
+                    if not changes:
+                        console.print(
+                            "[yellow]用法：/budget set 金额 300 视频秒 900 视频 80 图 100"
+                            "（写哪项改哪项）[/]"
+                        )
+                        continue
+                    agent.apply_budget({**agent.budget_defaults(), **changes})
+                    agent.pipeline.kick()
+                    console.print(f"[green]额度已改[/] [dim]{agent.guard.brief()}[/]")
                 elif arg.startswith("allow"):
                     amount = arg[len("allow"):].strip() or "50"
                     try:

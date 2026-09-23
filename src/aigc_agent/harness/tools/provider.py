@@ -57,6 +57,10 @@ class ToolMeta(BaseModel):
     # 自动放行次数护栏，金额护栏永远问人。
     budget_ask: bool = False
     budget_money: bool = False
+    # 这一次调用的花费预估（注册表按参数问 provider 的 estimate_cost 得到）：
+    # {"units": 段数/张数, "seconds": 视频秒数, "money": 元（目录有单价时）}。
+    # 闸门按它**事前**拦 —— 金额、段数、秒数都要在花之前算清（2026-09-23 审查）
+    estimate: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolResult(BaseModel):

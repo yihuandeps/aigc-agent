@@ -94,7 +94,7 @@ async def test_计次工具超限后被闸门拦下():
     assert (await registry.invoke("gen", {})).ok
     third = await registry.invoke("gen", {})
     assert not third.ok
-    assert "预算护栏" in third.error and "image" in third.error
+    assert "预算护栏" in third.error and "生图" in third.error
 
     assert paid.calls == ["gen", "gen"], "拦下的那次不能真的发出去"
     assert guard.usage.calls["image"] == 2
@@ -212,8 +212,12 @@ async def test_目录填了单价就写进资产并发COST事件():
     r = await registry.invoke("gen_image", {"prompt": "x", "prefer": "fast", "n": 2})
     assert r.ok, r.error
     assert store.get(r.asset_ref).gen_cost == 0.1
+    # 金额在闸门**放行时**按「单价 × 张数」预先记（2026-09-23：事后记账拦不住并发的一批），
+    # 生成完不再补 COST —— 同一笔不记两遍
     assert abs(guard.usage.money - 0.2) < 1e-9, "两张图 × 0.1"
-    assert guard.usage.calls["image"] == 1, "一次调用计一次，不按张数"
+    assert guard.usage.calls["image"] == 2, "按张数计（n=2 就是两张，之前只记 1 次）"
+    media_costs = [e for e in bus.history if e.type is EventType.COST and e.data.get("modality")]
+    assert media_costs == []
 
 
 async def test_没填单价只计次不记金额():
@@ -302,7 +306,7 @@ async def test_累计金额超限时loop挂起交给人():
 
     r = await loop.run_turn("继续")
     assert r.stop_reason is StopReason.BUDGET_EXCEEDED
-    assert "达到单次任务上限" in r.text
+    assert "本次开工已花" in r.text and "超过上限" in r.text
     stops = [e for e in bus.history if e.type is EventType.LOOP_STOP_REASON]
     assert stops and stops[-1].data["reason"] == "budget_exceeded"
 

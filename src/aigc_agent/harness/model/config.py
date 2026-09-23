@@ -147,6 +147,9 @@ class CostGuard(BaseModel):
     call_limits: dict[str, int] = Field(default_factory=dict)
     # 单日各类媒体调用上限（跨会话，靠台账）。没填 = 不限
     daily_call_limits: dict[str, int] = Field(default_factory=dict)
+    # 视频秒数口径（2026-09-23）：本次开工 / 单日。不依赖单价的视频刹车
+    seconds_limit: float | None = None
+    daily_seconds_limit: float | None = None
 
 
 class ModelsConfig(BaseModel):
@@ -208,6 +211,8 @@ class ModelsConfig(BaseModel):
                 per_task_limit=_num_or_none(guard_raw.get("per_task_limit")),
                 per_project_limit=_num_or_none(guard_raw.get("per_project_limit")),
                 daily_limit=_num_or_none(guard_raw.get("daily_limit")),
+                seconds_limit=_num_or_none(guard_raw.get("seconds_limit")),
+                daily_seconds_limit=_num_or_none(guard_raw.get("daily_seconds_limit")),
                 on_exceed=guard_raw.get("on_exceed", "pause_and_ask"),
                 call_limits={
                     str(k): int(v)

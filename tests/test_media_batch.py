@@ -212,7 +212,7 @@ async def test_批量按段数计次_不是按调用次数(tmp_path: Path):
 
     # 再来 6 段就超过 10 次上限，必须拦下（没有询问器时直接拒）
     ok2, why = await PermissionGate(bus, guard=guard).check(meta, {"jobs": _jobs(6)})
-    assert not ok2 and "本次要 6 个" in why and "上限 10 次" in why
+    assert not ok2 and "这次要 6 个" in why and "上限 10 次" in why
     assert guard.usage.calls["video"] == 6, "被拦下就不该记账"
 
     # 单段工具仍然按 1 次算

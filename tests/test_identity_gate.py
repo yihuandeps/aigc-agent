@@ -238,22 +238,16 @@ async def test_参考图链接过期_渲染前提示刷新(tmp_path: Path):
     assert "没有发起任何生成" in r.error
 
 
-async def test_刷新参考图链接_用本地副本复刻(tmp_path: Path):
+async def test_刷新参考图链接_没配托管就如实说刷不了_不复刻(tmp_path: Path):
+    """2026-09-23：之前没配托管就让生图模型拿本地图的 data URL「复刻」一张 —— 生成接口只收
+    公网链接，这条路在提交前就会被拒（从没走通过）；真走通了也是一张可能换脸的新图。"""
     store = AssetStore()
     _, pack_id = _seed(store, tmp_path, portrait_age_h=30)
     reg = Registry(store, tmp_path)
     fns = _fns(store, reg)
     r = await fns._fn_drama_refresh_refs()
-    assert r.ok, r.error
-    gen = [a for n, a in reg.calls if n == "gen_image"]
-    assert len(gen) == 1 and gen[0]["image"][0].startswith("data:image/png;base64,")
-    assert gen[0]["aspect_ratio"] == "3:4" and "复刻" in gen[0]["prompt"]
-    new_pack = json.loads(store.content(r.asset_ref))
-    assert new_pack["陆离"]["asset"] != json.loads(store.content(pack_id))["陆离"]["asset"]
-    assert new_pack["地铁车厢"]["url"] == "https://img/car.png", "没过期的不动"
-    assert store.get(r.asset_ref).parent_ids[0] == pack_id
-    r2 = await fns._fn_drama_refresh_refs(rendered_id=r.asset_ref)
-    assert not r2.ok and "没有需要刷新" in r2.error
+    assert not r.ok and "没配素材托管" in (r.error or "") and "hosting" in (r.error or "")
+    assert not [a for n, a in reg.calls if n == "gen_image"], "不花生成的钱"
 
 
 async def test_服装图与主形象不像_重生成一次(tmp_path: Path):

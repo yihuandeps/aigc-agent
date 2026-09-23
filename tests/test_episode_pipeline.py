@@ -95,7 +95,8 @@ class FakeGuard:
     def __init__(self, over: bool = False):
         self.over = over
 
-    def check(self, kind: str = "") -> Verdict:
+    def check(self, kind: str = "", **_: object) -> Verdict:
+        # 真的 CostGuard.check 还收 units / money / seconds（2026-09-23 按这一步要花多少查）
         return Verdict(not self.over, "预算超了" if self.over else "")
 
 
