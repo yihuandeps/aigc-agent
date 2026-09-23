@@ -72,4 +72,4 @@ find_materials / find_episode 找，fs_list 列目录，fs_read 读文本（含 
 # /auto 下仍要停下来问人一次的大节点（stage 里含这些词）
 MAJOR_STAGES: tuple[str, ...] = ("剧本", "视频生成", "图片生成")
 # 小节点：某一集（「剧本第3集」「12集」「单集」）—— /auto 下自动采纳
-MINOR_STAGE = re.compile(r"第?\d+\s*集|单集")
+MINOR_STAGE = re.compile(r"第?(\d+|[零〇一二两三四五六七八九十百]+)\s*集|单集")

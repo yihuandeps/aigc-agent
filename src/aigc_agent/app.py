@@ -213,6 +213,7 @@ class Agent:
 
         assets = AssetStore(workspace / "assets")
         assets.project = project  # 新资产打上项目键；查询默认只看本项目
+        assets.bind_loop()  # 线程里建的资产（fs_import）也能把落库事件投回主循环
         memories = MemoryStore(workspace / "memory")
 
         # 产物目录：生成内容（文本/图片/视频）落盘的用户文件夹，/out 随时改（= 换项目）

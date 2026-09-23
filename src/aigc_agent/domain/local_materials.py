@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .numerals import EPISODE_RE, cn_to_int
+
 LOCAL_PIN = "local_materials"
 
 KIND_BY_EXT: dict[str, str] = {
@@ -45,7 +47,7 @@ _KIND_CN = {
 }
 
 _EP_PATTERNS = (
-    re.compile(r"第\s*(\d{1,3})\s*集"),
+    EPISODE_RE,  # 第12集 / 第十二集
     re.compile(r"(?<![a-z0-9])ep(?:isode)?[\s_\-]?(\d{1,3})(?![0-9])", re.I),
     re.compile(r"(?<![a-z0-9])s\d{1,2}e(\d{1,3})(?![0-9])", re.I),
 )
@@ -59,7 +61,7 @@ def episode_in_name(name: str) -> int:
     for pat in _EP_PATTERNS:
         m = pat.search(name or "")
         if m:
-            return int(m.group(1))
+            return cn_to_int(m.group(1))
     return 0
 
 
@@ -297,7 +299,9 @@ class LocalMaterials:
         extra_dirs: list[Path] | tuple[Path, ...] = (),
         max_files: int = 4000,
         max_depth: int = 4,
-        ttl: float = 3.0,
+        # 30 秒：目录签名（各级子目录的 mtime）能认出增删文件；ttl 只兜「深层子目录里刚写的文件」。
+        # 之前 3 秒，每轮都全量重扫，签名缓存形同虚设（2026-09-23 审查）
+        ttl: float = 30.0,
     ) -> None:
         self._output = output
         self.extra_dirs = [Path(d).expanduser() for d in extra_dirs]

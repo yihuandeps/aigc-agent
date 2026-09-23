@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import threading
 import time
 import uuid
@@ -28,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from ...harness.context.compaction import is_only_fold_mark
 from ...harness.events.bus import EventType
+from ..numerals import EPISODE_RE, episode_from
 from ..output import slug
 
 
@@ -64,7 +64,8 @@ LEGACY_PROJECT = "legacy"
 # 集号识别（2026-09-20）：模型自己 save_draft 存的整集剧本、合规修订版都是 outline / text 类型、
 # 没有 gen_params.episode，只有摘要里写着「第6集·合规修订版」。之前按类型 + gen_params 认集，
 # 这批全部不算数 —— 用户目录里 6–37 集摆着，模型说「只写到第 5 集」。
-_EPISODE_IN_SUMMARY = re.compile(r"第\s*(\d{1,3})\s*集")
+# 「第12集」「第十二集」都认（2026-09-23 审查：中文数字的集号之前不算数）
+_EPISODE_IN_SUMMARY = EPISODE_RE
 _EPISODE_TYPES = ("text", "outline", "script", "storyboard")
 # 摘要里带这些词的文本资产不是剧本正文（分集目录、审核报告、宣传文案…），不算「这一集写完了」
 _NOT_SCRIPT_WORDS = ("目录", "大纲", "报告", "方案", "文案", "档案", "清单", "提示词")
@@ -124,6 +125,7 @@ class AssetStore:
         self._mtimes: dict[str, int] = {}
         self._scanned_at = 0.0
         self.refresh_interval = 1.0
+        self._loop: asyncio.AbstractEventLoop | None = None  # 主事件循环（见 _emit_created）
         # 事件总线（装配层挂上才有）。挂上后每次落库发 ASSET_CREATED ——
         # 按集流水管线（EpisodePipeline）靠它实时知道「哪集就绪了」。
         self.bus: Any = None
@@ -134,6 +136,13 @@ class AssetStore:
         if root:
             root.mkdir(parents=True, exist_ok=True)
             self._load()
+
+    def bind_loop(self) -> None:
+        """记下当前事件循环（装配时在主循环里调）：线程里建的资产要往它上面发事件。"""
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     def _load(self) -> None:
         """启动时把已落盘的资产读回来。
@@ -237,7 +246,21 @@ class AssetStore:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            # 在线程里建的（fs_import 走 to_thread）：之前事件直接丢了，按集流水漏接这批资产。
+            # 投回主事件循环去发（2026-09-23 审查）
+            main = self._loop
+            if main is None or main.is_closed():
+                return
+            snapshot = dict(
+                id=asset.id, type=asset.type.value, summary=asset.summary,
+                gen_params=dict(asset.gen_params), parent_ids=list(asset.parent_ids),
+                seq=asset.seq, project=asset.project, status=asset.status.value,
+            )
+            main.call_soon_threadsafe(
+                lambda: main.create_task(self.bus.emit(EventType.ASSET_CREATED, **snapshot))
+            )
             return
+        self._loop = loop  # 记住主循环，线程里建资产时往这里投
         loop.create_task(
             self.bus.emit(
                 EventType.ASSET_CREATED,
@@ -484,9 +507,7 @@ class AssetStore:
         if n > 0:
             return n
         if asset.type.value in _EPISODE_TYPES:
-            m = _EPISODE_IN_SUMMARY.search(asset.summary or "")
-            if m:
-                return int(m.group(1))
+            return episode_from(asset.summary or "")
         return 0
 
     @staticmethod

@@ -304,6 +304,16 @@ class FileFunctions:
         while target.exists():
             target = folder / f"{p.stem}-{n}{p.suffix}"
             n += 1
+        # 记下原路径：之前 trash 里只有文件名，恢复只能靠猜（2026-09-23 审查）
+        try:
+            import json
+
+            with (folder / "manifest.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"from": str(p), "to": str(target), "at": time.time()}, ensure_ascii=False
+                ) + "\n")
+        except OSError:
+            pass
         return target
 
     # ---------- 声明 ----------
