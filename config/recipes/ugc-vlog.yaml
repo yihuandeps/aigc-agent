@@ -50,8 +50,10 @@ shots:
     不用稳定器、不做电影式运镜、no cinematic emulation、无美颜无磨皮无滤镜；
     景别最近只到胸口以上，不推大特写
 
-  # 有真人出镜，皮肤真实感走全局档位（media_models.yaml drama.realism_level）
-  realism: auto
+  # 有真人出镜，皮肤真实感走全局档位（media_models.yaml drama.realism_level）。
+  # skin = 只加皮肤那段：完整真实感段里的「侧光 / 闪光灯直闪 / 感光颗粒」和上面的
+  # 「自然光、iPhone 随手拍」正面冲突（2026-09-23 审查）
+  realism: skin
 
   prompt_hint: |
     每个镜头按这个顺序写清楚：**机器怎么拿**（手持、举着、放在台面上）→ 主体在做什么

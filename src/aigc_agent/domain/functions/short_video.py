@@ -14,8 +14,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -32,6 +35,7 @@ from ...harness.tools.provider import (
 from ..assets.store import AssetStore, AssetType, local_copy
 from ..media import ffmpeg
 from ..media.naming import recipe_shot_name, safe_name
+from ..media.no_text import no_text_retry, parse_subtitle_verdict, subtitle_check_messages
 from ..pipeline.recipe import Recipe, list_recipes, load_recipe
 from ..pipeline.short_video import (
     Brief,
@@ -43,7 +47,7 @@ from ..pipeline.short_video import (
 from ..pipeline.subtitle import align_script
 from ..pipeline.voice_pick import parse_pick as parse_voice
 from ..pipeline.voice_pick import pick_prompt as voice_prompt
-from ..realism import norm_level
+from ..realism import REALISM_ROLE, norm_level
 from .drama import _run_parallel
 from .media import retryable_failure
 
@@ -305,6 +309,52 @@ class ShortVideoFunctions:
 
     def _cfg(self, key: str, default: Any) -> Any:
         return (getattr(self.catalog, "drama", {}) or {}).get(key, default)
+
+    def _subtitle_gate(self) -> tuple[bool, int]:
+        """(开没开, 发现字后重生成几次)。和短剧共用 media_models.yaml drama.subtitle_gate /
+        subtitle_retries；没有文本网关（脚本 / 测试）就关。"""
+        if self.gateway is None:
+            return False, 0
+        on = str(self._cfg("subtitle_gate", "true")).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            n = max(0, int(self._cfg("subtitle_retries", 1)))
+        except (TypeError, ValueError):
+            n = 1
+        return on, n
+
+    async def _burned_text(self, asset_id: str) -> tuple[bool | None, str]:
+        """抽几帧看画面里有没有叠上去的字。返回 (发现了没有, 说明)；查不了返回 (None, 原因)。
+
+        2026-09-23 审查：抽帧查字幕之前只有短剧链有 —— 画面里不许有字是用户定的最高优先级，
+        短视频镜头照样会被模型画上字幕条、标题。
+        """
+        try:
+            local = local_copy(self.store.get(asset_id))
+        except KeyError:
+            local = None
+        if local is None:
+            return None, "片段没有本地副本"
+        tmp = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="svsub_"))
+        try:
+            paths = await ffmpeg.extract_frames(local, tmp, count=4, width=512)
+            frames = await asyncio.to_thread(lambda: [p.read_bytes() for p in paths])
+        except Exception:  # noqa: BLE001
+            frames = []
+        finally:
+            await asyncio.to_thread(shutil.rmtree, tmp, True)
+        if not frames:
+            return None, "抽不出画面帧（检查 ffmpeg）"
+        urls = ["data:image/jpeg;base64," + base64.b64encode(b).decode() for b in frames]
+        note = ""
+        for _ in range(2):  # 判读输出不是 JSON：再问一次，还不行才算查不成
+            try:
+                resp = await self.gateway.chat(REALISM_ROLE, subtitle_check_messages(urls))
+            except Exception as e:  # noqa: BLE001
+                return None, f"字幕检查调用失败：{type(e).__name__}"
+            found, note = parse_subtitle_verdict(resp.text)
+            if found is not None:
+                return found, note
+        return None, note or "字幕检查没给出结论"
 
     def _tier_note(self, vtier: str, explicit: bool) -> tuple[str, str]:
         """(锁定的视频模型, 档位没生效的说明)。
@@ -648,6 +698,8 @@ class ShortVideoFunctions:
             except (TypeError, ValueError):
                 retries = 1
             limit = self.catalog.max_concurrency("video") if self.catalog is not None else 0
+            sub_gate, sub_retries = self._subtitle_gate()
+            unchecked: list[str] = []
             done = 0
             await self._progress("生成短视频素材", 0, len(to_generate))
 
@@ -677,6 +729,25 @@ class ShortVideoFunctions:
                     if r.ok or attempt >= retries or not retryable_failure(r):
                         break
                     await asyncio.sleep(3)
+                # 画面里不许有字：抽帧查，有字就带着「上一版出了字」重生成；还有就不进成片
+                if sub_gate and r is not None and r.ok and r.asset_ref:
+                    found, where = await self._burned_text(r.asset_ref)
+                    for _ in range(sub_retries):
+                        if not found:
+                            break
+                        again = await self.registry.invoke(
+                            "gen_video", {**args, "prompt": no_text_retry(args["prompt"])}
+                        )
+                        if not again.ok or not again.asset_ref:
+                            break
+                        r = again
+                        found, where = await self._burned_text(r.asset_ref)
+                    if found is None:
+                        unchecked.append(f"第{i}镜（{where}）")
+                    elif found:
+                        done += 1
+                        await self._progress("生成短视频素材", done, len(to_generate), f"第{i}镜")
+                        return i, "", f"画面里有字（{where or '位置不明'}），重生成后仍有，没进成片"
                 done += 1
                 await self._progress("生成短视频素材", done, len(to_generate), f"第{i}镜")
                 return i, (r.asset_ref if r.ok else ""), ("" if r.ok else (r.error or ""))
@@ -686,6 +757,11 @@ class ShortVideoFunctions:
                     clips[i] = aid
                 else:
                     failed.append(f"第{i}镜：{e[:90]}")
+            if unchecked:
+                notes.append(
+                    f"{len(unchecked)} 段没做成字幕检查：{'、'.join(sorted(unchecked)[:4])}"
+                    " —— 成片里有没有字要人看一眼"
+                )
         if not clips and not aroll:
             return ToolResult(ok=False, error="一个镜头都没有：\n" + "\n".join(failed))
 
@@ -697,6 +773,7 @@ class ShortVideoFunctions:
             notes.append("没有出镜素材：用 TTS 口播兜底（不然成片没有声音）")
         vo_on = vo_wanted and not no_voiceover and bool(brief.script) and not aroll
         if vo_on:
+            tts_model = str(recipe.models.get("tts_model") or "").strip()
             picked, speed, why = await self._pick_voice(recipe, brief, voice)
             r = await self.registry.invoke(
                 "tts",
@@ -706,6 +783,8 @@ class ShortVideoFunctions:
                     "speed": speed,
                     "instruct": str(recipe.voiceover.get("instruct") or ""),
                     "summary": f"{brief.title}·口播",
+                    # 配方里写了 TTS 模型就用它（之前写了没人读）；留空按目录默认
+                    **({"model": tts_model} if tts_model else {}),
                 },
             )
             if r.ok:

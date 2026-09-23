@@ -276,6 +276,12 @@ def image_suffix(level: str = "") -> str:
     return f"{_PERSON[lv]} {_LIGHT[lv]} {_OPTICS[lv]}"
 
 
+def skin_suffix(level: str = "") -> str:
+    """只要皮肤真实感，不管布光和光学 —— 手机随拍类配方用：真实感段里的「侧光 / 闪光灯直闪 /
+    感光颗粒」和「自然光、环境本来的颜色、iPhone 随手拍」正面冲突（2026-09-23 审查）。"""
+    return _PERSON[norm_level(level)]
+
+
 def video_suffix(level: str = "") -> str:
     """生视频时追加的真实感段落。
 

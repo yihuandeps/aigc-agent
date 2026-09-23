@@ -206,15 +206,20 @@ class Recipe:
         真实感段落放最后：它是**全局约束**（皮肤/布光/光学瑕疵），
         放前面会被当成画面主体描述，模型容易照着生成"一堆雀斑的特写"。
         realism 写 auto/true 时用全局档位（media_models.yaml drama.realism_level），
+        写 skin 只加皮肤那段（不改布光 / 光学：手机随拍类配方用），
         写成文字就原样用 —— 旧配方里手写的那段仍然有效。
         """
-        from ..realism import video_suffix  # 局部导入：避免 pipeline ↔ realism 的加载顺序问题
+        # 局部导入：避免 pipeline ↔ realism 的加载顺序问题
+        from ..realism import skin_suffix, video_suffix
 
         parts = [shot, str(self.shots.get("style") or "")]
         realism = self.shots.get("realism")
-        if isinstance(realism, bool) or str(realism).strip().lower() in ("auto", "true"):
+        mode = "" if isinstance(realism, bool) else str(realism or "").strip().lower()
+        if isinstance(realism, bool) or mode in ("auto", "true"):
             if realism:
                 parts.append(video_suffix(level))
+        elif mode in ("skin", "person"):
+            parts.append(skin_suffix(level))
         elif realism:
             parts.append(" ".join(str(realism).split()))
         return "，".join(p for p in parts if p.strip())

@@ -23,6 +23,7 @@ from ...domain.assets.migrate import (
     restore_migration,
 )
 from ...domain.assets.store import AssetStore
+from ...domain.assets.trash import purge_trash, trash_folders
 from ...domain.media.naming import apply_renames, plan_renames, write_manifest
 from ...domain.output import default_root
 from ...domain.project import project_key
@@ -100,6 +101,44 @@ def manifest_cmd(
         console.print(f"[dim]{root} 里没有可列的图/视频[/]")
         return
     console.print(f"[green]已写出 {path}[/]")
+
+
+@app.command("trash")
+def trash_cmd(
+    older_than: int = typer.Option(0, "--older-than", help="清理多少天以前的（0 = 只看不清）"),
+    apply: bool = typer.Option(False, "--apply", help="真的删（默认只列出会删什么）"),
+) -> None:
+    """回收站：fs_delete / 覆盖前备份 / 面容审查清下来的文件都在这里。之前从不清理。"""
+    entries = trash_folders(WORKSPACE)
+    if not entries:
+        console.print("[dim]回收站是空的[/]")
+        return
+    t = Table(show_header=True, header_style="bold")
+    for col in ("文件夹", "天前", "文件数", "大小"):
+        t.add_column(col)
+    for e in entries:
+        t.add_row(escape(e.name), f"{e.age_days:.0f}", str(e.files), e.size_text)
+    console.print(t)
+    if older_than <= 0:
+        console.print("[dim]只是列出。清理：agent assets trash --older-than 30 --apply[/]")
+        return
+    doomed = [e for e in entries if e.age_days >= older_than and e.purgeable]
+    kept = [e for e in entries if e.age_days >= older_than and not e.purgeable]
+    if kept:
+        console.print(
+            f"[dim]{len(kept)} 个迁移备份不清（撤销迁移要用它们的 manifest）：[/]"
+            + escape("、".join(e.name for e in kept))
+        )
+    if not doomed:
+        console.print(f"[dim]没有 {older_than} 天以前、可以清的文件夹[/]")
+        return
+    if not apply:
+        console.print(
+            f"[yellow]会永久删除 {len(doomed)} 个文件夹[/]（不可恢复）。确认：加 --apply"
+        )
+        return
+    gone = purge_trash(WORKSPACE, older_than)
+    console.print(f"[green]已删除 {len(gone)} 个文件夹[/]")
 
 
 @app.command("migrate")

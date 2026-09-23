@@ -468,7 +468,9 @@ class FileFunctions:
             "删除文件/目录 —— 实际是移到 workspace/trash/ 回收目录，可找回",
             PermissionLevel.WRITE,
             {"type": "object", "properties": {"path": path_p}, "required": ["path"]},
-            description="从不真删。要彻底删除请用户自己清空 workspace/trash/。",
+            description=(
+                "从不真删。要彻底删除请用户自己执行 agent assets trash --older-than 30 --apply。"
+            ),
         )
         self._add(
             "fs_import",

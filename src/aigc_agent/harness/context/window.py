@@ -14,6 +14,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+# 给记忆提取的原文里，各角色消息最多留多少字（0 = 不截）。见 Turn.transcript
+_TRANSCRIPT_CAP = {"tool": 600, "assistant": 3000}
+
 
 class Turn(BaseModel):
     """一问一答 = 1 轮。
@@ -37,6 +40,10 @@ class Turn(BaseModel):
     def transcript(self) -> str:
         """整轮的可读文本。给记忆提取用 —— 它要看到完整的一问一答，
         只给 user_text 会丢掉助手做了什么、人审说了什么。
+
+        工具返回只留开头、助手的长回复截断（2026-09-23 审查：整本剧本、整份分镜原样喂给
+        记忆提取，单次 4.1 万 token；记忆要的是人的偏好和决定，不是工具吐出来的正文）。
+        用户的话和人审决策（短）原样保留。
         """
         out = []
         for m in self.messages:
@@ -44,8 +51,12 @@ class Turn(BaseModel):
             content = m.get("content")
             if not isinstance(content, str) or not content.strip():
                 continue
+            text = content.strip()
+            cap = _TRANSCRIPT_CAP.get(role, 0)
+            if cap and len(text) > cap:
+                text = f"{text[:cap]}…（共 {len(text)} 字，后面略）"
             tag = {"user": "用户", "assistant": "助手", "tool": "工具", "system": "系统"}
-            out.append(f"{tag.get(role, role)}：{content.strip()}")
+            out.append(f"{tag.get(role, role)}：{text}")
         return "\n".join(out)
 
     @property
