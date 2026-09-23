@@ -14,6 +14,7 @@ from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -40,10 +41,15 @@ _QUIET = {
 
 
 def _brief(value: Any, limit: int = 80) -> str:
+    """一行摘要，已转义（日志里的方括号会被 rich 当标记，[/] 直接抛 MarkupError）。"""
     if value in (None, "", {}, []):
         return ""
     s = str(value).replace("\n", " ")
-    return s if len(s) <= limit else s[:limit] + "…"
+    return escape(s if len(s) <= limit else s[:limit] + "…")
+
+
+def _e(value: Any) -> str:
+    return escape(str(value if value is not None else ""))
 
 
 def _line(ev: Event) -> str | None:
@@ -58,19 +64,42 @@ def _line(ev: Event) -> str | None:
             f"{_brief(d.get('text_preview'))}"
         )
     if t is EventType.TOOL_CALL:
-        return f"  → {d.get('tool')} [dim]{_brief(d.get('args'))}[/]"
+        return f"  → {_e(d.get('tool'))} [dim]{_brief(d.get('args'))}[/]"
     if t is EventType.TOOL_RESULT:
-        return f"  ← {d.get('tool')} [dim]{d.get('duration_ms', 0)}ms {_brief(d.get('preview'))}[/]"
+        return (
+            f"  ← {_e(d.get('tool'))} [dim]{d.get('duration_ms', 0)}ms "
+            f"{_brief(d.get('preview'))}[/]"
+        )
     if t is EventType.TOOL_ERROR:
-        return f"  [red]✗ {d.get('tool')}[/] {_brief(d.get('error'))}"
+        return f"  [red]✗ {_e(d.get('tool'))}[/] {_brief(d.get('error'))}"
+    if t is EventType.TOOL_REJECTED:
+        return f"  [red]✗ {_e(d.get('tool'))}（没发出去）[/] {_brief(d.get('error'))}"
     if t is EventType.CHECKPOINT_REACHED:
-        return f"  [yellow]⏸ 人审[/] {d.get('stage') or d.get('node')} {_brief(d.get('question'))}"
+        return (
+            f"  [yellow]⏸ 人审[/] {_e(d.get('stage') or d.get('node'))} "
+            f"{_brief(d.get('question'))}"
+        )
     if t is EventType.CHECKPOINT_DECIDED:
-        return f"  [yellow]✎ 决策 {d.get('decision')}[/] {_brief(d.get('reason'))}"
+        # 谁定的：人（human）还是 /auto 自动采纳（auto）—— 之前回放里分不清
+        who = d.get("decided_by") or "human"
+        return (
+            f"  [yellow]✎ 决策 {_e(d.get('decision'))}[/] [dim]（{_e(who)}）[/] "
+            f"{_brief(d.get('reason'))}"
+        )
     if t is EventType.BUDGET_EXCEEDED:
-        return f"  [red]¥ 预算护栏[/] {d.get('tool')} {_brief(d.get('reason'))}"
+        return f"  [red]¥ 预算护栏[/] {_e(d.get('tool'))} {_brief(d.get('reason'))}"
     if t is EventType.PERMISSION_DENY:
-        return f"  [red]⛔ {d.get('tool')}[/] {_brief(d.get('reason'))}"
+        return f"  [red]⛔ {_e(d.get('tool'))}[/] {_brief(d.get('reason'))}"
+    if t is EventType.PERMISSION_GRANT:
+        return f"  [green]✓ 放行 {_e(d.get('tool'))}[/] {_brief(d.get('reason'))}"
+    if t is EventType.USER_STOP:
+        return f"  [yellow]■ 人叫停[/] {_brief(d.get('how'))}"
+    if t is EventType.GATE_VERDICT:
+        mark = "✓" if d.get("passed") else "✗"
+        return (
+            f"  {mark} 质检门 {_e(d.get('gate'))} {_e(d.get('clip'))} "
+            f"[dim]{_brief(d.get('detail'))}[/]"
+        )
     if t is EventType.WARNING:
         return f"  [yellow]⚠ {_brief(d.get('message'))}[/]"
     if t is EventType.SUBAGENT_END:

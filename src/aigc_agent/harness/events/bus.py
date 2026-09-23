@@ -34,6 +34,10 @@ class EventType(StrEnum):
     TOOL_CALL = "tool.call"
     TOOL_RESULT = "tool.result"
     TOOL_ERROR = "tool.error"
+    # 调度前就被拒（参数不是合法 JSON、抄回折叠占位、未知工具）：之前不发事件，复盘看不到
+    TOOL_REJECTED = "tool.rejected"
+    # 质检门的判定（字幕 / 人物一致性 / 镜头时长）：过没过、第几版、为什么
+    GATE_VERDICT = "gate.verdict"
     # 批量任务的进度汇报（done/total）。渲染批量图/视频时由调用方发，
     # 给 CLI 的进度窗用 —— 单个工具调用自己不知道一批有几个。
     BATCH_PROGRESS = "batch.progress"
@@ -44,6 +48,8 @@ class EventType(StrEnum):
     # 权限
     PERMISSION_ASK = "permission.ask"
     PERMISSION_DENY = "permission.deny"
+    # 问了人、人点了头（权限 / 超预算放行）。之前只记拒绝，复盘分不清哪些是人放的
+    PERMISSION_GRANT = "permission.grant"
 
     # 图执行
     GRAPH_START = "graph.start"
@@ -83,6 +89,7 @@ class EventType(StrEnum):
     BUDGET_EXCEEDED = "budget.exceeded"  # Cost Guard 拦下了一次调用
 
     WARNING = "warning"
+    USER_STOP = "user.stop"  # 人按了 /stop、/now 或 Ctrl+C
 
 
 class Event(BaseModel):

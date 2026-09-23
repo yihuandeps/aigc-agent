@@ -58,12 +58,18 @@ class ToolDispatcher:
             args, err = _parse_args(call.arguments)
             if err:
                 results[call.id] = ToolResult(ok=False, error=err)
+                await self.bus.emit(
+                    EventType.TOOL_REJECTED, tool=call.name, call_id=call.id, error=err[:300]
+                )
                 continue
 
             # 按参数算等级：同一个工具写产物目录和写 Agent 自己的配置，风险不是一回事
             meta = self.registry.meta_for_call(call.name, args)
             if meta is None:
                 results[call.id] = ToolResult(ok=False, error=f"未知工具 {call.name!r}")
+                await self.bus.emit(
+                    EventType.TOOL_REJECTED, tool=call.name, call_id=call.id, error="未知工具"
+                )
                 continue
 
             ok, reason = await self.gate.check(meta, args)

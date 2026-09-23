@@ -22,6 +22,7 @@ from typing import Any
 # 命令表：唯一出处。补全菜单、/help、文档都读它。
 # (命令, 一句话说明)
 COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/help", "列出全部命令"),
     ("/exit", "退出"),
     ("/quit", "退出"),
     ("/stat", "看状态：模型、工具数、窗口、产物目录、锁定的模型"),
@@ -32,16 +33,35 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/brief", "记忆简报"),
     ("/out", "改产物目录：/out E:\\西游记"),
     ("/type", "选产线：短剧 / 抖音短视频 / 广告 / 设计；/type off 不限定"),
+    ("/line", "同 /type"),
     ("/rename", "把已生成的图/视频改成带序号的可读文件名（/rename dry 只看计划）"),
     ("/rollback", "回退到某个资产版本重来：/rollback as_xxx"),
     ("/retry", "同一轮续跑（网络失败后不用重发话）"),
-    ("/budget", "预算用量；/budget reset 清零；/budget allow 50 临时追加"),
+    ("/budget", "预算用量；/budget set 金额 300 视频秒 900 改额度；/budget allow 50 临时追加；"
+                "/budget reset 清零本次开工的用量"),
     ("/auto", "自动人审：/auto on 打开、/auto off 关闭"),
     ("/stop", "停掉正在跑的这一轮"),
     ("/pause", "同 /stop"),
     ("/now", "停掉当前并插队发送：/now 先渲第 3 段"),
     ("/queue", "看排队的消息；/queue clear 清空"),
 )
+
+# 同义的写法（中文、别名）：分发时认，补全菜单不列
+ALIASES: dict[str, str] = {
+    "/停": "/stop", "/暂停": "/stop", "/停止": "/stop", "/重试": "/retry", "/继续跑": "/retry",
+    "/插队": "/now",
+}
+
+
+def known_command(text: str) -> bool:
+    """是不是命令表里的命令（带参数也认）。不在表里的「/xxx」不该当成聊天发给模型。"""
+    head = (text or "").strip().split(" ", 1)[0].lower()
+    return head in {c for c, _ in COMMANDS} or head in ALIASES
+
+
+def help_text() -> str:
+    width = max(len(c) for c, _ in COMMANDS)
+    return "\n".join(f"  {c.ljust(width)}  {d}" for c, d in COMMANDS)
 
 
 # 输入框配色。**每个值都要能被 prompt_toolkit 解析**，否则整个 CLI 起不来 ——
@@ -189,10 +209,7 @@ def make_reader(placeholder: str = "说点什么，或敲 / 看命令") -> Calla
 
     def read() -> str:
         try:
-            # patch_stdout：这一轮里别处 print / rich 输出都走到输入框**上方**，
-            # 输入框自己始终钉在最下面一行
-            with patch_stdout(raw=True):
-                text = session.prompt(message)
+            text = session.prompt(message)
         except EOFError:
             return ""
         except KeyboardInterrupt:
@@ -201,4 +218,35 @@ def make_reader(placeholder: str = "说点什么，或敲 / 看命令") -> Calla
             return sys.stdin.readline()
         return (text or "") + "\n"
 
-    return read
+    return PromptReader(read, patch_stdout)
+
+
+class PromptReader:
+    """输入框的「读一行」+ 整个会话只进一次 patch_stdout。
+
+    2026-09-23 审查（实测·模拟）：之前每读一行就在读线程里进出一次 patch_stdout，进度窗
+    又在主线程里反复开关 Live 重定向 —— 两个线程交替改 sys.stdout，Live 停下时可能把
+    sys.stdout 恢复成已经失效的代理，最终回复要么永远不显示、要么和输入框叠在一起。
+    现在 chat 开始时进一次、结束时出一次；所有输出都经同一个代理走到输入框上方。
+    """
+
+    def __init__(self, read: Callable[[], str], patcher: Any) -> None:
+        self._read = read
+        self._patcher = patcher
+        self._ctx: Any = None
+
+    def __call__(self) -> str:
+        return self._read()
+
+    def start(self) -> None:
+        if self._ctx is None:
+            self._ctx = self._patcher(raw=True)
+            self._ctx.__enter__()
+
+    def stop(self) -> None:
+        if self._ctx is not None:
+            ctx, self._ctx = self._ctx, None
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 — 退出时终端状态异常不要再抛
+                pass

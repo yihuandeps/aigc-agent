@@ -131,6 +131,10 @@ class PermissionGate:
                 EventType.PERMISSION_DENY, tool=meta.name, reason="用户拒绝"
             )
             return False, f"用户拒绝执行 {meta.name}"
+        await self.bus.emit(
+            EventType.PERMISSION_GRANT, tool=meta.name, level=meta.permission.value,
+            reason="用户确认",
+        )
         return True, "用户已确认"
 
     async def _budget(
@@ -189,6 +193,9 @@ class PermissionGate:
                 EventType.PERMISSION_DENY, tool=meta.name, reason="超预算，用户拒绝"
             )
             return False, f"预算护栏拦下 {meta.name}：{verdict.reason}（用户未放行）"
+        await self.bus.emit(
+            EventType.PERMISSION_GRANT, tool=meta.name, reason=f"超预算放行：{verdict.reason}"
+        )
 
         self.guard.allow_more(meta.cost_kind, n=units, seconds=seconds)
         if money:

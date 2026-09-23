@@ -1003,6 +1003,21 @@ class DramaFunctions:
                     score = int(v.score)
                     notes.append(f"人物一致 {v.score}/10" + ("（重生成后）" if regen else ""))
             blocking = sum(1 for g in issues if _gate_blocks(g, gc["block"]))
+            # 质检门判定发事件：复盘时看得到每一版过没过、卡在哪道门（之前只在备注里）
+            if self.bus is not None:
+                await self.bus.emit(
+                    EventType.GATE_VERDICT,
+                    clip=str(args.get("summary") or ""),
+                    version=regen + 1,
+                    passed=not issues,
+                    blocking=blocking,
+                    gate=",".join(issues) or "all",
+                    detail={
+                        k: (round(v, 2) if isinstance(v, float) else str(v)[:80])
+                        for k, v in issues.items()
+                    },
+                    asset=r.asset_ref,
+                )
             # 排序：拦成片的问题少 → 问题总数少 → 一致性分高 → 越新越好
             versions.append((r, (blocking, len(issues), -score, -len(versions)), issues))
             if regen and not any(k in issues for k in ("subtitle", "subtitle_unchecked")) and (

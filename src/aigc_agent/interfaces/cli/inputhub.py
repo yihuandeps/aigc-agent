@@ -42,9 +42,14 @@ class InputHub:
         self._reader = reader or sys.stdin.readline
         self._use_thread = use_thread
         self._q: asyncio.Queue[str | None] | None = None
-        self._waiter: asyncio.Future[str] | None = None
+        # 在等一行输入的：(future, 提示语)。**栈**：最后问的那个先拿到下一行。
+        # 2026-09-23 审查实测：之前只有一个等待位，后台（流水线经闸门）一问，主循环等着的
+        # 「你」就被顶掉了 —— 你打给主循环的话被当成那个提问的回答，主循环再也不返回
+        self._waiters: list[tuple[asyncio.Future[str], str]] = []
         self._task: asyncio.Task[Any] | None = None
         self._router: asyncio.Task[None] | None = None
+        # /stop 之类被按下时通知一声（CLI 接到事件总线上，复盘能看到是人停的）
+        self.on_stop: Callable[[str], None] | None = None
 
     # ---------- 生命周期 ----------
 
@@ -90,17 +95,20 @@ class InputHub:
             line = await self._q.get()
             if line is None:
                 self.eof = True
-                if self._waiter is not None and not self._waiter.done():
-                    self._waiter.set_exception(EOFError())
+                for fut, _ in self._waiters:
+                    if not fut.done():
+                        fut.set_exception(EOFError())
                 return
             text = line.strip()
             # 停止/插队优先：哪怕此刻正在问权限，也先把任务停掉
             if self.running and self._handle_control(text):
-                if self._waiter is not None and not self._waiter.done():
-                    self._waiter.set_result("")
+                top = self._top()
+                if top is not None:
+                    top.set_result("")
                 continue
-            if self._waiter is not None and not self._waiter.done():
-                self._waiter.set_result(line)
+            top = self._top()
+            if top is not None:
+                top.set_result(line)
                 continue
             if not text:
                 continue
@@ -109,12 +117,28 @@ class InputHub:
             else:
                 self.pending.append(text)
 
+    def _top(self) -> asyncio.Future[str] | None:
+        """最近问的、还在等的那个。"""
+        while self._waiters and self._waiters[-1][0].done():
+            self._waiters.pop()
+        return self._waiters[-1][0] if self._waiters else None
+
     def _handle_control(self, text: str) -> bool:
-        """/stop、/now：返回 True 表示已处理并发起了取消。"""
+        """/stop、/now：返回 True 表示已处理并发起了取消。
+
+        /stop 停下来的同时**清掉排队的消息**（2026-09-23 审查：排队里有「再渲第 3 集」，
+        /stop 停完会立刻开下一轮接着花钱）。/now 是改道不是叫停：插到队首，排着的照旧。
+        """
         low = text.lower()
         if low in STOP_WORDS:
             self.stopped_by_user = True
-            self.console.print("[yellow]■ 正在停止当前这一轮…[/]")
+            dropped = len(self.pending)
+            self.pending.clear()
+            self.console.print(
+                "[yellow]■ 正在停止当前这一轮…[/]"
+                + (f"[dim]（排队的 {dropped} 条也清掉了）[/]" if dropped else "")
+            )
+            self._notify_stop(text)
             self._task.cancel()  # type: ignore[union-attr]
             return True
         for p in NOW_PREFIXES:
@@ -124,9 +148,17 @@ class InputHub:
                     self.pending.insert(0, msg)
                     self.stopped_by_user = True
                     self.console.print(f"[yellow]■ 停止当前这一轮，随后立即发送：[/]{msg}")
+                    self._notify_stop(text)
                     self._task.cancel()  # type: ignore[union-attr]
                     return True
         return False
+
+    def _notify_stop(self, text: str) -> None:
+        if self.on_stop is not None:
+            try:
+                self.on_stop(text)
+            except Exception:  # noqa: BLE001 — 通知失败不能挡住停止
+                pass
 
     def _queue_while_running(self, text: str) -> None:
         low = text.lower()
@@ -157,12 +189,18 @@ class InputHub:
         if self.eof:
             raise EOFError
         loop = asyncio.get_running_loop()
-        self._waiter = loop.create_future()
+        fut: asyncio.Future[str] = loop.create_future()
+        self._waiters.append((fut, prompt))
         self.console.print(prompt, end="")
         try:
-            return await self._waiter
+            return await fut
         finally:
-            self._waiter = None
+            self._waiters = [(f, p) for f, p in self._waiters if f is not fut]
+            # 下面还有人在等（比如主循环的「你」）：把它的提示再打一遍，别让人以为卡住了
+            below = [(f, p) for f, p in self._waiters if not f.done()]
+            if below:
+                self.console.print()
+                self.console.print(below[-1][1], end="")
 
     async def next_message(self, prompt: str) -> str:
         """下一条要发给模型的话：有排队的先发排队的，没有就等人打。"""

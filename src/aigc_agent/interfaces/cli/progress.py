@@ -117,7 +117,12 @@ class ProgressBoard:
         if not self.enabled or self._live is not None:
             yield
             return
-        self._live = Live(self, console=self.console, refresh_per_second=4)
+        # 不重定向 stdout/stderr：输入框已经整会话接管了 sys.stdout，Live 再换一次，
+        # 停下时可能换回一个失效的代理，回复就再也显示不出来（2026-09-23 审查）
+        self._live = Live(
+            self, console=self.console, refresh_per_second=4,
+            redirect_stdout=False, redirect_stderr=False,
+        )
         self._live.start()
         try:
             yield

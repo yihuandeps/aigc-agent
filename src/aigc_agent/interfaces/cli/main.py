@@ -44,7 +44,7 @@ from .inputhub import InputHub  # noqa: E402
 from .mcp_cmd import app as mcp_app  # noqa: E402
 from .memory_cmd import app as memory_app  # noqa: E402
 from .progress import ProgressBoard  # noqa: E402
-from .promptbox import make_reader  # noqa: E402
+from .promptbox import help_text, known_command, make_reader, search  # noqa: E402
 from .quiet import install as quiet_shutdown_noise  # noqa: E402
 from .release_cmd import app as release_app  # noqa: E402
 from .rpa_cmd import app as rpa_app  # noqa: E402
@@ -338,7 +338,8 @@ async def _watched(hub: InputHub, coro: Any) -> LoopResult | None:
             raise
         console.print(
             "[yellow]■ 本轮已停止[/][dim]（没执行完的调用会在下一轮开始时补记为「已中断」；"
-            "已提交给远端的生成任务取不回来，重跑时能复用的会复用）[/]"
+            "已提交给远端的生成任务在服务端照跑、照计费 —— 同样的请求再来会先取回，"
+            "不重新付费；让我 media_tasks 可以看到它们）[/]"
         )
         return None
 
@@ -743,7 +744,10 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
     # 输入枢纽：stdin 由一根线程常驻读，一轮在跑时打字会排队，/stop 停、/now 插队。
     # 2026-09-22 用户要的：底部钉一个不消失的输入框，敲 / 弹命令菜单、模糊搜索。
     # 终端不支持或 stdin 被重定向时 make_reader 返回 None，退回原来的 readline。
-    hub = InputHub(console, reader=make_reader())
+    reader = make_reader()
+    hub = InputHub(console, reader=reader)
+    if reader is not None and hasattr(reader, "start"):
+        reader.start()
     hub.start()
 
     async def _asker(meta: ToolMeta, args: dict[str, Any]) -> bool:
@@ -777,6 +781,12 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
             return None
 
     agent.loop.budget_asker = _budget_asker
+
+    def _on_stop(how: str) -> None:
+        # 复盘时分得清是人停的（之前 /stop 不发任何事件）
+        asyncio.get_running_loop().create_task(agent.bus.emit(EventType.USER_STOP, how=how))
+
+    hub.on_stop = _on_stop
     agent.bus.subscribe(make_renderer(verbose))
     agent.bus.subscribe(board.on_event)
     # 按集流水管线的派发/完成提示（/auto on 时才开始派发，提示随时可见）
@@ -877,6 +887,18 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                 continue
             if text in {"/exit", "/quit"}:
                 break
+            if text.lower() in {"/help", "/?", "/帮助"}:
+                console.print(Panel(Text(help_text()), title="命令", border_style="cyan"))
+                continue
+            if text.startswith("/") and not known_command(text):
+                # 拼错的命令不当聊天发给模型（之前 /xxx 原样发出去，还会被当成要求去执行）
+                near = [c for c, _ in search(text.split(" ", 1)[0])][:4]
+                console.print(
+                    f"[yellow]没有这个命令：{escape(text.split(' ', 1)[0])}[/]"
+                    + (f"[dim]　是不是：{' '.join(near)}[/]" if near else "")
+                    + "[dim]　/help 看全部命令[/]"
+                )
+                continue
             if text.lower() in {"/stop", "/pause", "/停", "/暂停", "/停止"}:
                 console.print("[dim]现在没有在跑的任务[/]")
                 continue
@@ -887,6 +909,17 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                     continue
                 if last_result is None:
                     console.print("[dim]没有可接着跑的轮次[/]")
+                    continue
+                if not (
+                    last_result.resumable
+                    or last_result.stop_reason
+                    in (StopReason.MAX_ITERATIONS, StopReason.BUDGET_EXCEEDED)
+                ):
+                    # 正常结束的、被内容过滤拦下的，接着跑只会让模型把同样的话再说一遍
+                    console.print(
+                        f"[dim]上一轮是「{last_result.stop_reason.value}」停的，没有可以接着跑的"
+                        " —— 直接说下一句话[/]"
+                    )
                     continue
                 console.print("[dim]↻ 在同一轮接着跑…[/]")
 
@@ -1143,20 +1176,36 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                     result = await _decide_review(agent, board, hub)
                 else:
                     result = await _watched(hub, _turn(text))
+                if result is None:
+                    last_result = None
+                    continue
+                _print_result(result)
+                last_result = await _run_tail(agent, board, hub, result)
             except KeyboardInterrupt:
                 console.print("[yellow]已中断[/]")
                 continue
-            if result is None:
+            except Exception as e:  # noqa: BLE001 — 任何没接住的异常都不许把整个 chat 带走
+                # 2026-09-23 审查：之前一个 MarkupError / 渲染异常就直接退出 chat，挂着的人审
+                # 只在内存里、跟着丢了。现在报出来、存快照、回到输入
+                console.print(
+                    f"[red]这一轮出错了：{escape(type(e).__name__)}: {escape(str(e)[:300])}[/]"
+                    "\n[dim]对话现场已保存，可以接着说；反复出现请把这段报错发给维护者[/]"
+                )
+                try:
+                    agent.session_store.save(
+                        agent.memory, pending_review=agent.loop.pending_review
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 last_result = None
                 continue
-
-            _print_result(result)
-            last_result = await _run_tail(agent, board, hub, result)
 
         _print_stat(agent)
         console.print("[dim]再见[/]")
     finally:
         hub.close()
+        if reader is not None and hasattr(reader, "stop"):
+            reader.stop()
         await agent.aclose()
 
 
