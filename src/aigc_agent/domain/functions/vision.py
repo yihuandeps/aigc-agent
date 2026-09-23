@@ -29,7 +29,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
-from ..assets.store import AssetStore, AssetType
+from ..assets.store import AssetStore, AssetType, local_copy
 from ..media import ffmpeg
 
 VISION_ROLE = "vision"
@@ -176,9 +176,9 @@ class VisionFunctions:
             except KeyError:
                 near = self.store.nearest(s) if hasattr(self.store, "nearest") else ""
                 return None, "", None, f"没有资产 {s}" + (f"；相近的有 {near}" if near else "")
-            local = str(a.gen_params.get("local") or "")
-            if local and Path(local).exists():
-                return Path(local), "", a, ""
+            lc = local_copy(a)
+            if lc is not None:
+                return lc, "", a, ""
             uri = a.uri or ""
             if uri.startswith(("http://", "https://")):
                 return None, uri, a, ""

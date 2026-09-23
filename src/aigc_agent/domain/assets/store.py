@@ -427,6 +427,29 @@ class AssetStore:
         return len(self._items)
 
 
+def local_copy(asset: Asset) -> Path | None:
+    """资产在本机的文件：产物目录里的副本（gen_params.local）优先，没了退到 Agent 在
+    blobs/ 自留的那份（gen_params.blob），再退到 uri 本身是本地文件的（导入的素材、
+    create_blob 落的音频）。都不在返回 None。
+
+    2026-09-23 审查：产物目录是用户的，会被整理、移动、删除 —— E:\\内容测试\\images 整个
+    没了之后 194 个图片资产找不到本地副本，远端链接也早过期。读本地副本一律走这里。
+    """
+    gp = asset.gen_params or {}
+    for key in ("local", "blob"):
+        v = str(gp.get(key) or "")
+        if v:
+            p = Path(v)
+            if p.exists():
+                return p
+    uri = asset.uri or ""
+    if uri and not uri.startswith(("http://", "https://", "asset://", "data:")):
+        p = Path(uri)
+        if p.exists():
+            return p
+    return None
+
+
 def rights_of(asset: Asset) -> str:
     """版权状态，按创建者判：generated（本系统生成）/ human（人给的）/ unknown。
 

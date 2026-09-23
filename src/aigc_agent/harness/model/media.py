@@ -96,10 +96,22 @@ class MediaTask:
     elapsed_s: float = 0.0
     polls: int = 0
     raw: dict[str, Any] = field(default_factory=dict)
+    # 失败发生在哪一步：submit（服务端大概率没建任务）/ poll（任务已建、还在计费）
+    stage: str = ""
+    # 原样重新提交安全吗 —— 只有「请求确实没送到 / 被明确拒收（429）」才安全。
+    # 轮询阶段的失败永远不安全：任务在服务端照跑，重提就是付两份钱（2026-09-23 审查）
+    retryable: bool = False
+    http_status: int = 0
+    # 这次结果是从台账里取回的旧任务（没有重新付费）
+    recovered: bool = False
 
     @property
     def ok(self) -> bool:
         return self.status is TaskStatus.SUCCEEDED and bool(self.urls)
+
+
+class PollTransientError(Exception):
+    """轮询时服务端/网关的暂时性错误（429、5xx）：任务本身没事，接着问。"""
 
 
 class MediaProvider(Protocol):
@@ -223,13 +235,19 @@ class ApiMartProvider:
         payload = _safe_json(resp)
 
         if resp.status_code >= 400:
+            code = resp.status_code
             return MediaTask(
                 task_id="",
                 kind=kind,
                 model=model,
                 status=TaskStatus.FAILED,
-                error=f"HTTP {resp.status_code}：{_err_text(payload) or resp.text[:200]}",
+                error=f"HTTP {code}：{_err_text(payload) or resp.text[:200]}",
                 raw=payload,
+                stage="submit",
+                http_status=code,
+                # 429 是被拒收（没建任务、不扣费）；502/503/504 是网关没转到后端。
+                # 400/401/403/500 等说明请求本身或服务端有问题，原样重提没意义或有风险
+                retryable=code == 429 or code in (502, 503, 504),
             )
 
         urls = extract_urls(payload)
@@ -272,8 +290,16 @@ class ApiMartProvider:
         task.raw = payload
 
         if resp.status_code >= 400:
+            code = resp.status_code
+            detail = f"HTTP {code}：{_err_text(payload) or resp.text[:200]}"
+            if code in (408, 425, 429) or code >= 500:
+                # 网关偶发 5xx / 限流：任务在服务端照常跑，只是这次没问到。之前一次就判死，
+                # 上层再把它当网络抖动重新提交 —— 同一个镜头付两份钱（2026-09-23 审查）
+                raise PollTransientError(detail)
             task.status = TaskStatus.FAILED
-            task.error = f"HTTP {resp.status_code}：{_err_text(payload) or resp.text[:200]}"
+            task.error = detail
+            task.http_status = code
+            task.stage = "poll"
             return task
 
         task.status = normalize_status(_deep_get(payload, "status"))
@@ -317,7 +343,18 @@ def _err_text(payload: Any) -> str:
 
 
 class MediaGateway:
-    """submit → poll → 取回。带退避、超时、事件。"""
+    """submit → poll → 取回。带退避、超时、事件、任务台账。
+
+    2026-09-23 审查后加的四样：
+      · **任务台账**（ledger）：提交成功就记下 task_id；取消、超时、轮询放弃也照记。
+        钱花了拿不到结果的任务，事后能用同一个 task_id 取回。
+      · **先取回、再提交**：同一份请求（指纹相同）在台账里还有没交付的任务，就去取回它，
+        不重新付费 —— 上层的「失败重试」因此不会再把还在跑的任务又提交一遍。
+      · **按模态共享并发**：信号量放在网关里，两批渲染同时跑也不会把服务商的并发打爆
+        （之前每次调用各建一个信号量，两批并发就翻倍）。
+      · **分级重试**：提交只在「请求确实没送到」时重试，429 退避后再试；轮询时的
+        429/5xx 当网络抖动接着问，不判死。
+    """
 
     def __init__(
         self,
@@ -331,6 +368,9 @@ class MediaGateway:
         max_polls: int = 0,
         max_transient: int = 10,
         submit_retries: int = 2,
+        ledger: Any = None,
+        concurrency: dict[str, int] | None = None,
+        rate_limit_retries: int = 4,
     ) -> None:
         self.providers = providers
         self.bus = bus
@@ -345,8 +385,26 @@ class MediaGateway:
         # 网络抖动容忍：轮询连续多少次网络错误才判失败。之前一次 ConnectError 就把任务
         # 判死 —— 服务端其实还在跑、也照样计费，片段却丢了。
         self.max_transient = max_transient
-        # 提交阶段的网络错误重试次数（HTTP 4xx 不重试，那是请求本身的问题）
+        # 提交阶段「请求没送到」的重试次数（HTTP 4xx 不重试，那是请求本身的问题）
         self.submit_retries = submit_retries
+        # 提交被 429 拒收（没建任务、不扣费）时退避重试几次
+        self.rate_limit_retries = rate_limit_retries
+        # 任务台账（MediaTaskLedger）。None = 不记（脚本 / 测试）
+        self.ledger = ledger
+        # 各模态同时在跑的任务上限（image / video / audio）。0 或缺 = 不限
+        self.concurrency = dict(concurrency or {})
+        self._sems: dict[str, asyncio.Semaphore] = {}
+        # 本进程正在轮询的 task_id：台账里「没交付」的任务如果正被本进程等着，不能拿去取回
+        self._inflight: set[str] = set()
+
+    def _sem(self, kind: MediaKind) -> asyncio.Semaphore | None:
+        n = int(self.concurrency.get(kind.value) or 0)
+        if n <= 0:
+            return None
+        sem = self._sems.get(kind.value)
+        if sem is None:
+            sem = self._sems[kind.value] = asyncio.Semaphore(n)
+        return sem
 
     async def generate(
         self,
@@ -369,8 +427,24 @@ class MediaGateway:
                     f"可用：{', '.join(self.providers) or '（无）'}"
                 ),
             )
+        sem = self._sem(kind)
+        if sem is None:
+            return await self._generate(p, provider, kind, model, prompt, max_wait_s, params)
+        async with sem:
+            return await self._generate(p, provider, kind, model, prompt, max_wait_s, params)
 
+    async def _generate(
+        self,
+        p: MediaProvider,
+        provider: str,
+        kind: MediaKind,
+        model: str,
+        prompt: str,
+        max_wait_s: float | None,
+        params: dict[str, Any],
+    ) -> MediaTask:
         started = time.perf_counter()
+        fingerprint = task_fingerprint(kind, model, prompt, params)
         await self.bus.emit(
             EventType.MODEL_REQUEST,
             modality=kind.value,
@@ -379,11 +453,67 @@ class MediaGateway:
             prompt_len=len(prompt),
         )
 
+        # 1) 同一份请求在台账里还有没交付的任务：先取回它（服务端可能早就生成完了）
+        rec = None
+        if self.ledger is not None:
+            rec = self.ledger.recoverable(fingerprint, exclude=self._inflight)
+        if rec is not None:
+            await self.bus.emit(
+                EventType.WARNING,
+                message=(
+                    f"同一份{kind.value}请求在台账里有没取回的任务 {rec.task_id}"
+                    f"（{rec.status}），先取回它，不重新提交"
+                ),
+            )
+            task = MediaTask(
+                task_id=rec.task_id, kind=kind, model=rec.model or model,
+                status=TaskStatus.RUNNING, recovered=True,
+            )
+            task = await self._await_task(p, task, max_wait_s)
+            if task.ok or task.status is not TaskStatus.FAILED:
+                return await self._finish(task, started)
+            # 旧任务确实失败了（服务端判的，不是我们没问到）：这次正常提交一个新的
+            await self.bus.emit(
+                EventType.WARNING, message=f"台账里的任务 {rec.task_id} 已失败，重新提交"
+            )
+
+        # 2) 正常提交
         task = await self._submit(p, kind, model, prompt, params)
+        if task.task_id and task.task_id != "sync" and self.ledger is not None:
+            self.ledger.submitted(
+                task.task_id, kind=kind.value, model=model, provider=provider,
+                fingerprint=fingerprint, prompt=prompt, params=params,
+            )
+        task = await self._await_task(p, task, max_wait_s)
+        return await self._finish(task, started)
+
+    async def recover(
+        self, provider: str, task_id: str, kind: MediaKind, model: str,
+        max_wait_s: float | None = None,
+    ) -> MediaTask:
+        """按 task_id 取回一个之前没拿到结果的任务（轮询到结束，不提交新的）。"""
+        p = self.providers.get(provider)
+        if p is None:
+            return MediaTask(
+                task_id=task_id, kind=kind, model=model, status=TaskStatus.FAILED,
+                error=f"未配置 provider {provider!r}",
+            )
+        started = time.perf_counter()
+        task = MediaTask(
+            task_id=task_id, kind=kind, model=model, status=TaskStatus.RUNNING, recovered=True
+        )
+        task = await self._await_task(p, task, max_wait_s)
+        return await self._finish(task, started)
+
+    async def _await_task(
+        self, p: MediaProvider, task: MediaTask, max_wait_s: float | None
+    ) -> MediaTask:
+        """轮询到结束。被取消（/stop、工具超时）时把 task_id 记成 abandoned 再往外抛。"""
         budget = max_wait_s if max_wait_s is not None else self.max_wait_s
         interval = self.poll_interval
         polls = 0  # 本次发出的轮询请求数（网络失败的也算一次请求）
         transient = 0  # 连续网络错误次数
+        tracked = bool(task.task_id) and task.task_id != "sync"
 
         # 计时规则（用户 2026-09-17 定的）：排队/等依赖的时间**不吃生成预算**。
         # 生成计时从任务真正开跑（状态变 running）那一刻起算 —— 服务端队列
@@ -393,79 +523,153 @@ class MediaGateway:
         queue_budget = self.max_queue_s or budget
         queued_since = time.perf_counter()
         run_started: float | None = None
-
-        while not task.status.done:
-            now = time.perf_counter()
-            if task.status is TaskStatus.RUNNING:
-                if run_started is None:
-                    run_started = now
-                if now - run_started > budget:
+        if tracked:
+            self._inflight.add(task.task_id)
+        try:
+            while not task.status.done:
+                now = time.perf_counter()
+                if task.status is TaskStatus.RUNNING:
+                    if run_started is None:
+                        run_started = now
+                    if now - run_started > budget:
+                        task.status = TaskStatus.TIMEOUT
+                        task.error = f"生成超时（开跑后 >{budget:.0f}s，已轮询 {task.polls} 次）"
+                        break
+                elif now - queued_since > queue_budget:
                     task.status = TaskStatus.TIMEOUT
-                    task.error = f"生成超时（开跑后 >{budget:.0f}s，已轮询 {task.polls} 次）"
-                    break
-            elif now - queued_since > queue_budget:
-                task.status = TaskStatus.TIMEOUT
-                task.error = (
-                    f"排队超时（>{queue_budget:.0f}s 仍未开跑，已轮询 {task.polls} 次）"
-                )
-                break
-            if self.max_polls and polls >= self.max_polls:
-                task.status = TaskStatus.TIMEOUT
-                task.error = (
-                    f"轮询 {polls} 次（每 {self.poll_interval:g}s 一次）仍未完成，放弃等待"
-                )
-                break
-            await asyncio.sleep(interval)
-            interval = min(interval * self.poll_backoff, self.max_poll_interval)
-            polls += 1
-            try:
-                task = await p.poll(task)
-                transient = 0
-            except (httpx.TransportError, OSError) as e:
-                # 网络抖动：任务在服务端照常跑，这里只是没问到 —— 接着问，别把任务判死
-                transient += 1
-                if transient > self.max_transient:
-                    task.status = TaskStatus.FAILED
                     task.error = (
-                        f"轮询连续 {transient} 次网络错误，放弃：{type(e).__name__}: {e}"
+                        f"排队超时（>{queue_budget:.0f}s 仍未开跑，已轮询 {task.polls} 次）"
                     )
                     break
-            except Exception as e:  # noqa: BLE001
-                task.status = TaskStatus.FAILED
-                task.error = f"轮询失败 {type(e).__name__}: {e}"
-                break
+                if self.max_polls and polls >= self.max_polls:
+                    task.status = TaskStatus.TIMEOUT
+                    task.error = (
+                        f"轮询 {polls} 次（每 {self.poll_interval:g}s 一次）仍未完成，放弃等待"
+                    )
+                    break
+                await asyncio.sleep(interval)
+                interval = min(interval * self.poll_backoff, self.max_poll_interval)
+                polls += 1
+                try:
+                    task = await p.poll(task)
+                    transient = 0
+                except (httpx.TransportError, OSError, PollTransientError) as e:
+                    # 网络抖动 / 网关 5xx / 限流：任务在服务端照常跑，这里只是没问到 ——
+                    # 接着问，别把任务判死
+                    transient += 1
+                    if transient > self.max_transient:
+                        task.status = TaskStatus.TIMEOUT
+                        task.error = (
+                            f"轮询连续 {transient} 次没问到（{type(e).__name__}: {e}），放弃等待"
+                        )
+                        break
+                except Exception as e:  # noqa: BLE001
+                    task.status = TaskStatus.TIMEOUT
+                    task.error = f"轮询出错 {type(e).__name__}: {e}"
+                    break
+        except asyncio.CancelledError:
+            if tracked and self.ledger is not None:
+                self.ledger.update(
+                    task.task_id, "abandoned",
+                    error="本地放弃等待（/stop 或工具超时），服务端可能仍在生成",
+                )
+            raise
+        finally:
+            if tracked:
+                self._inflight.discard(task.task_id)
 
+        if tracked:
+            if task.status is TaskStatus.TIMEOUT:
+                # 本地没等到 ≠ 任务失败：它多半还在服务端跑、照样计费。记下来，事后能取回；
+                # 也明确告诉上层**不要原样重提**
+                task.stage = "poll"
+                task.retryable = False
+                task.error = (
+                    f"{task.error}。任务 {task.task_id} 可能仍会在服务端完成（已计费）："
+                    "用 media_tasks 查看、media_recover 取回，不要原样重新提交"
+                )
+                if self.ledger is not None:
+                    self.ledger.update(task.task_id, "timeout", error=task.error or "")
+            elif self.ledger is not None:
+                if task.ok:
+                    self.ledger.update(task.task_id, "succeeded", urls=task.urls)
+                else:
+                    self.ledger.update(task.task_id, "failed", error=task.error or "")
+        return task
+
+    async def _finish(self, task: MediaTask, started: float) -> MediaTask:
         task.elapsed_s = round(time.perf_counter() - started, 1)
         await self.bus.emit(
             EventType.MODEL_RESPONSE,
-            modality=kind.value,
-            model=model,
+            modality=task.kind.value,
+            model=task.model,
             status=task.status.value,
             urls=len(task.urls),
             elapsed_s=task.elapsed_s,
             polls=task.polls,
             error=task.error,
+            task_id=task.task_id,
+            recovered=task.recovered,
         )
         return task
 
     async def _submit(
         self, p: MediaProvider, kind: MediaKind, model: str, prompt: str, params: dict[str, Any]
     ) -> MediaTask:
-        """提交，网络错误重试几次（HTTP 4xx/5xx 由 provider 转成 FAILED，不在这里重试）。"""
-        for attempt in range(self.submit_retries + 1):
+        """提交。只在「请求确实没送到」时重试；被 429 拒收时退避后再试。
+
+        · 连不上 / 连接超时 / 连接池等不到：请求没发出去，重试安全
+        · 读超时 / 连接中途断：请求**可能已经送达**、服务端可能已经建了任务 ——
+          不重试（之前会重试，一个镜头最多被提交 6 次），交给上层看台账决定
+        · HTTP 429：被拒收，没建任务、不扣费，按退避重试
+        """
+        attempt = limited = 0
+        while True:
             try:
-                return await p.submit(kind, model, prompt, **params)
-            except (httpx.TransportError, OSError) as e:
+                task = await p.submit(kind, model, prompt, **params)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 if attempt >= self.submit_retries:
                     return MediaTask(
-                        task_id="",
-                        kind=kind,
-                        model=model,
-                        status=TaskStatus.FAILED,
-                        error=f"提交失败（网络错误，已重试 {attempt} 次）：{type(e).__name__}: {e}",
+                        task_id="", kind=kind, model=model, status=TaskStatus.FAILED,
+                        error=(
+                            f"提交失败（连不上服务端，已重试 {attempt} 次）："
+                            f"{type(e).__name__}: {e}"
+                        ),
+                        stage="submit", retryable=True,
                     )
-                await asyncio.sleep(min(2.0 * (attempt + 1), 10.0))
-        raise AssertionError("unreachable")
+                attempt += 1
+                await asyncio.sleep(min(2.0 * attempt, 10.0))
+                continue
+            except (httpx.TransportError, OSError) as e:
+                return MediaTask(
+                    task_id="", kind=kind, model=model, status=TaskStatus.FAILED,
+                    error=(
+                        f"提交后没收到响应（{type(e).__name__}: {e}）：服务端可能已经建了任务、"
+                        "开始计费，所以没有自动重提。过几分钟看服务商控制台或重试前先确认"
+                    ),
+                    stage="submit", retryable=False,
+                )
+            if (
+                task.status is TaskStatus.FAILED
+                and task.http_status == 429
+                and limited < self.rate_limit_retries
+            ):
+                limited += 1
+                await asyncio.sleep(min(5.0 * (2 ** (limited - 1)), 60.0))
+                continue
+            return task
+
+
+def task_fingerprint(kind: MediaKind, model: str, prompt: str, params: dict[str, Any]) -> str:
+    """同一份生成请求的指纹：模态 + 模型 + 提示词 + 会影响产物的参数。"""
+    import hashlib
+    import json
+
+    body = json.dumps(
+        {"k": kind.value, "m": model, "p": prompt, "x": params},
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()[:20]
 
     async def close(self) -> None:
         for p in self.providers.values():

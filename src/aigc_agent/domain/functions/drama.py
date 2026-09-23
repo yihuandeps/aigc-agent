@@ -32,7 +32,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
-from ..assets.store import AssetStore, AssetType
+from ..assets.store import AssetStore, AssetType, local_copy
 from ..drama import (
     ask_script_next,
     ask_text,
@@ -99,6 +99,7 @@ from ..realism import (
     person_video_prompt,
     realism_check_messages,
 )
+from .media import retryable_failure
 
 # 人审挂起的环节名：同一个角色查出多张互不一致的脸、又定不了谁是准的时候，
 # 按它在总线上认决策（2026-09-22 用户定：Agent 自动挑，歧义才问）
@@ -407,8 +408,14 @@ class DramaFunctions:
                     "filename": {"type": "string", "description": "成片文件名"},
                     "reuse": {
                         "type": "boolean",
-                        "description": "复用这份提示词上次已成功的片段，只重生成失败/缺的"
-                        "（默认 true；要全部重生成传 false）",
+                        "description": "复用这份提示词上次已成功、过了质检门、参考图包没换的片段，"
+                        "只重生成失败/缺的（默认 true；要全部重生成传 false）",
+                    },
+                    "redo": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "reuse 时强制重渲这几段（写场次或镜头，如 "
+                        "\"第1集-2场 镜5-9\" 或 \"镜5-9\"）—— 人复核后不满意的段用它",
                     },
                 },
                 "required": ["shots_id"],
@@ -709,22 +716,47 @@ class DramaFunctions:
             a = self.store.get(asset_id)
         except KeyError:
             return False
-        local = str(a.gen_params.get("local") or "")
-        if local and Path(local).exists():
+        if local_copy(a) is not None:
             return True
-        uri = a.uri or ""
-        if uri.startswith(("http://", "https://")):
-            return True
-        return bool(uri) and Path(uri).exists()
+        return (a.uri or "").startswith(("http://", "https://"))
 
-    def _previous_clips(self, shots_id: str, episode: int) -> dict[tuple[str, str], str]:
-        """这份提示词此前渲过的成功片段：(场次, 镜头范围) → 片段资产 id，最新的优先。
+    def _previous_clips(
+        self, shots_id: str, episode: int, pack_id: str = "", redo: list[str] | None = None
+    ) -> dict[tuple[str, str], str]:
+        """这份提示词此前渲过、**过了质检门**的片段：(场次, 镜头范围) → 片段资产 id，最新的优先。
 
         重跑只补失败/缺的段 —— 之前一段网络错误就要整集重生成，成功的段也跟着再付一遍钱。
+
+        2026-09-23 审查后改的三处：
+          · 不再只认整批跑完才写的片段索引：每段视频生成时就带着标签（所属提示词、场次、
+            镜头、参考图包），渲到一半被 /stop、超时、崩溃，已付费的段下次照样能复用
+          · 参考图包换了（换脸、补了服装）就不复用旧片段 —— 否则新脸永远到不了视频
+          · redo 里点名的段强制重渲（之前结果里让人「去掉问题段」，却没有参数能做到）
         """
-        out: dict[tuple[str, str], str] = {}
+        cand: dict[tuple[str, str], tuple[int, str]] = {}
+
+        def offer(key: tuple[str, str], seq: int, cid: str) -> None:
+            if not cid or not self._clip_playable(cid):
+                return
+            if key not in cand or seq > cand[key][0]:
+                cand[key] = (seq, cid)
+
+        # ① 每段自带标签的片段（新口径）
+        for a in self.store.find(type_=AssetType.VIDEO):
+            tags = (a.gen_params or {}).get("tags") or {}
+            if not isinstance(tags, dict) or tags.get("shots_id") != shots_id:
+                continue
+            if not tags.get("accepted"):
+                continue  # 没过质检门（带字幕 / 变脸）或半路被拒的版本不复用
+            if pack_id and tags.get("pack") and tags.get("pack") != pack_id:
+                continue
+            offer((str(tags.get("scene") or ""), str(tags.get("name") or "")), a.seq, a.id)
+
+        # ② 老口径：整批跑完落的片段索引
         for a in self.store.find(creator="tool:drama_render_shots"):
             if not a.parent_ids or a.parent_ids[0] != shots_id:
+                continue
+            if pack_id and len(a.parent_ids) > 1 and a.parent_ids[1] != pack_id:
                 continue
             ep = int(a.gen_params.get("episode") or 0)
             if episode and ep not in (0, episode):
@@ -734,11 +766,20 @@ class DramaFunctions:
             except (KeyError, json.JSONDecodeError):
                 continue
             for row in rows if isinstance(rows, list) else []:
+                if row.get("flagged"):
+                    continue  # 带着问题标记进索引的段（仍有字幕 / 仍漂移）不复用
                 key = (str(row.get("scene") or ""), str(row.get("name") or ""))
-                cid = str(row.get("asset") or "")
-                if key in out or not cid or not self._clip_playable(cid):
-                    continue
-                out[key] = cid
+                offer(key, a.seq, str(row.get("asset") or ""))
+
+        out = {k: v[1] for k, v in cand.items()}
+        for want in redo or []:
+            w = str(want or "").strip()
+            if not w:
+                continue
+            for key in list(out):
+                label = f"{key[0]} {key[1]}"
+                if w in label or w == key[1]:
+                    out.pop(key, None)
         return out
 
     def _video_retries(self) -> int:
@@ -763,11 +804,17 @@ class DramaFunctions:
         return on, n
 
     async def _invoke_video(self, args: dict[str, Any], retries: int) -> Any:
-        """gen_video + 网络类失败原样重试（连接失败、5xx、轮询网络错误）；400 与超时不重试。"""
+        """gen_video + 「请求没送到」类失败原样重试。
+
+        只看媒体层给的结构化标记（retryable_failure）：连不上、被 429 拒收才重提；
+        轮询失败 / 超时 / 5xx 一律不重提 —— 那时任务多半还在服务端跑、已经计费，
+        之前按错误文本里的「网络」「HTTP 5」重提，一个镜头付两份钱（2026-09-23 审查）。
+        真要再来一次，媒体网关会先去任务台账取回同一份请求没交付的那个任务。
+        """
         r: Any = None
         for attempt in range(retries + 1):
             r = await self.registry_invoke("gen_video", args)
-            if r.ok or attempt >= retries or not _transient_error(r.error or ""):
+            if r.ok or attempt >= retries or not retryable_failure(r):
                 break
             await asyncio.sleep(3)
         return r
@@ -1118,13 +1165,31 @@ class DramaFunctions:
                 out.append(m.key)
         return out
 
+    def _mark_clip(self, asset_id: str, notes: list[str]) -> bool:
+        """一段过完质检门之后在它的标签上记结论：accepted 才能被下次复用、进成片。
+
+        带着「仍有字幕」（用户定的最高优先级）或检查没做成的段不算 accepted。
+        返回是否 accepted。
+        """
+        accepted = not any(_blocking_note(n) for n in notes)
+        try:
+            a = self.store.get(asset_id)
+        except KeyError:
+            return accepted
+        tags = dict((a.gen_params or {}).get("tags") or {})
+        tags["accepted"] = accepted
+        if notes:
+            tags["notes"] = list(notes)[-6:]
+        a.gen_params["tags"] = tags
+        self.store.put(a)
+        return accepted
+
     def _local_video(self, asset_id: str) -> Path | None:
         try:
             a = self.store.get(asset_id)
         except KeyError:
             return None
-        local = str(a.gen_params.get("local") or "")
-        return Path(local) if local and Path(local).exists() else None
+        return local_copy(a)
 
     async def _frames_of(self, video: Path, count: int = 4) -> list[bytes]:
         """抽几帧 jpg 给视觉模型看。抽不出来返回空。"""
@@ -2157,7 +2222,7 @@ class DramaFunctions:
     def _image_payload(self, asset_id: str, url: str) -> str:
         """给视觉模型看的图：本地副本转 data URL（不依赖对方能不能拉外链），没有就给 url。"""
         try:
-            local = self.store.get(asset_id).gen_params.get("local")
+            local = local_copy(self.store.get(asset_id))
         except KeyError:
             local = None
         if local:
@@ -2410,6 +2475,7 @@ class DramaFunctions:
         filename: str = "",
         episode: int = 0,
         reuse: bool = True,
+        redo: list[str] | None = None,
     ) -> ToolResult:
         try:
             raw = self.store.content(shots_id)
@@ -2464,7 +2530,7 @@ class DramaFunctions:
             )
         lib = self._library_for(shots_id, pack_id)
         # 增量重跑：上次已成功的段直接复用，只生成失败/缺的 —— 引用门只查这次要生成的段
-        prev_clips = self._previous_clips(shots_id, episode) if reuse else {}
+        prev_clips = self._previous_clips(shots_id, episode, pack_id, redo) if reuse else {}
         todo = [
             i for i, s in enumerate(shots)
             if not prev_clips.get((s.scene_index, s.video_name), "")
@@ -2719,10 +2785,21 @@ class DramaFunctions:
                     args["image"] = refs
                 if videos:
                     args["video_urls"] = videos
+                # 片段自带标签（2026-09-23）：渲到一半被打断，已付费的段下次凭它复用；
+                # 参考图包也记上，换了包（换脸）就不复用旧片段
+                args["tags"] = {
+                    "shots_id": shots_id,
+                    "scene": s.scene_index,
+                    "name": s.video_name,
+                    "pack": pack_id,
+                    "episode": episode,
+                }
                 # 网络类失败自动重试 + 人物一致性门 + 字幕门
                 r, clip_notes = await self._gen_clip(
                     args, retries, sub_gate, sub_retries, id_refs=id_refs
                 )
+                if r.ok and r.asset_ref:
+                    self._mark_clip(r.asset_ref, clip_notes)
                 done_v += 1
                 await self._progress(
                     "渲染分镜视频", done_v, len(shots), f"{s.scene_index} {s.video_name}"
@@ -3083,15 +3160,13 @@ def _format_note(problems: list[str], fmt: EpisodeFormat) -> str:
     )
 
 
-_TRANSIENT = (
-    "ConnectError", "ConnectTimeout", "ReadTimeout", "ReadError", "RemoteProtocolError",
-    "PoolTimeout", "网络", "HTTP 5", "HTTP 429", "轮询失败", "提交失败",
-)
+def _blocking_note(note: str) -> bool:
+    """这条质检结论是否意味着这段不能进成片 / 不能被复用。
 
-
-def _transient_error(err: str) -> bool:
-    """网络抖动/服务端暂时性错误 —— 值得原样再试一次；400 和超时不算。"""
-    return any(k in err for k in _TRANSIENT)
+    ⛔ 开头的是质检门判的「不通过」；「仍有字幕」是用户定的最高优先级约束，
+    查出来了就不算过（2026-09-23 审查：之前只在结果里提一句，照样拼进成片）。
+    """
+    return note.startswith("⛔") or "仍有字幕" in note
 
 
 def _voice_note(

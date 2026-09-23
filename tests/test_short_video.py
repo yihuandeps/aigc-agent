@@ -243,7 +243,10 @@ async def test_读回复_文件登记_改生成_联网给搜索词(tmp_path: Pat
 
 async def test_出片_素材直用_缺的并发生成_配音字幕合成_重跑复用(tmp_path: Path):
     store = AssetStore()
-    reg = Registry(store, fail_once={"AI 芯片为什么不够用·第1镜": "轮询失败 ConnectError: x"})
+    # 提交时连不上服务端（请求没送到）才原样重提；轮询失败不重提（任务已在服务端计费）
+    reg = Registry(
+        store, fail_once={"AI 芯片为什么不够用·第1镜": "提交失败（连不上服务端）：ConnectError: x"}
+    )
     fns = _fns(store, reg)
     made = await fns.invoke("short_video_brief", {"keyword": "AI 芯片", "style": "tech-short"})
     clip = tmp_path / "gpu.mp4"

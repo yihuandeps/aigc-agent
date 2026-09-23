@@ -70,6 +70,7 @@ from .harness.model.config import ModelsConfig
 from .harness.model.gateway import ModelGateway
 from .harness.model.ledger import CostLedger
 from .harness.model.media import ApiMartProvider, MediaGateway
+from .harness.model.task_ledger import MediaTaskLedger
 from .harness.permission.gate import Asker, PermissionGate
 from .harness.tools.builtin import builtin
 from .harness.tools.disclosure import DisclosureProvider
@@ -208,7 +209,7 @@ class Agent:
         skills.load()
 
         catalog = MediaCatalog.load(config_dir / "media_models.yaml")
-        media_gw, audio_gw = _media_gateways(config, catalog, bus)
+        media_gw, audio_gw = _media_gateways(config, catalog, bus, workspace=workspace)
 
         registry = ToolRegistry(bus)
         memory = ShortTermMemory(policy=WindowPolicy())
@@ -578,12 +579,15 @@ async def rollback_to(
 
 
 def _media_gateways(
-    config: ModelsConfig, catalog: MediaCatalog, bus: EventBus
+    config: ModelsConfig, catalog: MediaCatalog, bus: EventBus, workspace: Path | None = None
 ) -> tuple[MediaGateway, AudioGateway]:
     """图像/视频与语音的网关。
 
     两者调用形状不同（异步任务 vs 同步二进制/multipart），所以是两个网关，
     但共用同一份 provider 配置和同一个模型目录。
+
+    workspace 给了就挂任务台账（media_tasks.jsonl）：提交成功就记 task_id，
+    中途放弃等待的任务事后能取回，同一份请求重来时先取回、不重新付费（2026-09-23 审查）。
     """
     raw = (config.raw.get("image") or {}).get("providers") or {}
     spec = raw.get(catalog.provider) or {}
@@ -600,6 +604,12 @@ def _media_gateways(
         max_polls=catalog.polling.max_polls,
         max_transient=catalog.polling.max_transient,
         submit_retries=catalog.polling.submit_retries,
+        ledger=MediaTaskLedger(workspace / "media_tasks.jsonl") if workspace else None,
+        # 按模态共享的并发上限：两批渲染同时跑也不会把服务商的并发打爆
+        concurrency={
+            "image": catalog.max_concurrency("image"),
+            "video": catalog.max_concurrency("video"),
+        },
     )
     providers: dict[str, Any] = {catalog.provider: ApiMartAudioProvider(base, key)}
 

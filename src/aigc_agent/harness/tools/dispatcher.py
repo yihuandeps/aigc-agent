@@ -31,11 +31,23 @@ class ToolDispatcher:
         gate: PermissionGate,
         bus: EventBus,
         timeout: float = 120.0,
+        max_parallel: int = 16,
     ) -> None:
         self.registry = registry
         self.gate = gate
         self.bus = bus
         self.timeout = timeout
+        # 同一次迭代里最多同时跑几个工具（花钱的媒体调用另有网关里的按模态并发上限）
+        self._parallel = asyncio.Semaphore(max(1, max_parallel))
+        # 已经跑完、结果还没被 Loop 回填的调用（call_id → 结果）。
+        # 2026-09-23 审查：/stop 取消一整批时，之前连同批里**已经完成**的结果一起丢，
+        # 下一轮被补记成「没有执行结果」—— 已付费的 4 段视频，模型以为没做又生成一遍。
+        # Loop 修补悬空调用时先来这里取真实结果。
+        self._completed: dict[str, ToolResult] = {}
+
+    def take_completed(self, call_id: str) -> ToolResult | None:
+        """取走一个已完成但没被回填的结果（被中断的那一批里先跑完的）。"""
+        return self._completed.pop(call_id, None)
 
     async def run(self, calls: list[ToolCall]) -> list[tuple[ToolCall, ToolResult]]:
         # ---- 第一阶段：串行过闸门 ----
@@ -79,6 +91,9 @@ class ToolDispatcher:
             for cid, task in tasks.items():
                 results[cid] = task.result()
 
+        # 正常返回：这批结果由调用方回填，缓存里的就不需要了
+        for cid in results:
+            self._completed.pop(cid, None)
         return [(c, results[c.id]) for c in calls if c.id in results]
 
     async def _invoke_one(
@@ -90,14 +105,22 @@ class ToolDispatcher:
     ) -> ToolResult:
         await self.bus.emit(EventType.TOOL_CALL, tool=call.name, args=args, call_id=call.id)
         try:
-            result = await asyncio.wait_for(
-                # 上面第一阶段已经串行过闸门了，这里不再问第二遍
-                self.registry.invoke_ungated(call.name, args), timeout=timeout_s
-            )
+            async with self._parallel:
+                result = await asyncio.wait_for(
+                    # 上面第一阶段已经串行过闸门了，这里不再问第二遍
+                    self.registry.invoke_ungated(call.name, args), timeout=timeout_s
+                )
         except TimeoutError:
-            result = ToolResult(ok=False, error=f"工具执行超时（>{timeout_s:.0f}s）")
+            result = ToolResult(
+                ok=False,
+                error=(
+                    f"工具执行超时（>{timeout_s:.0f}s）：本地不再等了，但它调用的模型/生成任务"
+                    "可能仍在服务端跑完并计费 —— 重做前先核对（生图/生视频看 media_tasks）"
+                ),
+            )
         except Exception as e:  # noqa: BLE001 — 单个工具崩溃不能打断整轮
             result = ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
+        self._completed[call.id] = result
 
         if result.ok and len(result.content) > max_chars:
             # 截断要让模型知道被截了、截了多少 —— 否则它会把"看到的"当成"全部"

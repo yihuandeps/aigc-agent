@@ -246,8 +246,11 @@ async def test_媒体function注册且权限正确():
     perms = {m.name: m.permission.value for m in registry.catalog()}
     assert set(perms) == {
         "list_media_models", "gen_image", "gen_video", "gen_images", "gen_videos",
+        "media_tasks", "media_recover",  # 任务台账：查看 / 取回没拿到结果的任务（2026-09-23）
     }
     assert perms["list_media_models"] == "L-read"
+    assert perms["media_tasks"] == "L-read"
+    assert perms["media_recover"] == "L-write"  # 取回已付费的任务，不产生新费用
     assert perms["gen_image"] == "L-compute"  # 花钱
     assert perms["gen_video"] == "L-compute"
     # 批量版本同样花钱，权限不能松（2026-09-19 加，解决逐段调用串行）

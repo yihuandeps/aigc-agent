@@ -51,12 +51,30 @@ def test_在项目目录里启动时不往源码目录里倒(tmp_path: Path):
 
 
 def test_目录不可写就回落(tmp_path: Path, monkeypatch):
+    """可写性真的写一个临时文件去试（2026-09-23）：os.access 在 Windows 上对目录恒为真，
+    System32 也判成可写 —— 所以这里模拟的是「试写失败」。"""
+    import aigc_agent.domain.output as out_mod
+
     here = tmp_path / "只读"
     here.mkdir()
     ws = tmp_path / "ws"
-    monkeypatch.setattr(os, "access", lambda p, mode: False)
+    monkeypatch.setattr(out_mod, "writable", lambda d: False)
     with _cd(here):
         assert default_root(ws, "s1", None) == ws / "output" / "s1"
+
+
+def test_项目子目录_系统目录_程序目录都不当产物目录(tmp_path: Path):
+    from aigc_agent.domain.output import _system_dir
+
+    project = tmp_path / "手搓Agent"
+    (project / "src").mkdir(parents=True)
+    ws = project / "workspace"
+    with _cd(project / "src"):  # 之前只判「等于项目目录」，子目录里启动照样往仓库倒
+        assert default_root(ws, "s", project) == ws / "output" / "s"
+    assert _system_dir(Path("C:/Windows/System32"))
+    assert _system_dir(Path("C:/Users/x/AppData/Local/Programs/aigc-agent"))
+    assert not _system_dir(Path("C:/Users/x/AppData/Local/Temp/work"))
+    assert not _system_dir(Path("E:/西游记"))
 
 
 def test_取不到当前目录也不炸(tmp_path: Path, monkeypatch):

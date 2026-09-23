@@ -73,6 +73,12 @@ class ToolResult(BaseModel):
     suspend: bool = False
     suspend_payload: dict[str, Any] = Field(default_factory=dict)
 
+    # 给**程序**看的结构化附加信息（不进上下文）。例：媒体生成失败时
+    # {"retryable": False, "task_id": "..."} —— 调用方据此决定能不能原样重提，
+    # 不再靠在错误文本里找「网络」「HTTP 5」这种字眼猜（2026-09-23 审查：猜错了就是
+    # 把还在服务端跑、已经计费的任务又提交一遍）。
+    meta: dict[str, Any] = Field(default_factory=dict)
+
     def to_message_content(self) -> str:
         if not self.ok:
             return f"[工具执行失败] {self.error}"

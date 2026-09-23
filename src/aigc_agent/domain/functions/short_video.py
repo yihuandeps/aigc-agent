@@ -27,7 +27,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
-from ..assets.store import AssetStore, AssetType
+from ..assets.store import AssetStore, AssetType, local_copy
 from ..media import ffmpeg
 from ..media.naming import recipe_shot_name, safe_name
 from ..pipeline.recipe import Recipe, list_recipes, load_recipe
@@ -42,7 +42,8 @@ from ..pipeline.subtitle import align_script
 from ..pipeline.voice_pick import parse_pick as parse_voice
 from ..pipeline.voice_pick import pick_prompt as voice_prompt
 from ..realism import norm_level
-from .drama import _run_parallel, _transient_error
+from .drama import _run_parallel
+from .media import retryable_failure
 
 PLANNER_ROLE = "short_video_planner"
 _MAX_SOURCE_CHARS = 20_000  # 喂给规划模型的热点材料总上限
@@ -524,7 +525,9 @@ class ShortVideoFunctions:
                 r = None
                 for attempt in range(retries + 1):
                     r = await self.registry.invoke("gen_video", args)
-                    if r.ok or attempt >= retries or not _transient_error(r.error or ""):
+                    # 只有「请求没送到」才原样重提；轮询失败/超时时任务在服务端照跑、
+                    # 已计费，重提就是付两份钱（2026-09-23 审查）
+                    if r.ok or attempt >= retries or not retryable_failure(r):
                         break
                     await asyncio.sleep(3)
                 done += 1
@@ -672,11 +675,9 @@ class ShortVideoFunctions:
             a = self.store.get(asset_id)
         except KeyError:
             return False
-        local = str(a.gen_params.get("local") or "")
-        if local and Path(local).exists():
+        if local_copy(a) is not None:
             return True
-        uri = a.uri or ""
-        return uri.startswith(("http://", "https://")) or (bool(uri) and Path(uri).exists())
+        return (a.uri or "").startswith(("http://", "https://"))
 
     async def _material_clip(self, asset_id: str, seconds: float, shot_no: int) -> tuple[str, str]:
         """素材资产 → 可拼的视频片段 id。视频直接用；图片做成静止镜头。"""
@@ -688,7 +689,8 @@ class ShortVideoFunctions:
             return (asset_id, "") if self._playable(asset_id) else ("", "视频文件不在了")
         if a.type is not AssetType.IMAGE:
             return "", f"类型是 {a.type.value}，不是视频或图片"
-        src = str(a.gen_params.get("local") or "") or (a.uri or "")
+        lc = local_copy(a)
+        src = str(lc) if lc is not None else (a.uri or "")
         if not src or src.startswith(("http://", "https://")):
             return "", "图片没有本地文件"
         out_dir = (

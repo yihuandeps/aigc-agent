@@ -20,7 +20,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
-from ..assets.store import AssetStore, AssetType
+from ..assets.store import AssetStore, AssetType, local_copy
 from ..media import ffmpeg
 from ..pipeline.cutting import describe, plan_cuts
 
@@ -159,9 +159,9 @@ class VideoEditFunctions:
         本地路径记在 gen_params["local"]，和 gen_image / gen_video 的落盘副本一个口径。
         """
         a = self.store.get(asset_id)
-        local = str(a.gen_params.get("local") or "")
-        if local and Path(local).exists():
-            return Path(local), ""
+        lc = local_copy(a)
+        if lc is not None:
+            return lc, ""
         uri = a.uri or ""
         if uri and not uri.startswith(("http://", "https://")):
             p = Path(uri)

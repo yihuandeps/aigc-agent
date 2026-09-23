@@ -106,11 +106,11 @@ class Rename:
 
 def _local_file(asset: Asset, root: Path) -> Path | None:
     """资产的本地副本：优先 gen_params["local"]，其次产物目录里按 id 命名的默认文件。"""
-    local = asset.gen_params.get("local")
-    if local:
-        p = Path(str(local))
-        if p.exists():
-            return p
+    from ..assets.store import local_copy
+
+    p = local_copy(asset)
+    if p is not None:
+        return p
     ext = _EXT.get(asset.type)
     if ext is None:
         return None

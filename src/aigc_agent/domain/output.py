@@ -39,11 +39,44 @@ def default_root(workspace: Path, session_id: str = "", project_root: Path | Non
         cwd = Path.cwd().resolve()
     except OSError:
         return fallback
-    if project_root is not None and cwd == Path(project_root).resolve():
-        return fallback
-    if not os.access(cwd, os.W_OK):
+    if project_root is not None:
+        pr = Path(project_root).resolve()
+        # 项目目录**及其子目录**（src、workspace…）都不是内容目录（之前只判相等）
+        if cwd == pr or cwd.is_relative_to(pr):
+            return fallback
+    if _system_dir(cwd) or not writable(cwd):
         return fallback
     return cwd
+
+
+def writable(d: Path) -> bool:
+    """真的写一个临时文件试试。os.access 在 Windows 上对目录恒为真（System32 也是），
+    判不出来（2026-09-23 审查实测）。"""
+    try:
+        import tempfile
+
+        fd, name = tempfile.mkstemp(prefix=".aigc-probe-", dir=d)
+        os.close(fd)
+        os.unlink(name)
+        return True
+    except OSError:
+        return False
+
+
+def _system_dir(d: Path) -> bool:
+    """系统目录 / 用户主目录本身 / AppData 下：不该当产物目录（往里倒剧本视频会搅乱系统
+    或把主目录当垃圾场）。"""
+    s = str(d).replace("\\", "/").lower().rstrip("/")
+    if s.startswith(("c:/windows", "c:/program files", "c:/programdata")):
+        return True
+    # AppData 下是程序与配置（用户的 agent.cmd 就装在 AppData/Local/Programs 下，从快捷方式
+    # 启动时当前目录就是它）—— 只放过临时目录
+    if "/appdata/" in s + "/" and "/appdata/local/temp" not in s:
+        return True
+    try:
+        return d == Path.home().resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 class OutputPrefs:
@@ -52,21 +85,41 @@ class OutputPrefs:
     def __init__(self, root: Path | str, downloader: Downloader | None = None) -> None:
         self.root = Path(root)
         self.downloader = downloader or _download_default
+        self.retry_delay = 2.0  # 网络抖动时下载重试的退避基数（秒）
 
     def dir_for(self, kind: str) -> Path:
         """kind: texts | images | videos | downloads | exports"""
         return self.root / kind
 
-    async def download(self, url: str, dest_dir: Path, name: str) -> Path | None:
-        """best-effort 下载到产物目录。失败返回 None —— 本地副本不是主链路，
-        远端 URL 还在资产上，不能因为下载挂了把生成也算成失败。"""
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / name
-            ok = await self.downloader(url, dest)
-        except Exception:  # noqa: BLE001
-            return None
-        return dest if ok else None
+    async def download(
+        self, url: str, dest_dir: Path, name: str, attempts: int = 3
+    ) -> Path | None:
+        """下载到产物目录，失败退避重试。都失败返回 None —— 远端 URL 还在资产上，
+        不能因为下载挂了把生成也算成失败。
+
+        但本地副本不只是方便：字幕门、镜头门、一致性门都要抽本地帧，远端链接约 24h 失效。
+        之前一次失败就放弃，网络一抖这几道门就被静默跳过（2026-09-23 审查），所以重试。
+        """
+        import asyncio
+
+        dest = dest_dir / name
+        for k in range(max(1, attempts)):
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                if await self.downloader(url, dest):
+                    return dest
+                failed_for_good = True  # 服务端明确拒了（4xx）：几秒内不会自己好，不重试
+            except Exception:  # noqa: BLE001 — 网络抖动：值得再试
+                failed_for_good = False
+            try:
+                dest.unlink(missing_ok=True)  # 下载一半的残文件不能留着冒充副本
+            except OSError:
+                pass
+            if failed_for_good:
+                return None
+            if k + 1 < attempts:
+                await asyncio.sleep(self.retry_delay * (k + 1))
+        return None
 
 
 async def _download_default(url: str, dest: Path) -> bool:

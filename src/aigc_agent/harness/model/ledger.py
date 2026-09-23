@@ -17,6 +17,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from .task_ledger import append_jsonl
+
 
 def today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
@@ -36,26 +38,55 @@ class LedgerEntry(BaseModel):
 
 
 class CostLedger:
-    """追加写。内存里只留聚合，不留全部明细 —— 明细在文件里。"""
+    """追加写。内存里只留聚合，不留全部明细 —— 明细在文件里。
+
+    多个进程（两个终端各开一个会话）共用同一份台账：每次查询前把别的进程新追加的
+    行读进来（按文件偏移增量读），单日 / 单项目上限才是真的「所有会话合计」。
+    之前只在启动时读一次，另一个终端当天花的钱这边看不见（2026-09-23 审查）。
+    """
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path
+        self._reset()
+        if path is not None and path.exists():
+            self._load()
+
+    def _reset(self) -> None:
         self._money_by_day: dict[str, float] = defaultdict(float)
         self._money_by_project: dict[str, float] = defaultdict(float)
         self._calls_by_day: dict[tuple[str, str], int] = defaultdict(int)
         self._calls_by_project: dict[tuple[str, str], int] = defaultdict(int)
         self.entries = 0
-        if path is not None and path.exists():
-            self._load()
+        self._offset = 0  # 已经读进聚合的字节数
 
     def _load(self) -> None:
-        assert self.path is not None
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        """从上次读到的位置往后读完整的行（最后半行留着，等它写完）。"""
+        if self.path is None:
+            return
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        if size < self._offset:  # 文件被换掉 / 截断：从头重算
+            self._reset()
+        if size == self._offset:
+            return
+        try:
+            with self.path.open("rb") as f:
+                f.seek(self._offset)
+                chunk = f.read()
+        except OSError:
+            return
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return
+        for line in chunk[:end].decode("utf-8", "replace").splitlines():
             try:
                 e = LedgerEntry.model_validate_json(line)
             except Exception:  # noqa: BLE001 — 单行坏数据不该让台账起不来
                 continue
             self._absorb(e)
+        self._offset += end + 1
 
     def _absorb(self, e: LedgerEntry) -> None:
         self.entries += 1
@@ -66,16 +97,21 @@ class CostLedger:
         self._calls_by_project[(e.project, e.kind)] += e.calls
 
     def append(self, e: LedgerEntry) -> LedgerEntry:
+        self._load()  # 先把别的进程追加的读进来，再记自己这行
         self._absorb(e)
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(e.model_dump_json() + "\n")
+            try:
+                append_jsonl(self.path, e.model_dump_json())
+                self._offset = self.path.stat().st_size  # 自己这行已经在聚合里了
+            except OSError:
+                pass
         return e
 
     # ---------- 查询 ----------
 
     def money(self, day: str = "", project: str = "") -> float:
+        self._load()
         if day:
             return self._money_by_day.get(day, 0.0)
         if project:
@@ -83,6 +119,7 @@ class CostLedger:
         return sum(self._money_by_day.values())
 
     def calls(self, kind: str, day: str = "", project: str = "") -> int:
+        self._load()
         if day:
             return self._calls_by_day.get((day, kind), 0)
         if project:

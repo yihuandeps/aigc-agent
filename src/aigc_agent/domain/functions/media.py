@@ -323,6 +323,37 @@ class MediaFunctions:
             max_result_chars=12_000,
         )
 
+        self._specs["media_tasks"] = ToolSpec(
+            name="media_tasks",
+            summary="列出提交了但没取回结果的图/视频任务（多半已生成、已计费）",
+            permission=PermissionLevel.READ,
+            description=(
+                "生成中途被 /stop、工具超时、轮询放弃时，服务端的任务照跑、照扣费，"
+                "task_id 记在台账里。**重做之前先看这里**：能取回就用 media_recover 取回，"
+                "不要原样重新提交（那是再付一份钱）。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "description": "最多列几个，默认 20"}},
+            },
+        )
+        self._specs["media_recover"] = ToolSpec(
+            name="media_recover",
+            summary="按 task_id 取回之前没拿到结果的生成任务，登记成资产（不重新付费）",
+            permission=PermissionLevel.WRITE,
+            timeout=1500,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "local_name": {"type": "string", "description": _LOCAL_NAME_DESC},
+                    "parent_id": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+        )
+
     # ---------- ToolProvider 协议 ----------
 
     async def list_tools(self) -> list[ToolMeta]:
@@ -584,6 +615,7 @@ class MediaFunctions:
         parent_id: str = "",
         image: list[str] | None = None,
         local_name: str = "",
+        tags: dict[str, Any] | None = None,
     ) -> ToolResult:
         bad = _not_public(list(image or []))
         if bad:
@@ -601,6 +633,7 @@ class MediaFunctions:
             parent_id,
             AssetType.IMAGE,
             local_name=local_name,
+            tags=tags,
             n=max(1, min(int(n or 1), 4)),
             aspect_ratio=aspect_ratio or None,
             # 参考图。实测 2026-09-12 接口收的字段是 image，不是 image_url/reference_images。
@@ -628,6 +661,7 @@ class MediaFunctions:
         local_name: str = "",
         allow_text: bool = False,
         allow_no_refs: bool = False,
+        tags: dict[str, Any] | None = None,
     ) -> ToolResult:
         pics = list(image or image_urls or [])
         bad = _not_public(pics + list(video_urls or []) + list(audio_urls or []))
@@ -688,6 +722,7 @@ class MediaFunctions:
             parent_id,
             AssetType.VIDEO,
             local_name=local_name,
+            tags=tags,
             aspect_ratio=aspect_ratio or None,
             duration=duration,
             resolution=resolution or None,
@@ -708,6 +743,7 @@ class MediaFunctions:
         asset_type: AssetType,
         *,
         local_name: str = "",
+        tags: dict[str, Any] | None = None,
         **params: Any,
     ) -> ToolResult:
         chosen, why = self.catalog.choose(kind, model, prefer)
@@ -715,8 +751,17 @@ class MediaFunctions:
             return ToolResult(ok=False, error=why)  # 不静默替换成别的模型
 
         spec = self.catalog.get(kind, chosen)
+        clamp_note = ""
         if spec and spec.max_duration and params.get("duration"):
-            params["duration"] = min(int(params["duration"]), spec.max_duration)
+            want = int(params["duration"])
+            if want > spec.max_duration:
+                params["duration"] = spec.max_duration
+                # 之前静默截断：换了个单段上限更短的模型，时间线按 15s 排的镜头尾巴全被砍掉，
+                # 一集只剩约 2/3 却没有任何提示（2026-09-23 审查）
+                clamp_note = (
+                    f"⚠ {chosen} 单段最长 {spec.max_duration}s，这段从 {want}s 截到了 "
+                    f"{spec.max_duration}s —— 按 {want}s 排的镜头时间线尾巴会被砍掉"
+                )
 
         task = await self.gateway.generate(
             self.catalog.provider,
@@ -734,12 +779,54 @@ class MediaFunctions:
                     f"{chosen} 生成失败（{task.status.value}，{task.elapsed_s}s，"
                     f"轮询 {task.polls} 次）：{task.error or '未知原因'}"
                 ),
+                # 给调用方程序看：能不能原样重提（2026-09-23 审查：之前靠错误文本猜，
+                # 把「轮询失败」也当网络抖动重提，同一个镜头付两份钱）
+                meta={
+                    "retryable": task.retryable,
+                    "task_id": task.task_id,
+                    "stage": task.stage,
+                    "status": task.status.value,
+                },
             )
 
-        # 产物落 Asset —— 血缘、成本归因照旧。
+        result = await self._register(
+            task, kind, prompt, chosen, why, summary, parent_id, asset_type,
+            local_name=local_name, tags=tags, params=params,
+        )
+        if clamp_note:
+            result.content = f"{result.content}\n{clamp_note}"
+        return result
+
+    async def _register(
+        self,
+        task: Any,
+        kind: MediaKind,
+        prompt: str,
+        chosen: str,
+        why: str,
+        summary: str,
+        parent_id: str,
+        asset_type: AssetType,
+        *,
+        local_name: str = "",
+        tags: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        """把一次成功的生成任务登记成资产（+ 本地副本 + Agent 自留备份）。
+
+        _generate 和 media_recover 共用：取回的旧任务和新生成的走同一套落库口径。
+        """
+        spec = self.catalog.get(kind, chosen)
         # 单价来自目录（media_models.yaml 的 price，参考价）：网关不回传金额，
         # 目录没填就留空 —— 那时 Cost Guard 只剩次数口径，但次数口径始终有效。
-        price = spec.price if spec else None
+        price = self.catalog.price_of(kind, chosen, params or {}) if hasattr(
+            self.catalog, "price_of"
+        ) else (spec.price if spec else None)
+        gp_base: dict[str, Any] = {"prompt": prompt, "model": chosen, **(params or {})}
+        if tags:
+            gp_base["tags"] = dict(tags)
+        if task.task_id and task.task_id != "sync":
+            gp_base["task_id"] = task.task_id
         assets = []
         for i, url in enumerate(task.urls):
             a = self.store.create(
@@ -748,7 +835,7 @@ class MediaFunctions:
                 summary=summary or f"{prompt[:24]}…" + (f" #{i + 1}" if len(task.urls) > 1 else ""),
                 parents=[parent_id] if parent_id else [],
                 creator=f"model:{chosen}",
-                gen_params={"prompt": prompt, "model": chosen, **params},
+                gen_params=dict(gp_base),
                 gen_cost=price,
             )
             a.uri = url
@@ -785,17 +872,142 @@ class MediaFunctions:
                 p = await self.prefs.download(url, folder, target.name)
                 if p:
                     a.gen_params["local"] = str(p)
+                    # Agent 自己留一份（同盘硬链接不占空间）：产物目录是用户的，
+                    # 整理/删掉之后远端链接也早过期了，参考图就再也找不回来
+                    blob = keep_blob(self.store, p, a.id)
+                    if blob:
+                        a.gen_params["blob"] = str(blob)
                     self.store.put(a)
                     got.append(p.name)
             if got:
                 local_note = f"\n本地副本：{folder}（{len(got)}/{len(assets)}）：{', '.join(got)}"
+            if len(got) < len(assets):
+                local_note += (
+                    f"\n⚠ {len(assets) - len(got)} 个本地副本没下载下来（远端链接约 24 小时失效，"
+                    "字幕/镜头检查也要靠本地副本）"
+                )
+
+        ledger = getattr(self.gateway, "ledger", None)
+        if ledger is not None and task.task_id and task.task_id != "sync":
+            ledger.delivered(task.task_id)
 
         lines = [f"{a.id} → {a.uri}" for a in assets]
+        head = f"用 {chosen}（{why}）生成了 {len(assets)} 个，耗时 {task.elapsed_s}s：\n"
+        if getattr(task, "recovered", False):
+            head = (
+                f"取回了之前没拿到结果的任务 {task.task_id}（没有重新付费），"
+                f"{chosen} 共 {len(assets)} 个：\n"
+            )
+        return ToolResult(
+            content=head + "\n".join(lines) + local_note,
+            asset_ref=assets[0].id,
+            meta={"task_id": task.task_id, "recovered": bool(getattr(task, "recovered", False))},
+        )
+
+    # ---------- 任务台账：钱花了没拿到结果的，能取回 ----------
+
+    async def _fn_media_tasks(self, limit: int = 20) -> ToolResult:
+        ledger = getattr(self.gateway, "ledger", None)
+        if ledger is None:
+            return ToolResult(content="没有接任务台账（脚本 / 测试环境）")
+        rows = ledger.pending(limit=max(1, min(int(limit or 20), 100)))
+        if not rows:
+            return ToolResult(content="台账里没有未取回的媒体任务。")
+        now = time.time()
+        lines = [
+            f"- {r.task_id} · {r.kind}/{r.model} · {r.status} · {r.age_h(now):.1f} 小时前 · "
+            f"{(r.prompt or '')[:40]}" + (f" · {r.error[:60]}" if r.error else "")
+            for r in rows
+        ]
         return ToolResult(
             content=(
-                f"用 {chosen}（{why}）生成了 {len(assets)} 个，耗时 {task.elapsed_s}s：\n"
+                f"未取回的媒体任务 {len(rows)} 个（新的在前）。它们多半已在服务端生成并计费，"
+                "用 media_recover(task_id=…) 取回成资产；超过 24 小时的链接可能已失效：\n"
                 + "\n".join(lines)
-                + local_note
-            ),
-            asset_ref=assets[0].id,
+            )
         )
+
+    async def _fn_media_recover(
+        self, task_id: str, summary: str = "", local_name: str = "", parent_id: str = ""
+    ) -> ToolResult:
+        ledger = getattr(self.gateway, "ledger", None)
+        rec = ledger.get(task_id) if ledger is not None else None
+        if rec is None:
+            return ToolResult(
+                ok=False, error=f"台账里没有任务 {task_id}（media_tasks 列出可取回的）"
+            )
+        if rec.delivered:
+            return ToolResult(ok=False, error=f"任务 {task_id} 的结果已经登记过资产，不用再取回")
+        try:
+            kind = MediaKind(rec.kind)
+        except ValueError:
+            return ToolResult(ok=False, error=f"任务 {task_id} 的类型 {rec.kind!r} 不认识")
+        task = await self.gateway.recover(
+            self.catalog.provider, task_id, kind, rec.model, max_wait_s=self.catalog.max_wait(kind)
+        )
+        if not task.ok:
+            return ToolResult(
+                ok=False,
+                error=f"任务 {task_id} 取不回来（{task.status.value}）：{task.error or '未知原因'}",
+                meta={"retryable": False, "task_id": task_id},
+            )
+        params = dict(rec.params or {})
+        tags = params.pop("tags", None)
+        return await self._register(
+            task, kind, rec.prompt, rec.model, "取回", summary or f"取回·{rec.prompt[:20]}…",
+            parent_id, AssetType.IMAGE if kind is MediaKind.IMAGE else AssetType.VIDEO,
+            local_name=local_name, tags=tags, params=params,
+        )
+
+
+# 请求确实没送到服务端的错误（重提安全）。其余一律不自动重提。
+_SEND_FAILED = ("ConnectError", "ConnectTimeout", "PoolTimeout", "连不上服务端")
+
+
+def retryable_failure(result: Any) -> bool:
+    """这次失败能不能**原样重新提交**。
+
+    优先看结构化标记（ToolResult.meta["retryable"]，媒体网关按「请求到没到服务端」判）；
+    没有标记（旧调用方 / 非媒体工具）才看错误文本，而且只认「连不上」这一类 ——
+    「轮询失败」「HTTP 5xx」都不算：那时任务多半已在服务端跑、已计费（2026-09-23 审查）。
+    """
+    if result is None or getattr(result, "ok", False):
+        return False
+    meta = getattr(result, "meta", None) or {}
+    if "retryable" in meta:
+        return bool(meta["retryable"])
+    err = str(getattr(result, "error", "") or "")
+    if "轮询" in err or "超时" in err:
+        return False  # 轮询阶段的连接错误同样叫 ConnectError，但那时任务已在服务端
+    return any(k in err for k in _SEND_FAILED)
+
+
+def keep_blob(store: Any, src: Any, asset_id: str) -> Any:
+    """在资产库的 blobs/ 下给本地副本留一份：同盘硬链接（不占空间），跨盘复制小文件。
+
+    用户的产物目录会被整理、移动、删除（2026-09-23 审查：E:\\内容测试\\images 整个没了，
+    194 个图片资产的本地副本全断，远端链接也早过期）—— Agent 自己得留一份。
+    """
+    import os
+    import shutil
+    from pathlib import Path
+
+    root = getattr(store, "root", None)
+    if root is None:
+        return None
+    try:
+        src = Path(src)
+        d = Path(root) / "blobs"
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / f"{asset_id}{src.suffix}"
+        if dest.exists():
+            return dest
+        try:
+            os.link(src, dest)
+        except OSError:
+            if src.stat().st_size > 50 * 1024 * 1024:
+                return None  # 跨盘的大视频不复制（占空间），靠远端/产物目录
+            shutil.copy2(src, dest)
+        return dest
+    except OSError:
+        return None

@@ -20,7 +20,8 @@ from pathlib import Path
 import httpx2 as httpx
 
 from aigc_agent.domain.assets.store import AssetStore, AssetType
-from aigc_agent.domain.functions.drama import DramaFunctions, _transient_error
+from aigc_agent.domain.functions.drama import DramaFunctions
+from aigc_agent.domain.functions.media import retryable_failure
 from aigc_agent.domain.functions.video_edit import VideoEditFunctions
 from aigc_agent.harness.events.bus import EventBus
 from aigc_agent.harness.model.media import (
@@ -127,7 +128,11 @@ async def test_轮询网络抖动不判死_连续超限才失败():
 
     p2 = FlakyProvider(flaky_polls=99, polls_needed=2)
     task2 = await _gw(p2, max_transient=4).generate("apimart", MediaKind.VIDEO, "m", "x")
-    assert task2.status is TaskStatus.FAILED and "连续 5 次网络错误" in (task2.error or "")
+    # 连续没问到 ≠ 任务失败（2026-09-23）：它多半还在服务端跑、已计费 —— 按超时处理，
+    # 标明不能原样重提，指路取回
+    assert task2.status is TaskStatus.TIMEOUT and "连续 5 次" in (task2.error or "")
+    assert task2.retryable is False and task2.stage == "poll"
+    assert "media_recover" in (task2.error or "")
 
 
 async def test_轮询次数上限_固定间隔():
@@ -207,17 +212,26 @@ def _shots(store: AssetStore) -> str:
     return store.create(json.dumps(SHOTS, ensure_ascii=False), summary="提示词", creator="t").id
 
 
-def test_网络类错误才重试():
-    assert _transient_error("seedance-2.0 生成失败（failed）：轮询失败 ConnectError: x")
-    assert _transient_error("提交失败（网络错误，已重试 2 次）")
-    assert _transient_error("HTTP 502：bad gateway")
-    assert not _transient_error("HTTP 400: Invalid format for video_urls[0]")
-    assert not _transient_error("生成超时（开跑后 >600s）")
+def test_只有请求没送到才原样重提():
+    """2026-09-23 审查：之前「轮询失败」「HTTP 5xx」也重提 —— 那时任务已在服务端跑、
+    已计费，重提就是付两份钱。现在优先看媒体层的结构化标记，文本兜底只认「连不上」。"""
+    fail = ToolResult  # 简写
+    assert retryable_failure(fail(ok=False, error="x", meta={"retryable": True}))
+    assert not retryable_failure(fail(ok=False, error="ConnectError", meta={"retryable": False}))
+    # 没有结构化标记（旧调用方）：只认提交阶段连不上
+    assert retryable_failure(fail(ok=False, error="提交失败（连不上服务端）：ConnectError: x"))
+    assert not retryable_failure(fail(ok=False, error="轮询失败 ConnectError: x"))
+    assert not retryable_failure(fail(ok=False, error="HTTP 502：bad gateway"))
+    assert not retryable_failure(fail(ok=False, error="HTTP 400: Invalid format"))
+    assert not retryable_failure(fail(ok=False, error="生成超时（开跑后 >600s）"))
+    assert not retryable_failure(fail(ok=True))
 
 
 async def test_单段网络失败自动重试一次():
     store = AssetStore()
-    reg = Registry(store, fail_once={"[第1集-1场] 1-2": "轮询失败 ConnectError: boom"})
+    reg = Registry(
+        store, fail_once={"[第1集-1场] 1-2": "提交失败（连不上服务端）：ConnectError: boom"}
+    )
     r = await DramaFunctions(None, store, registry=reg)._fn_drama_render_shots(_shots(store))
     assert r.ok, r.error
     assert "失败" not in r.content.split("\n\n")[0]
@@ -242,7 +256,8 @@ async def test_重跑只补失败的段_成功的复用():
     r1 = await fns._fn_drama_render_shots(shots_id)
     assert r1.ok and "[第1集-3场] 5-6" in r1.content.split("失败：")[1]
     names = [a["summary"] for a in reg.videos()]
-    assert len(names) == 4 and len(set(names)) == 3  # 第 3 段重试过（同名两次），前两段各一次
+    # 轮询失败不原样重提（任务已在服务端、已计费）：三段各一次
+    assert len(names) == 3 and len(set(names)) == 3
 
     # 修好网络再跑：前两段复用，只生成第 3 段；成片按原序拼 3 段
     reg.always_fail.clear()

@@ -39,7 +39,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
-from ..assets.store import AssetStore, AssetType
+from ..assets.store import AssetStore, AssetType, local_copy
 from ..documents import DOC_EXT, UNSUPPORTED_EXT, extract_text
 from ..local_materials import ranges as index_ranges
 from ..media import ffmpeg
@@ -942,7 +942,8 @@ class FileFunctions:
             mode = "overwrite" if overwrite else "create"
             await asyncio.to_thread(self._write_sync, d, text, mode)
             return ToolResult(content=f"已导出 {asset_id} → {_norm(d)}（{len(text)} 字）")
-        src = str(a.gen_params.get("local") or "") or (a.uri or "")
+        lc = local_copy(a)
+        src = str(lc) if lc is not None else (a.uri or "")
         if src and not src.startswith(("http://", "https://")):
             return await asyncio.to_thread(self._transfer_sync, Path(src), d, overwrite, False)
         if not src:

@@ -14,14 +14,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from ...app import PROJECT_ROOT, Agent
-from ...envdetect import workspace_root
+from ...app import Agent
 from ...capabilities.memory.brief import build_brief
 from ...capabilities.memory.recorder import RejectionRecorder
 from ...capabilities.memory.store import Layer, MemoryStore
 from ...domain.assets.store import AssetStore
 from ...domain.pipeline.executors import AgentNodeExecutor, ToolNodeExecutor
 from ...domain.pipeline.registry import GraphRegistry
+from ...envdetect import workspace_root
 from ...harness.events.bus import Event, EventType
 from ...harness.execution.graph.models import Decision, GraphState, NodeType
 from ...harness.execution.graph.runtime import GraphRuntime, make_state_summary

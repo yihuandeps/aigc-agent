@@ -102,7 +102,8 @@ async def test_本地下载失败不拖累生成(tmp_path):
     r = await fns._fn_gen_image("一只橘猫", model="qwen-image-2.0")
 
     assert r.ok  # 生成本身不受影响
-    assert "本地副本" not in r.content
+    assert "本地副本：" not in r.content  # 不谎称落了副本
+    assert "没下载下来" in r.content  # 如实说没落下（字幕/镜头检查要靠它，2026-09-23）
     assert list(prefs.dir_for("images").glob("*.png")) == []
 
 

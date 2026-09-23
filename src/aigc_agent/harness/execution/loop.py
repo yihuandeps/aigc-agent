@@ -129,16 +129,23 @@ class LoopRuntime:
                     for c in m.get("tool_calls") or []:
                         dangling.append((t, c["id"]))
         n = 0
+        take = getattr(self.dispatcher, "take_completed", None)
         for t, cid in dangling:
-            if cid not in answered:
-                t.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": cid,
-                        "content": "（这次调用被中断，没有执行结果）",
-                    }
+            if cid in answered:
+                continue
+            # 同一批里在中断前已经跑完的调用：回填真实结果（2026-09-23 审查：之前一律补
+            # 「没有执行结果」，已付费生成的段被模型当成没做，又生成一遍）
+            done = take(cid) if callable(take) else None
+            if done is not None:
+                content = done.to_message_content() + "\n（本轮被打断前这次调用已经完成）"
+            else:
+                content = (
+                    "（这次调用被中断，没拿到执行结果。若是生图/生视频这类花钱的调用，"
+                    "服务端可能已经在生成、已经计费 —— 重做之前先用 media_tasks / list_assets "
+                    "核对，能取回就 media_recover 取回，别直接重新生成）"
                 )
-                n += 1
+            t.messages.append({"role": "tool", "tool_call_id": cid, "content": content})
+            n += 1
         return n
 
     # ---------- 装配与调用 ----------
