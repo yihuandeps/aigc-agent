@@ -33,6 +33,7 @@ from aigc_agent.domain.functions.episodes import (
 from aigc_agent.harness.events.bus import EventBus, EventType
 from aigc_agent.harness.model.gateway import ModelResponse, ToolCall, Usage
 from aigc_agent.harness.permission.gate import PermissionGate
+from aigc_agent.harness.tools.builtin import builtin
 from aigc_agent.harness.tools.dispatcher import ToolDispatcher
 from aigc_agent.harness.tools.registry import ToolRegistry
 
@@ -128,15 +129,27 @@ async def test_list_assets截断上限单独放宽():
 
 
 async def test_截断时告诉模型截了多少():
+    bus = EventBus()
+    reg = ToolRegistry(bus)
+    reg.register(builtin)
+    await reg.refresh()
+    disp = ToolDispatcher(reg, PermissionGate(bus), bus)
+    call = ToolCall(id="c1", name="calc", arguments=json.dumps({"expression": "10**4200"}))
+    result = (await disp.run([call]))[0][1]
+    assert result.truncated and "结果已截断：共 4201 字" in result.content
+    assert "没读全之前不要据此改写或下结论" in result.content
+
+
+async def test_长资产分页读不被调度器截断():
+    """2026-09-23 缺口 F：read_asset 之前被截到 4000 字，截断提示又指回它自己 —— 读不全。"""
     store = AssetStore()
     store.create("x" * 9000, summary="长文")
     reg, bus = await _content_registry(store)
     disp = ToolDispatcher(reg, PermissionGate(bus), bus)
     aid = store.all()[0].id
     call = ToolCall(id="c1", name="read_asset", arguments=json.dumps({"asset_id": aid}))
-    out = await disp.run([call])
-    result = out[0][1]
-    assert result.truncated and "结果已截断：共 9000 字" in result.content
+    result = (await disp.run([call]))[0][1]
+    assert not result.truncated and result.content == "x" * 9000
 
 
 async def test_find_episode():

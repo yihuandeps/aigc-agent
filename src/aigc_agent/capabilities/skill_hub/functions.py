@@ -79,9 +79,16 @@ class SkillFunctions:
                     "properties": {
                         "skill": {"type": "string"},
                         "name": {"type": "string", "description": "参考文档名，可省略 .md"},
+                        "offset": {
+                            "type": "integer",
+                            "description": "长文档分页：从第几个字开始，上一页结尾会写",
+                        },
                     },
                     "required": ["skill", "name"],
                 },
+                # 之前没设，被调度器按默认截到 4000 字 —— 15 篇参考里 11 篇超过 4000 字，
+                # 短剧指引点名要拉的「04-叙事与表演」只看得到一半（2026-09-23 审查）
+                max_result_chars=MAX_REF_CHARS + 600,
             ),
         }
 
@@ -135,7 +142,9 @@ class SkillFunctions:
             body += f"\n\n（未找到：{', '.join(missing)}）"
         return ToolResult(content=body)
 
-    async def _fn_load_skill_reference(self, skill: str, name: str) -> ToolResult:
+    async def _fn_load_skill_reference(
+        self, skill: str, name: str, offset: int = 0
+    ) -> ToolResult:
         sk = next((s for s in self.hub.available if s.name == skill), None)
         if sk is None:
             avail = ", ".join(s.name for s in self.hub.available) or "（无）"
@@ -150,8 +159,13 @@ class SkillFunctions:
         if not text:
             return ToolResult(ok=False, error=f"{ref.path} 读不出内容")
 
-        truncated = len(text) > MAX_REF_CHARS
-        return ToolResult(
-            content=f"# {skill} / {ref.name}\n\n{text[:MAX_REF_CHARS]}",
-            truncated=truncated,
-        )
+        total = len(text)
+        start = max(0, min(int(offset or 0), total))
+        end = min(total, start + MAX_REF_CHARS)
+        body = f"# {skill} / {ref.name}\n\n{text[start:end]}"
+        if end < total:
+            body += (
+                f"\n\n[还有 {total - end:,} 字：load_skill_reference(skill=\"{skill}\", "
+                f"name=\"{ref.name}\", offset={end}) 继续]"
+            )
+        return ToolResult(content=body)

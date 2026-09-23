@@ -99,6 +99,7 @@ from ..realism import (
     person_video_prompt,
     realism_check_messages,
 )
+from .content import STUB_HINTS
 from .media import retryable_failure
 
 # 人审挂起的环节名：同一个角色查出多张互不一致的脸、又定不了谁是准的时候，
@@ -243,12 +244,21 @@ class DramaFunctions:
             description=(
                 "第①步。把短剧剧本拆成分集的镜头序列：场景标头 + 逐镜的"
                 "景别/运镜/视觉动作 + **100% 保留的原文台词**。\n"
-                "产物存为资产，第③步要用它的 id。"
+                "**一次拆一集**（传这一集的 script_id）：一集 80–120 个镜头行，几集并成一次"
+                "会超出模型单次输出上限被截断。产物存为资产，第③步要用它的 id。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "script": {"type": "string", "description": "剧本原文"},
+                    "script_id": {
+                        "type": "string",
+                        "description": "剧本资产 id（**优先用它**：一集或几集的 script 资产，"
+                        "find_episode / list_assets 查得到）—— 长剧本别整段塞进参数",
+                    },
+                    "script": {
+                        "type": "string",
+                        "description": "剧本原文（没有资产 id 时才用；不能是占位符或摘要）",
+                    },
                     "ethnicity": {
                         "type": "string",
                         "enum": ["asian", "chinese", "caucasian", "african", "latino", "mixed"],
@@ -261,7 +271,7 @@ class DramaFunctions:
                     },
                     "note": {"type": "string", "description": "额外要求，可省略"},
                 },
-                "required": ["script", "ethnicity", "language"],
+                "required": ["ethnicity", "language"],
             },
         )
 
@@ -276,12 +286,26 @@ class DramaFunctions:
                 "哪些场景、哪几集穿它；一个角色×场景组合必须有对应服装）、场景、道具。\n"
                 "角色和服装描述带一段**锁定后缀**（纯白底/单张全身/16:9/8K），"
                 "不透传给人看、也不让人改，生图时由服务端原样拼回去。\n"
-                "返回里有服装-场景分配表，缺口会标 ⚠。产物存为资产，第③步要用它的 id。"
+                "返回里有服装-场景分配表，缺口会标 ⚠。产物存为资产，第③步要用它的 id。\n"
+                "全剧的剧本传 script_ids（按集号顺序的剧本资产 id 列表），不要把几万字塞进参数。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "script": {"type": "string", "description": "剧本原文"},
+                    "script_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "全剧各集的剧本资产 id（按集号顺序）—— **优先用它**",
+                    },
+                    "script_id": {
+                        "type": "string",
+                        "description": "剧本资产 id（**优先用它**：一集或几集的 script 资产，"
+                        "find_episode / list_assets 查得到）—— 长剧本别整段塞进参数",
+                    },
+                    "script": {
+                        "type": "string",
+                        "description": "剧本原文（没有资产 id 时才用；不能是占位符或摘要）",
+                    },
                     "ethnicity": {
                         "type": "string",
                         "enum": ["asian", "chinese", "caucasian", "african", "latino", "mixed"],
@@ -294,7 +318,7 @@ class DramaFunctions:
                     },
                     "note": {"type": "string", "description": "额外要求，可省略"},
                 },
-                "required": ["script", "ethnicity", "language"],
+                "required": ["ethnicity", "language"],
             },
         )
 
@@ -1848,6 +1872,9 @@ class DramaFunctions:
         resp = await self._prose(
             [{"role": "user", "content": write_prompt(idea, episodes, minutes, fmt=self.fmt)}]
         )
+        stop = _finish_problem(resp, "剧本")
+        if stop:
+            return ToolResult(ok=False, error=stop)
         return self._save_script(resp.text, f"剧本·{episodes}集", ["idea"], idea)
 
     async def _prose(self, messages: list[dict[str, Any]]) -> Any:
@@ -1870,9 +1897,29 @@ class DramaFunctions:
         resp = await self._prose(
             [{"role": "user", "content": expand_prompt(script, note, fmt=self.fmt)}]
         )
+        stop = _finish_problem(resp, "扩写")
+        if stop:
+            return ToolResult(ok=False, error=stop)
         return self._save_script(
             resp.text, "剧本·扩写修改", [script_id] if script_id else [], ""
         )
+
+    def _script_input(self, script: str, ids: list[str]) -> tuple[str, str]:
+        """拆解类工具的剧本入参：资产 id 优先（按顺序拼），否则用原文。返回 (剧本, 错误)。
+
+        2026-09-23 审查：之前只收全文 —— 模型把整部剧塞进工具参数（25 万上下文那次事故的
+        入口），或者抄回折叠占位符、写个「测试」，工具照样调 gemini，凭空编出另一部剧的
+        分镜（真实日志：11 字的「测试」→ 118 秒后返回「15 段·共 210s」）。
+        """
+        parts: list[str] = []
+        for aid in ids:
+            try:
+                parts.append(self.store.content(aid))
+            except KeyError as e:
+                return "", f"取不到剧本资产：{e}"
+        text = "\n\n".join(parts) if parts else (script or "")
+        problem = _script_problem(text)
+        return (text, "") if not problem else ("", problem)
 
     def _save_script(
         self, text: str, summary: str, parents: list[str], idea: str
@@ -1905,10 +1952,16 @@ class DramaFunctions:
     # ---------- ① 分镜脚本 ----------
 
     async def _fn_drama_storyboard(
-        self, script: str, ethnicity: str = "", language: str = "", note: str = ""
+        self,
+        script: str = "",
+        ethnicity: str = "",
+        language: str = "",
+        note: str = "",
+        script_id: str = "",
     ) -> ToolResult:
-        if not script.strip():
-            return ToolResult(ok=False, error="script 是空的")
+        script, err = self._script_input(script, [script_id] if script_id else [])
+        if err:
+            return ToolResult(ok=False, error=err, meta={"charged": False})
         opts = normalize(ethnicity, language)
         if not opts.ready:
             # 不猜。族裔和语言会贯穿角色形象和全部分镜视频，选错等于整条链重跑。
@@ -1922,6 +1975,9 @@ class DramaFunctions:
             {"role": "user", "content": user},
         ]
         resp = await self.gateway.chat(_ROLE, messages)
+        stop = _finish_problem(resp, "分镜脚本")
+        if stop:
+            return ToolResult(ok=False, error=stop)
         eps, err = parse_episodes(resp.text)
         if err:
             return ToolResult(ok=False, error=f"分镜解析失败：{err}")
@@ -1940,6 +1996,7 @@ class DramaFunctions:
             json.dumps([as_dict(e) for e in eps], ensure_ascii=False, indent=2),
             type_=AssetType.STORYBOARD,
             summary=f"分镜脚本·{len(eps)}集",
+            parents=[script_id] if script_id else [],
             creator="tool:drama_storyboard",
             gen_params={
                 "episodes": len(eps),
@@ -1971,15 +2028,25 @@ class DramaFunctions:
             },
         ]
         resp = await self.gateway.chat(role, follow)
+        if _finish_problem(resp, "修订"):
+            return first  # 改的那版被截断 / 被过滤：保留第一版，别拿半截的替换它
         return resp.text
 
     # ---------- ② 资产库 ----------
 
     async def _fn_drama_assets(
-        self, script: str, ethnicity: str = "", language: str = "", note: str = ""
+        self,
+        script: str = "",
+        ethnicity: str = "",
+        language: str = "",
+        note: str = "",
+        script_id: str = "",
+        script_ids: list[str] | None = None,
     ) -> ToolResult:
-        if not script.strip():
-            return ToolResult(ok=False, error="script 是空的")
+        ids = list(script_ids or []) + ([script_id] if script_id else [])
+        script, err = self._script_input(script, ids)
+        if err:
+            return ToolResult(ok=False, error=err, meta={"charged": False})
         opts = normalize(ethnicity, language)
         if not opts.ready:
             return ToolResult(ok=False, error=ask_text())
@@ -1991,6 +2058,9 @@ class DramaFunctions:
                 {"role": "user", "content": user},
             ],
         )
+        stop = _finish_problem(resp, "资产库")
+        if stop:
+            return ToolResult(ok=False, error=stop)
         lib, err = parse_assets(resp.text)
         if err:
             return ToolResult(ok=False, error=f"资产库解析失败：{err}")
@@ -2087,6 +2157,9 @@ class DramaFunctions:
             {"role": "user", "content": user},
         ]
         resp = await self.gateway.chat(_ROLE, messages)
+        stop = _finish_problem(resp, "视频提示词")
+        if stop:
+            return ToolResult(ok=False, error=stop)
         shots, err = parse_shots(resp.text)
         if err:
             return ToolResult(ok=False, error=f"镜头提示词解析失败：{err}")
@@ -3294,6 +3367,54 @@ def _format_note(problems: list[str], fmt: EpisodeFormat) -> str:
         f"\n\n⚠ 规格检查未过（{fmt.brief()}；已让模型改过一次仍未达标，"
         "可带 note 重跑或人工调）：\n  " + "\n  ".join(problems)
     )
+
+
+def _finish_problem(resp: Any, what: str) -> str:
+    """文本模型这次输出被截断 / 被内容过滤了没有。没问题返回空串。
+
+    2026-09-23 审查：之前一律不看 finish_reason —— 截断和内容过滤都只报「JSON 解析失败」，
+    模型当成偶发故障原样重试（真实事故：第 1 集真剧本拆分镜时 gemini 返回
+    content_filter，输出 1205 字被截，工具只说解析失败）。
+    """
+    fr = str(getattr(resp, "finish_reason", "") or "").strip().lower()
+    if fr in ("length", "max_tokens"):
+        return (
+            f"{what}被截断：输出超过了模型单次输出上限（finish_reason={fr}），内容不完整、"
+            "没有保存。把输入拆小再来（一次一集），不要原样重试"
+        )
+    if fr in ("content_filter", "content-filter", "safety", "sensitive", "blocked"):
+        return (
+            f"{what}被模型服务商的内容安全过滤拦下（finish_reason={fr}），没有产出。"
+            "这不是网络问题，原样重试多半还会被拦 —— 检查里面有没有未成年人涉险、暴力、"
+            "身体细节描写这类内容，调整措辞后再试，或者如实告诉用户"
+        )
+    return ""
+
+
+def _script_problem(text: str) -> str:
+    """拆解类工具收到的剧本像不像真剧本。像就返回空串。"""
+    from ...harness.context.compaction import find_fold_marks
+
+    s = (text or "").strip()
+    if not s:
+        return "没有剧本内容：传 script_id（剧本资产 id）或完整的剧本原文"
+    if find_fold_marks({"script": s}):
+        return (
+            "剧本里有上下文折叠留下的占位标记（形如「<N 字已折叠>」），不是真实内容 —— "
+            "传剧本资产 id（script_id），别把历史里被折叠的正文抄回来"
+        )
+    if len(s) < 200:
+        return (
+            f"剧本只有 {len(s)} 个字，不像完整剧本：拆出来的分镜只能是模型凭空编的。"
+            "传剧本资产 id（script_id / script_ids），或把完整正文传进来"
+        )
+    # 不到 800 字又写着占位字样的，不可能是完整剧本
+    if len(s) < 800 and any(h in s for h in STUB_HINTS):
+        return (
+            "剧本里写着「此处省略 / 略 / 同上」之类的占位字样，不是完整正文 —— "
+            "传剧本资产 id（script_id），或把完整正文传进来"
+        )
+    return ""
 
 
 def _label_hit(key: tuple[str, str], wants: list[str] | None) -> bool:

@@ -30,6 +30,8 @@ from aigc_agent.domain.functions.drama import DramaFunctions
 from aigc_agent.domain.functions.episodes import build_contract
 
 CONFIG = Path(__file__).resolve().parents[1] / "config" / "drama.yaml"
+# 拆解类工具不收几个字的空壳（2026-09-23 缺口 F），测试要给一段像样的剧本
+SCRIPT = "场景一 内景 客栈 夜\n" + "林秋推门进来，掌柜抬头看了她一眼，手里的算盘停了。\n" * 12
 
 
 # ---------------------------------------------------------------- 规格本身
@@ -295,7 +297,7 @@ async def test_分镜脚本不合规格_改一次():
     good = json.dumps([{"episodeIndex": 1, "episodeTitle": "第1集", "episodeDesc": _desc(96, 1)}])
     gw = SeqGateway([bad, good])
     fns = DramaFunctions(gw, store, registry=None, catalog=None, fmt=EpisodeFormat())
-    r = await fns._fn_drama_storyboard("剧本正文", ethnicity="asian", language="zh")
+    r = await fns._fn_drama_storyboard(SCRIPT, ethnicity="asian", language="zh")
     assert r.ok, r.error
     assert len(gw.calls) == 2 and "96 镜" in r.content and "✓ 规格" in r.content
     assert HOOK_MARK in gw.calls[0][0]["content"]  # system 提示里有规则

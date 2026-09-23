@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -39,6 +39,10 @@ from ..tools.registry import ToolRegistry
 # 金额护栏询问器：收到超限原因，返回临时追加的金额（元）；None 或 <= 0 = 停下交给人。
 BudgetAsker = Callable[[str], Awaitable[float | None]]
 
+# finish_reason 的两类：被截断 / 被内容安全过滤（各家叫法不一）
+_TRUNCATED = {"length", "max_tokens"}
+_FILTERED = {"content_filter", "content-filter", "sensitive", "safety", "blocked"}
+
 _EXTRA_REVIEW = (
     "[工具执行失败] 一次迭代里只能提一次人审，本次已有一条在等人决定；"
     "这条请求被忽略，等上一条决策回来后再提。"
@@ -52,6 +56,9 @@ class StopReason(StrEnum):
     BUDGET_EXCEEDED = "budget_exceeded"
     INTERRUPTED = "interrupted"
     ERROR = "error"
+    # 模型服务商的内容安全过滤拦下了这次回复（finish_reason=content_filter）。
+    # 之前当成正常完成，空回复就那么过去了（2026-09-23 审查）
+    CONTENT_FILTER = "content_filter"
 
 
 @dataclass
@@ -64,6 +71,9 @@ class LoopResult:
     # 停机是 error 时的类别（connection / timeout / quota / context_overflow / other）。
     # 网络类的可以在**同一轮**里接着跑（continue_turn），本轮做过的活不用重来。
     error_kind: str = ""
+    # 本轮失败的工具调用（「工具名：原因」）。CLI 直接列给人看 —— 不管模型最后怎么说，
+    # 人都能看到哪几步没成（真实日志里有工具报错后模型仍说「已完成」的）
+    tool_failures: list[str] = field(default_factory=list)
 
     @property
     def resumable(self) -> bool:
@@ -113,6 +123,8 @@ class LoopRuntime:
         # 金额护栏的询问器与停机提示（CLI 接终端，Web 接人审台）
         self.budget_asker = budget_asker
         self.budget_hint = budget_hint
+        # 本轮（含人审前后、续跑）失败的工具调用，给 LoopResult.tool_failures
+        self._failures: list[str] = []
 
     def _repair_interrupted_calls(self) -> int:
         """补全没有 tool 响应的 tool_calls。Ctrl+C 可能打断在「assistant 已回填、
@@ -251,6 +263,21 @@ class LoopRuntime:
             if resp is None:
                 return err, StopReason.ERROR, cost, i
             cost += resp.usage.cost or 0.0
+            finish = (resp.finish_reason or "").strip().lower()
+
+            # ---- 停机判定 0：被内容安全过滤拦下 ----
+            # 在回填之前判：带着工具调用的半截回复不能进历史（没有工具结果就 400）
+            if finish in _FILTERED:
+                if resp.text:
+                    turn.messages.append({"role": "assistant", "content": resp.text})
+                await self.bus.emit(
+                    EventType.LOOP_STOP_REASON, reason="content_filter", detail=finish
+                )
+                text = (resp.text + "\n\n" if resp.text else "") + (
+                    "（这次回复被模型服务商的内容安全过滤拦下了。换个说法，"
+                    "或者把涉及的内容调整后再试 —— 原样重发多半还会被拦）"
+                )
+                return text, StopReason.CONTENT_FILTER, cost, i
 
             # 助手消息回填（含工具调用）
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": resp.text or None}
@@ -267,7 +294,10 @@ class LoopRuntime:
 
             # ---- 停机判定 1：没有工具调用 = 本轮完成 ----
             if not resp.wants_tools:
-                return resp.text, StopReason.NO_TOOL_CALLS, cost, i
+                text = resp.text
+                if finish in _TRUNCATED:
+                    text = (text or "") + "\n\n（回复到这里被截断了：超过模型单次输出上限）"
+                return text, StopReason.NO_TOOL_CALLS, cost, i
 
             # ---- 执行工具（权限串行、执行并发）----
             results = await self.dispatcher.run(resp.tool_calls)
@@ -285,12 +315,19 @@ class LoopRuntime:
                         {"role": "tool", "tool_call_id": call.id, "content": _EXTRA_REVIEW}
                     )
                     continue
+                content = result.to_message_content()
+                if not result.ok:
+                    self._failures.append(f"{call.name}：{(result.error or '')[:120]}")
+                    if finish in _TRUNCATED and "不是合法 JSON" in (result.error or ""):
+                        # 输出被截断 → 工具参数只写了一半。告诉模型真正的原因和出路，
+                        # 否则它会原样重试到撞迭代上限（2026-09-23 审查）
+                        content += (
+                            "\n原因：这次输出超过了模型单次输出上限，参数被截断了。长内容别塞进"
+                            "工具参数 —— 用 fs_write 分几块写到本地文件（第二块起 mode=append）"
+                            "再 fs_import，或者传已经存好的资产 id"
+                        )
                 turn.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": result.to_message_content(),
-                    }
+                    {"role": "tool", "tool_call_id": call.id, "content": content}
                 )
 
             # ---- 停机判定 1.5：模型主动请求人审 ----
@@ -370,6 +407,7 @@ class LoopRuntime:
         turn = self.memory.new_turn()
         turn.messages.append({"role": "user", "content": user_input})
         self.assembler.shrink = False  # 应急压缩只管一轮
+        self._failures = []
 
         await self.bus.emit(
             EventType.LOOP_START, turn=turn.index, role=self.role, input_preview=user_input[:200]
@@ -384,7 +422,8 @@ class LoopRuntime:
                 EventType.LOOP_END, turn=turn.index, iterations=i, stop_reason=stop.value
             )
             return LoopResult(
-                text=final_text, turn=turn, iterations=i, stop_reason=stop, cost=turn_cost or None
+                text=final_text, turn=turn, iterations=i, stop_reason=stop, cost=turn_cost or None,
+                tool_failures=list(self._failures),
             )
 
         # ---- 批量驱逐（涨到 evict_at 才一次性剔回 window_turns）----
@@ -417,6 +456,7 @@ class LoopRuntime:
             stop_reason=stop,
             cost=turn_cost or None,
             error_kind=self.last_error_kind,
+            tool_failures=list(self._failures),
         )
 
     def _over_budget(self, turn_cost: float) -> tuple[str, bool]:
@@ -548,4 +588,5 @@ class LoopRuntime:
             stop_reason=stop,
             cost=cost or None,
             error_kind=self.last_error_kind,
+            tool_failures=list(self._failures),
         )

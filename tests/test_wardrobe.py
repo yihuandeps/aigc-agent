@@ -29,6 +29,9 @@ from aigc_agent.domain.media.naming import library_reference_names
 from aigc_agent.harness.model.gateway import ModelResponse, Usage
 from aigc_agent.harness.tools.provider import ToolResult
 
+# 拆解类工具不收几个字的空壳（2026-09-23 缺口 F），测试要给一段像样的剧本
+SCRIPT = "场景一 内景 守门人小屋 夜\n" + "陆离擦着灯罩，门外有人敲了三下。他没抬头。\n" * 12
+
 LIB = {
     "characters": [
         {
@@ -217,7 +220,7 @@ async def test_drama_assets输出分配表与缺口(monkeypatch):
     store = AssetStore()
     gw = _Gw(json.dumps(LIB, ensure_ascii=False))
     fns = DramaFunctions(gw, store)
-    r = await fns._fn_drama_assets("剧本…", ethnicity="chinese", language="zh")
+    r = await fns._fn_drama_assets(SCRIPT, ethnicity="chinese", language="zh")
     assert r.ok, r.error
     assert "陆离：2 套服装" in r.content and "← 疾控中心实验室" in r.content
     assert "1 套服装没标场景/集数（老鬼-劳保服-[1]）" in r.content

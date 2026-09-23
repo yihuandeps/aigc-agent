@@ -1,6 +1,7 @@
 """按集流水并行管线（EpisodePipeline）验收。
 
-- 剧本满 5 集才派分镜；最后一批不满 5 也派
+- 每一集的剧本一到就单独拆这一集的分镜（传 script_id；2026-09-23 前是 5 集并成一次，
+  必然超出模型单次输出上限被截断）
 - 全剧剧本齐 → 资产库 → 参考图 顺序派发（各一次，跨集复用）
 - 参考图就绪 → 逐集提示词 → 逐集渲染（第N集）
 - enabled=False 一个都不派；on_enable() 扫存量补派
@@ -46,8 +47,11 @@ class FakeRegistry:
     async def invoke(self, name, args):
         self.calls.append((name, args))
         if name == "drama_storyboard":
-            # 从剧本原文认集号，产出覆盖这些集的分镜资产（真工具的资产格式）
-            eps = sorted({int(m) for m in re.findall(r"第(\d+)集", args["script"])})
+            # 从剧本资产认集号，产出覆盖这些集的分镜资产（真工具的资产格式）
+            script = self.store.content(args["script_id"]) if args.get("script_id") else (
+                args["script"]
+            )
+            eps = sorted({int(m) for m in re.findall(r"第(\d+)集", script)})
             content = json.dumps(
                 [
                     {
@@ -156,35 +160,23 @@ async def _settle(pipe: EpisodePipeline, seconds: float = 5.0) -> None:
 # ---------------------------------------------------------------- 批次分镜
 
 
-async def test_满5集才派分镜_末批不满也派(tmp_path):
+async def test_每集剧本一到就单独拆这一集的分镜(tmp_path):
     store, bus = AssetStore(), EventBus()
     fake = FakeRegistry(store)
     pipe = _build(store, bus, fake, tmp_path, total=12)
     try:
-        for n in range(1, 5):
+        for n in range(1, 4):
             await _episode(store, n)
         await _settle(pipe)
-        assert fake.count("drama_storyboard") == 0  # 4 集不派
+        calls = fake.args_of("drama_storyboard")
+        assert len(calls) == 3, "一集一次，不再等凑满 5 集"
+        assert all("script_id" in a and "script" not in a for a in calls), "传资产 id 不塞全文"
+        got = sorted(int(store.get(a["script_id"]).gen_params["episode"]) for a in calls)
+        assert got == [1, 2, 3]
 
-        await _episode(store, 5)
+        await _episode(store, 4)
         await _settle(pipe)
-        assert fake.count("drama_storyboard") == 1  # 第 1-5 集一批
-        script = fake.args_of("drama_storyboard")[0]["script"]
-        assert "第1集" in script and "第5集" in script
-
-        for n in range(6, 10):
-            await _episode(store, n)
-        await _settle(pipe)
-        assert fake.count("drama_storyboard") == 1  # 第二批还差一集
-
-        await _episode(store, 10)
-        await _settle(pipe)
-        assert fake.count("drama_storyboard") == 2
-
-        await _episode(store, 11)
-        await _episode(store, 12)
-        await _settle(pipe)
-        assert fake.count("drama_storyboard") == 3  # 末批只有 2 集也派
+        assert fake.count("drama_storyboard") == 4
     finally:
         await pipe.aclose()
 
@@ -201,8 +193,9 @@ async def test_全剧齐后资产库参考图提示词渲染逐级接续(tmp_pat
             await _episode(store, n)
         await _settle(pipe)
 
-        assert fake.count("drama_storyboard") == 1  # 不满 5 的唯一一批
+        assert fake.count("drama_storyboard") == 3  # 一集一次
         assert fake.count("drama_assets") == 1
+        assert len(fake.args_of("drama_assets")[0]["script_ids"]) == 3  # 全剧按集号传 id
         assert fake.count("drama_render_assets") == 1
         # 逐集提示词，episode 参数正确
         assert {a["episode"] for a in fake.args_of("drama_shots")} == {1, 2, 3}
@@ -231,7 +224,7 @@ async def test_关闭时不派发_on后扫存量补派(tmp_path):
         pipe.enabled = True
         pipe.on_enable()
         await _settle(pipe)
-        assert fake.count("drama_storyboard") == 1
+        assert fake.count("drama_storyboard") == 3
         assert fake.count("drama_render_shots") == 3
     finally:
         await pipe.aclose()
@@ -251,7 +244,7 @@ async def test_预算超支暂停渲染_清零后续派(tmp_path):
         await _settle(pipe)
 
         # 文本环节（分镜/资产库/提示词）不受预算闸影响，花钱的渲染类被刹住
-        assert fake.count("drama_storyboard") == 1
+        assert fake.count("drama_storyboard") == 3
         assert fake.count("drama_assets") == 1
         assert fake.count("drama_render_assets") == 0
         assert fake.count("drama_shots") == 3

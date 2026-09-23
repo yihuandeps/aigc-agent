@@ -39,6 +39,49 @@ _TYPE_BY_KIND = {
 DEFAULT_LIST_LIMIT = 30
 
 
+READ_PAGE = 12_000  # read_asset / 参考文档一页多少字
+
+# 短内容里出现这些字样，说明模型没写正文、只写了个指代（抄回来的「省略」「同上」）
+STUB_HINTS = ("此处省略", "（略）", "(略)", "……省略", "...省略", "同上", "见上文", "见前文",
+              "内容同前", "全文略")
+
+
+def _stub_problem(content: str) -> str:
+    """存稿内容是不是空壳（占位字样 + 很短）。是就返回拒收原因。
+
+    折叠占位符「<N 字已折叠>」在参数层和资产库两道都拦了；这里补它的变体 ——
+    模型换个说法（「此处省略…」「同上」）照样能把一份空壳存成「第 3 集剧本」
+    （2026-09-23 审查）。只拦**短**内容，正文里偶尔出现这几个字不误伤。
+    """
+    s = (content or "").strip()
+    if len(s) < 300 and any(h in s for h in STUB_HINTS):
+        return (
+            f"内容只有 {len(s)} 个字，还写着「省略 / 同上」之类的指代 —— 这不是正文，没有保存。"
+            "把完整内容写出来；太长就 fs_write 分块写本地文件再 fs_import；"
+            "要沿用已存的内容就传它的资产 id，别存一份空壳"
+        )
+    return ""
+
+
+def page_of(text: str, offset: int, call_head: str) -> str:
+    """取一页，并在结尾说清楚还剩多少、下一页怎么读。call_head 形如 read_asset(asset_id="x"。"""
+    total = len(text)
+    start = max(0, min(int(offset or 0), total))
+    end = min(total, start + READ_PAGE)
+    body = text[start:end]
+    if start == 0 and end >= total:
+        return body
+    if start >= total:
+        return f"[offset={offset} 已经超过末尾：共 {total:,} 字，前面都读过了]"
+    head = f"[第 {start + 1:,}–{end:,} 字 / 共 {total:,} 字]\n"
+    tail = (
+        f"\n\n[还有 {total - end:,} 字没读：{call_head}, offset={end}) 继续]"
+        if end < total
+        else "\n\n[读完了]"
+    )
+    return head + body + tail
+
+
 class ContentFunctions:
     """内容领域的 ToolProvider。
 
@@ -94,14 +137,25 @@ class ContentFunctions:
 
         self._add(
             "read_asset",
-            "按 id 读回一份资产的完整内容",
+            "按 id 读回一份资产的内容（长的分页读：offset 往后翻）",
             PermissionLevel.READ,
             {
                 "type": "object",
-                "properties": {"asset_id": {"type": "string"}},
+                "properties": {
+                    "asset_id": {"type": "string"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "从第几个字开始读，默认 0；上一页结尾会写下一页的 offset",
+                    },
+                },
                 "required": ["asset_id"],
             },
-            description="上下文里只有资产的 id 和摘要，需要全文时用这个取回。",
+            description=(
+                "上下文里只有资产的 id 和摘要，需要全文时用这个取回。一次最多 "
+                f"{READ_PAGE:,} 字；更长的（整集分镜、资产库、多集剧本）结尾会写「还有 N 字，"
+                "offset=… 继续」—— **要改写长资产就先读全**，只读到一半就改写会把后半截丢掉。"
+            ),
+            max_result_chars=READ_PAGE + 400,
         )
 
         self._add(
@@ -254,6 +308,9 @@ class ContentFunctions:
         episode: int = 0,
     ) -> ToolResult:
         gen_params: dict[str, Any] = {"episode": episode} if episode else {}
+        stub = _stub_problem(content)
+        if stub:
+            return ToolResult(ok=False, error=stub)
         if parent_id:
             asset = self.store.revise(parent_id, content, summary=summary, creator="model")
             if gen_params:
@@ -272,8 +329,14 @@ class ContentFunctions:
             asset_ref=asset.id,
         )
 
-    async def _fn_read_asset(self, asset_id: str) -> ToolResult:
-        return ToolResult(content=self.store.content(asset_id), asset_ref=asset_id)
+    async def _fn_read_asset(self, asset_id: str, offset: int = 0) -> ToolResult:
+        """分页读。2026-09-23 审查：之前不分页、被调度器截到 4000 字，截断提示还指回同一个
+        工具 —— 超过 4000 字的资产模型永远读不全，改写后存回去，后半截就静默丢了。"""
+        text = self.store.content(asset_id)
+        return ToolResult(
+            content=page_of(text, offset, f'read_asset(asset_id="{asset_id}"'),
+            asset_ref=asset_id,
+        )
 
     async def _fn_list_assets(
         self,

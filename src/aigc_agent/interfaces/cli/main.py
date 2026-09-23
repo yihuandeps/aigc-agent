@@ -21,8 +21,10 @@ for _stream in (sys.stdout, sys.stderr):
 
 import typer  # noqa: E402
 from rich.console import Console  # noqa: E402
+from rich.markup import escape  # noqa: E402
 from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
+from rich.text import Text  # noqa: E402
 
 from ...app import PROJECT_ROOT, Agent, load_dotenv  # noqa: E402
 from ...domain.lines import get_line, is_off, parse_line  # noqa: E402
@@ -97,11 +99,11 @@ def make_renderer(verbose: bool):
                 f"{_brief(d.get('preview'))}{mark}"
             )
         elif ev.type is EventType.TOOL_ERROR:
-            console.print(f"  [red]✗ {d['tool']}[/] {d.get('error')}")
+            console.print(f"  [red]✗ {escape(str(d['tool']))}[/] {escape(str(d.get('error')))}")
         elif ev.type is EventType.MODEL_RETRY:
             console.print(
                 f"  [yellow]↻ 重试 {d['attempt']}/{d['max_attempts']}"
-                f"（{d['delay_s']}s 后）[/] [dim]{d.get('error')}[/]"
+                f"（{d['delay_s']}s 后）[/] [dim]{escape(str(d.get('error')))}[/]"
             )
         elif ev.type is EventType.WINDOW_EVICT:
             why = "上下文超预算，预检提前剔" if d.get("reason") == "token_budget" else "批量驱逐"
@@ -116,9 +118,9 @@ def make_renderer(verbose: bool):
                 f"约 {d.get('tokens', 0):,} token[/]"
             )
         elif ev.type is EventType.WARNING:
-            console.print(f"  [yellow]⚠ {d.get('message')}[/]")
+            console.print(f"  [yellow]⚠ {escape(str(d.get('message')))}[/]")
         elif ev.type is EventType.SKILL_RELOAD:
-            console.print(f"  [magenta]↻ {d.get('message')}[/]")
+            console.print(f"  [magenta]↻ {escape(str(d.get('message')))}[/]")
         elif ev.type is EventType.COMPLIANCE_CHECKED:
             mark = "[green]通过[/]" if d.get("passed") else f"[red]block {d.get('block')}[/]"
             console.print(f"  [cyan]⚖ 机审 {d.get('asset')}[/] {mark} · warn {d.get('warn')}")
@@ -143,13 +145,16 @@ def make_renderer(verbose: bool):
             )
         elif ev.type is EventType.BUDGET_EXCEEDED:
             console.print(
-                f"  [red]¥ 预算护栏：{d.get('tool')}[/] {d.get('reason')} "
-                f"[dim]（{d.get('usage')}）[/]"
+                f"  [red]¥ 预算护栏：{escape(str(d.get('tool')))}[/] "
+                f"{escape(str(d.get('reason')))} [dim]（{escape(str(d.get('usage')))}）[/]"
             )
         elif ev.type is EventType.PERMISSION_DENY:
-            console.print(f"  [red]⛔ {d.get('tool')} 被拒绝[/] [dim]{d.get('reason', '')}[/]")
+            console.print(
+                f"  [red]⛔ {escape(str(d.get('tool')))} 被拒绝[/] "
+                f"[dim]{escape(str(d.get('reason', '')))}[/]"
+            )
         elif ev.type is EventType.LOOP_STOP_REASON:
-            detail = f" — {d['detail']}" if d.get("detail") else ""
+            detail = f" — {escape(str(d['detail']))}" if d.get("detail") else ""
             console.print(f"  [yellow]■ 停机：{d.get('reason')}{detail}[/]")
         elif ev.type is EventType.CHECKPOINT_REACHED:
             console.print(
@@ -170,10 +175,12 @@ def make_renderer(verbose: bool):
 
 
 def _brief(value: Any, limit: int = 90) -> str:
+    """一行摘要，**已转义**可以直接拼进 rich 标记（工具参数 / 报错里的方括号会被当成
+    标记解析，[/] 这类直接抛 MarkupError 把整个 chat 带崩 —— 2026-09-23 审查）。"""
     if value in (None, "", {}, []):
         return ""
     s = str(value).replace("\n", " ")
-    return s if len(s) <= limit else s[:limit] + "…"
+    return escape(s if len(s) <= limit else s[:limit] + "…")
 
 
 def _line_label(agent: Any) -> str:
@@ -202,6 +209,41 @@ async def _ask_permission(meta: ToolMeta, args: dict[str, Any], hub: InputHub) -
     )
     answer = await hub.ask("执行吗？(y/N) ")
     return answer.strip().lower() in {"y", "yes"}
+
+
+def _candidate_view(agent: Agent, asset: Any) -> tuple[str, Path | None]:
+    """人审面板里一个候选怎么显示：文本给开头 + 字数 + 全文在哪；图片/视频给本地路径和链接。
+
+    之前一律打印 content[:1500] —— 图片/视频的 content 是空的，人看到一个空框
+    （2026-09-23 审查）。
+    """
+    from ...domain.assets.store import local_copy
+
+    local = local_copy(asset)
+    kind = asset.type.value
+    if kind in ("image", "video", "audio"):
+        where = str(local) if local is not None else "（没有本地副本）"
+        return f"{kind} · {asset.summary}\n本地文件：{where}\n链接：{asset.uri or '—'}", local
+    body = agent.assets.content(asset.id)
+    if len(body) > 1500:
+        body = body[:1500] + (
+            f"\n……（共 {len(body)} 字；全文在产物目录 texts/ 里，或让我 read_asset）"
+        )
+    return body or "（空）", None
+
+
+def _open_file(p: Path) -> None:
+    """用系统默认程序打开（看图/看视频）。打不开就把路径打出来。"""
+    import os
+    import subprocess
+
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(str(p))  # noqa: S606 — 打开的是资产库登记过的本地产物
+        else:
+            subprocess.Popen(["xdg-open", str(p)])  # noqa: S603, S607
+    except OSError:
+        console.print(f"[dim]打不开，文件在：{escape(str(p))}[/]")
 
 
 async def _confirm_budget(agent: Agent, hub: InputHub) -> None:
@@ -270,9 +312,18 @@ def _parse_decision(raw: str) -> tuple[str, str] | None:
 
 def _print_result(result: LoopResult) -> None:
     console.print()
-    console.print(Panel(result.text or "[dim]（无文本输出）[/]", border_style="green"))
+    # 模型回复原样显示，不当 rich 标记解析（回复里的 [/] [/budget allow 50] 之类会让
+    # rich 抛 MarkupError，整个 chat 直接退出 —— 2026-09-23 审查）
+    body = Text(result.text) if result.text else Text("（无文本输出）", style="dim")
+    console.print(Panel(body, border_style="green"))
     cost = f" · ¥{result.cost:.4f}" if result.cost else ""
     console.print(f"[dim]{result.iterations} 次迭代 · {result.stop_reason.value}{cost}[/]")
+    fails = getattr(result, "tool_failures", None) or []
+    if fails:
+        # 不管模型最后怎么说，失败的步骤都列出来给人看
+        shown = "\n".join(f"  ✗ {escape(f)}" for f in fails[:8])
+        more = f"\n  …另有 {len(fails) - 8} 次" if len(fails) > 8 else ""
+        console.print(f"[yellow]本轮有 {len(fails)} 次工具调用失败：[/]\n{shown}{more}")
 
 
 async def _decide_review(agent: Agent, board: ProgressBoard, hub: InputHub) -> LoopResult | None:
@@ -291,30 +342,45 @@ async def _decide_review(agent: Agent, board: ProgressBoard, hub: InputHub) -> L
     console.print()
     console.print(
         Panel(
-            f"[bold]{pending.get('question', '')}[/]",
-            title=f"[yellow]人审 · {stage}[/]",
+            Text(str(pending.get("question", "")), style="bold"),
+            title=f"[yellow]人审 · {escape(str(stage))}[/]",
             border_style="yellow",
         )
     )
+    openable: list[Path] = []
     for aid in pending.get("assets", []):
         try:
             asset = agent.assets.get(aid)
         except KeyError:
-            console.print(f"  [red]候选 {aid} 已不存在[/]")
+            console.print(f"  [red]候选 {escape(str(aid))} 已不存在[/]")
             continue
-        console.print(
-            Panel(agent.assets.content(aid)[:1500], title=asset.brief(), border_style="blue")
-        )
+        body, local = _candidate_view(agent, asset)
+        if local is not None:
+            openable.append(local)
+        console.print(Panel(Text(body), title=escape(asset.brief()), border_style="blue"))
     console.print(
         "[bold]决策[/]  [green]a[/]=采纳（可带补充：a 控制在60集）  "
         "[yellow]r[/]=打回重写  [red]j[/]=方向不对退回  [dim]理由可直接跟在后面[/]"
+        + ("  [cyan]o[/]=打开候选文件" if openable else "")
+        + "  [dim]/stop 先不定[/]"
     )
     async def _resume(decision: str, reason: str = "", decided_by: str = "human") -> LoopResult:
         with board.running():
             return await agent.loop.resume_turn(decision, reason=reason, decided_by=decided_by)
 
     while True:
-        raw = await hub.ask("> ")
+        try:
+            raw = await hub.ask("> ")
+        except EOFError:
+            return None  # Ctrl+D：先不定，挂起的人审留着，下一条输入会再问
+        low = raw.strip().lower()
+        if low in {"o", "open", "打开"} and openable:
+            for p in openable:
+                _open_file(p)
+            continue
+        if low in {"/stop", "/pause", "/停", "/exit", "/quit"}:
+            console.print("[dim]先不定：这条人审挂着，下一条输入会先问它[/]")
+            return None
         if raw.strip().lower() in {"/auto on", "/auto 开"}:
             # 在决策口开 /auto：后续小节点人审不再逐条问
             agent.loop.auto_review = True
@@ -340,6 +406,11 @@ async def _decide_review(agent: Agent, board: ProgressBoard, hub: InputHub) -> L
         decision, reason = parsed
         while decision != "adopt" and not reason:
             reason = (await hub.ask("[yellow]打回理由（必填）[/] ")).strip()
+            if reason.startswith("/"):
+                # 「/stop」之类是命令不是理由（之前 Ctrl+C 产生的 /stop 被当打回理由存进了记忆）
+                console.print("[red]这是命令不是理由；请写一句为什么打回。[/]")
+                reason = ""
+                continue
             if not reason:
                 console.print("[red]理由不能为空。不记原因的话下一版会犯一模一样的错。[/]")
         return await _watched(hub, _resume(decision, reason=reason))

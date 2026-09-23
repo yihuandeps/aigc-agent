@@ -1,8 +1,12 @@
 """按集流水并行管线（EpisodePipeline）—— /auto 批量出稿的引擎。
 
 剧本按集落资产（save_draft episode=N），ASSET_CREATED 事件驱动本管线：
-某批集数凑齐就后台派分镜；全剧齐就拆资产库、渲参考图；之后逐集出
+某一集的剧本一落库就后台拆这一集的分镜；全剧齐就拆资产库、渲参考图；之后逐集出
 视频提示词、逐集渲染出「第N集.mp4」。环节间不排队等齐，谁先就绪谁先跑。
+
+2026-09-23 审查后分镜改成**逐集拆**（传这一集的 script_id）：之前 5 集并成一次调用，
+一集 80–120 个镜头行，5 集必然超出模型单次输出上限被截断 → 解析失败 → 这一批标失败
+永不重派，流水线就卡在那里。
 
 设计要点：
 
@@ -72,6 +76,9 @@ class EpisodePipeline:
         # 管线层再不压，N 集并行渲染会把远端接口打爆。
         self._text_sem = asyncio.Semaphore(max_parallel_text)
         self._render_sem = asyncio.Semaphore(max_parallel_renders)
+        # 分镜资产 id → 它覆盖的集号。资产不可变，解析一次就够 —— 之前每条资产事件都把
+        # 全库的分镜 JSON 重新解析一遍
+        self._sb_eps: dict[str, list[int]] = {}
 
     # ---------- 生命周期 ----------
 
@@ -127,15 +134,15 @@ class EpisodePipeline:
         ethnicity, language, total = state
         view = self._scan()
 
-        # ① 批次分镜：批内集数凑齐就派（最后一批可以不满）
-        for batch, members in self._batches(view["scripts"], total).items():
-            key = f"storyboard:{batch}"
-            if self._skip(key) or batch in view["storyboards"]:
+        # ① 分镜：每一集的剧本一到就单独拆这一集
+        for ep, script_id in sorted(view["scripts"].items()):
+            if total and ep > total:
+                continue
+            key = f"storyboard:{ep}"
+            if self._skip(key) or ep in view["storyboards"]:
                 continue
             self._spawn(
-                key,
-                self._storyboard(batch, members, view["scripts"], ethnicity, language),
-                self._text_sem,
+                key, self._storyboard(ep, script_id, ethnicity, language), self._text_sem
             )
 
         # ② 全剧剧本齐 → 拆资产库 → 渲参考图（各一次，跨集复用）
@@ -155,19 +162,14 @@ class EpisodePipeline:
             ):
                 self._spawn("refs", self._refs(view["assets_lib"]), self._render_sem)
 
-        # ③ 各集视频提示词：需要本批分镜 + 资产库（提示词要绑定资产 ID）。
+        # ③ 各集视频提示词：需要这一集的分镜 + 资产库（提示词要绑定资产 ID）。
         # 参考图是渲染的前置，不是提示词的 —— 不等它，提示词与渲图并行跑。
         if view["assets_lib"]:
-            for batch, sb_id in view["storyboards"].items():
-                for ep in self._batch_members(batch, total):
-                    key = f"shots:{ep}"
-                    if self._skip(key) or ep in view["shots"]:
-                        continue
-                    self._spawn(
-                        key,
-                        self._shots(ep, sb_id, view["assets_lib"]),
-                        self._text_sem,
-                    )
+            for ep, sb_id in sorted(view["storyboards"].items()):
+                key = f"shots:{ep}"
+                if self._skip(key) or ep in view["shots"]:
+                    continue
+                self._spawn(key, self._shots(ep, sb_id, view["assets_lib"]), self._text_sem)
 
         # ④ 各集渲染：提示词 + 参考图都齐才派，预算超支就刹住（预算恢复后自动解除）
         if not view["refs"]:
@@ -251,12 +253,10 @@ class EpisodePipeline:
             if a.type is AssetType.SCRIPT and ep:
                 _keep_latest(scripts, int(ep), a)
             elif a.creator == "tool:drama_storyboard":
-                eps, err = parse_episodes(self.assets.content(a.id))
-                if not err:
-                    # 一资多批：模型手动跑的全剧分镜覆盖所有批次，
-                    # 管线认出后不会重复拆（drama_shots 内部按集过滤，兼容整本资产）
-                    for e in eps:
-                        _keep_latest(storyboards, (e.index - 1) // self.batch_size, a)
+                # 一份分镜可能覆盖多集（模型手动跑的全剧分镜）：按集登记，
+                # drama_shots 内部按集过滤，兼容整本资产
+                for e in self._storyboard_eps(a.id):
+                    _keep_latest(storyboards, e, a)
             elif a.creator == "tool:drama_assets":
                 if a.seq > assets_lib[0]:
                     assets_lib = (a.seq, a.id)
@@ -278,6 +278,19 @@ class EpisodePipeline:
             "shots": {k: v[1] for k, v in shots.items()},
             "rendered": {k: v[1] for k, v in rendered.items()},
         }
+
+    def _storyboard_eps(self, asset_id: str) -> list[int]:
+        """这份分镜覆盖哪几集（缓存）。"""
+        cached = self._sb_eps.get(asset_id)
+        if cached is not None:
+            return cached
+        try:
+            eps, err = parse_episodes(self.assets.content(asset_id))
+        except KeyError:
+            eps, err = [], "gone"
+        found = [] if err else [int(e.index) for e in eps]
+        self._sb_eps[asset_id] = found
+        return found
 
     def _batches(self, scripts: dict[int, str], total: int) -> dict[int, list[int]]:
         """该派分镜的完整批次。批次按集号划 (N-1)//size，不按到达顺序。"""
@@ -343,33 +356,26 @@ class EpisodePipeline:
         t.add_done_callback(self._tasks.discard)
 
     async def _storyboard(
-        self,
-        batch: int,
-        members: list[int],
-        scripts: dict[int, str],
-        ethnicity: str,
-        language: str,
+        self, ep: int, script_id: str, ethnicity: str, language: str
     ) -> None:
-        lo, hi = members[0], members[-1]
-        self._say(f"⚙ 第 {lo}-{hi} 集剧本齐了，开始拆这批分镜…")
-        script = "\n\n".join(self.assets.content(scripts[ep]) for ep in members)
+        self._say(f"⚙ 第 {ep} 集剧本到了，开始拆这一集的分镜…")
         r = await self.registry.invoke(
             "drama_storyboard",
-            {"script": script, "ethnicity": ethnicity, "language": language},
+            {"script_id": script_id, "ethnicity": ethnicity, "language": language},
         )
         if not r.ok:
-            self._fail(f"storyboard:{batch}", f"第 {lo}-{hi} 集分镜失败：{r.error}")
+            self._fail(f"storyboard:{ep}", f"第 {ep} 集分镜失败：{r.error}")
             return
-        self._say(f"✓ 第 {lo}-{hi} 集分镜完成")
+        self._say(f"✓ 第 {ep} 集分镜完成")
 
     async def _assets_lib(
         self, scripts: dict[int, str], total: int, ethnicity: str, language: str
     ) -> None:
         self._say("⚙ 全剧剧本齐了，开始拆资产库（角色/服装/场景/道具）…")
-        script = "\n\n".join(self.assets.content(scripts[ep]) for ep in range(1, total + 1))
+        ids = [scripts[ep] for ep in range(1, total + 1)]
         r = await self.registry.invoke(
             "drama_assets",
-            {"script": script, "ethnicity": ethnicity, "language": language},
+            {"script_ids": ids, "ethnicity": ethnicity, "language": language},
         )
         if not r.ok:
             self._fail("assets", f"资产库拆解失败：{r.error}")

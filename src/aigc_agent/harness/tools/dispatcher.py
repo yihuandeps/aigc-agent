@@ -133,7 +133,8 @@ class ToolDispatcher:
             result.content = (
                 result.content[:max_chars]
                 + f"\n\n[结果已截断：共 {total} 字，只显示前 {max_chars} 字。"
-                "列表类结果请加过滤条件或分页再查]"
+                "工具支持 offset / 分页参数就翻页读，列表类结果加过滤条件再查 —— "
+                "**没读全之前不要据此改写或下结论**]"
             )
             result.truncated = True
 

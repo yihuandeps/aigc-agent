@@ -329,6 +329,13 @@ class SubAgentRunner:
             )
         if stop is StopReason.BUDGET_EXCEEDED:
             return base.model_copy(update={"ok": False, "error": "预算护栏触发：" + text})
+        # 没做完 / 被拦下的不算产出（之前照样 ok=True，半截结果被当成成品往下传）
+        if stop is StopReason.CONTENT_FILTER:
+            return base.model_copy(update={"ok": False, "error": "被模型服务商的内容安全过滤拦下"})
+        if stop is StopReason.MAX_ITERATIONS:
+            return base.model_copy(
+                update={"ok": False, "error": f"子代理跑满 {iterations} 轮还没做完"}
+            )
         if not defn.output_schema:
             return base.model_copy(update={"data": text})
         data = parse_json(text)

@@ -241,6 +241,12 @@ class AssetStore:
 
     def revise(self, base_id: str, content: str, summary: str = "", creator: str = "") -> Asset:
         """产出新版本，保留血缘。打回重做走这条路，不是覆盖原资产。"""
+        # 同 create：折叠占位符不许落库（之前 revise 这条路没拦，2026-09-23 审查）
+        if is_only_fold_mark(content):
+            raise ValueError(
+                f"内容只是上下文折叠留下的占位符（{content.strip()[:30]}），不是真正的正文，"
+                "不存。把完整内容重新写出来；太长就 fs_write 分块写本地文件再 fs_import。"
+            )
         base = self.get(base_id)
         return self.put(
             Asset(
