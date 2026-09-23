@@ -1041,8 +1041,22 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                 elif arg in {"off", "关"}:
                     agent.loop.auto_review = False
                     agent.pipeline.enabled = False  # 在跑的跑完，不再派新任务
+                elif arg in {"retry", "重试"}:
+                    # 失败的环节之前只在重启后才会重派（2026-09-23 审查）
+                    keys = agent.pipeline.retry()
+                    if not keys:
+                        console.print("[dim]流水线没有失败的环节[/]")
+                    else:
+                        names = escape("、".join(keys))
+                        off = "" if agent.pipeline.enabled else "（/auto 没开，开了才派）"
+                        console.print(
+                            f"[green]重派 {len(keys)} 个失败的环节[/]：{names}  [yellow]{off}[/]"
+                        )
+                    continue
                 elif arg:
-                    console.print("[yellow]用法：/auto on 开 · /auto off 关[/]")
+                    console.print(
+                        "[yellow]用法：/auto on 开 · /auto off 关 · /auto retry 重派失败的环节[/]"
+                    )
                     continue
                 if not agent.loop.auto_review:
                     console.print("[dim]自动模式已关：每条人审都会停下来问你，流水线暂停派发。[/]")
@@ -1051,8 +1065,8 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                     "[green]自动模式已开[/]：小节点人审自动采纳不再逐条问你，"
                     "每条决策都会打印出来；大节点（剧本/视频生成/图片生成）"
                     "仍会停下来等你拍板一次。\n"
-                    "[dim]按集流水已开：剧本每满 5 集自动接续分镜/提示词/渲染"
-                    "（渲染仍受预算闸约束）。\n"
+                    "[dim]按集流水已开：每落一集剧本就拆这一集的分镜；全剧齐后拆资产库、"
+                    "渲参考图，再逐集出提示词、渲染（渲染仍受预算闸约束）。\n"
                     "随时 Ctrl+C 打断，/auto off 回到逐条确认。"
                     "注意：L-external 不可逆操作与预算超限也仍会问你。[/]"
                 )
@@ -1071,7 +1085,14 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                         return await agent.loop.continue_turn(turn)
 
                 try:
-                    if agent.loop.pending_review is not None:
+                    pending = agent.loop.pending_review
+                    if pending is not None and agent.loop._is_major_review(pending):  # noqa: SLF001
+                        # 大节点（换模型、剧本、视频生成）开了 /auto 也要人定 —— 之前这里一律按采纳
+                        # 结案，挂着的「换视频模型」就这么被换了（2026-09-23 审查）
+                        console.print(
+                            "[yellow]挂着的人审是大节点，仍需你来定：发任意一句话会先问它[/]"
+                        )
+                    elif pending is not None:
                         console.print("[dim]↻ 有挂起的人审，按采纳结案继续跑[/]")
                         resumed = await _watched(hub, _auto_resume())
                     elif (

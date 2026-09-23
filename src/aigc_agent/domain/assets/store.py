@@ -255,6 +255,7 @@ class AssetStore:
                 id=asset.id, type=asset.type.value, summary=asset.summary,
                 gen_params=dict(asset.gen_params), parent_ids=list(asset.parent_ids),
                 seq=asset.seq, project=asset.project, status=asset.status.value,
+                creator=asset.creator,
             )
             main.call_soon_threadsafe(
                 lambda: main.create_task(self.bus.emit(EventType.ASSET_CREATED, **snapshot))
@@ -272,6 +273,7 @@ class AssetStore:
                 seq=asset.seq,
                 project=asset.project,
                 status=asset.status.value,
+                creator=asset.creator,
             )
         )
 

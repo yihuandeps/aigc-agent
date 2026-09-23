@@ -214,7 +214,7 @@ async def test_流水线有活在跑时不许换项目(tmp_path: Path, monkeypat
         with pytest.raises(RuntimeError, match="流水线"):
             agent.switch_project(tmp_path / "别的剧")
         agent.pipeline._inflight.clear()  # noqa: SLF001
-        agent.pipeline._failed.add("render:3")  # noqa: SLF001
+        agent.pipeline._failed["render:3"] = "sh_1|rf_1"  # noqa: SLF001
         agent.switch_project(tmp_path / "别的剧")
         assert not agent.pipeline._failed, "上一部剧的失败标记不能挡住新剧的同号集"  # noqa: SLF001
     finally:

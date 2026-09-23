@@ -33,6 +33,9 @@ from .models import Episode, ShotPrompt, _is_slug
 HOOK_MARK = "【高潮点】"  # 分镜脚本里高潮镜头的行首标记
 HOOK_LINE = "⚡"  # 剧本标题下的高潮点说明行标记
 DEFAULT_MAX_CUT = 3.0  # 单镜上限（秒），config/drama.yaml cut.max_seconds 没写时用它
+# 分镜 / 视频提示词的规则版本：提示词规则或产物格式有实质改动时改这里（和下面的数值一起
+# 组成规格戳）。按集流水见到旧戳的提示词不直接拿去渲，先按现行规格重出（2026-09-23 审查）
+SPEC_RULES = "2026-09-23"
 
 _CONFIG_DIR = Path(__file__).resolve().parents[3].parent / "config"
 
@@ -50,6 +53,14 @@ class EpisodeFormat:
     min_cut_seconds: float = 1.0
 
     # ---------- 派生 ----------
+
+    @property
+    def stamp(self) -> str:
+        """规格戳：分镜 / 视频提示词资产记在 gen_params.spec 上，流水线按它认旧规格。"""
+        return (
+            f"{SPEC_RULES}·段{self.min_shot_seconds}-{self.max_shot_seconds}s"
+            f"·镜{self.min_cut_seconds:g}-{self.max_cut_seconds:g}s"
+        )
 
     @property
     def seconds(self) -> int:

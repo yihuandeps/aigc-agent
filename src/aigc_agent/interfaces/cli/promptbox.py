@@ -39,7 +39,7 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/retry", "同一轮续跑（网络失败后不用重发话）"),
     ("/budget", "预算用量；/budget set 金额 300 视频秒 900 改额度；/budget allow 50 临时追加；"
                 "/budget reset 清零本次开工的用量"),
-    ("/auto", "自动人审：/auto on 打开、/auto off 关闭"),
+    ("/auto", "自动人审：/auto on 打开、/auto off 关闭、/auto retry 重派流水线失败的环节"),
     ("/stop", "停掉正在跑的这一轮"),
     ("/pause", "同 /stop"),
     ("/now", "停掉当前并插队发送：/now 先渲第 3 段"),

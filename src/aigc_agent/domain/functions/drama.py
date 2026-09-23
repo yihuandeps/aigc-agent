@@ -2128,6 +2128,7 @@ class DramaFunctions:
                 "ethnicity": opts.ethnicity,
                 "language": opts.language,
                 "format_problems": len(problems),
+                "spec": self.fmt.stamp,  # 规格戳：流水线据此认旧规格的产物
             },
         )
         body = "\n".join(
@@ -2314,6 +2315,7 @@ class DramaFunctions:
             "costume_bindings": len(bindings),
             "wardrobe_gaps": len(wardrobe_warns),
             "format_problems": len(problems),
+            "spec": self.fmt.stamp,  # 规格戳：流水线见到旧戳的不直接拿去渲
         }
         if episode:
             gp["episode"] = episode  # 按集流水的产物标记：pipeline 按它认出「第N集提示词」

@@ -37,6 +37,8 @@ class FakeRegistry:
     def __init__(self, store: AssetStore):
         self.store = store
         self.calls: list[tuple[str, dict]] = []
+        self.fail: dict[str, int] = {}  # 工具名 → 还要失败几次
+        self.spec = ""  # drama_shots 产物上的规格戳（真工具打 EpisodeFormat.stamp）
 
     def count(self, name: str) -> int:
         return sum(1 for n, _ in self.calls if n == name)
@@ -46,6 +48,9 @@ class FakeRegistry:
 
     async def invoke(self, name, args):
         self.calls.append((name, args))
+        if self.fail.get(name, 0) > 0:
+            self.fail[name] -= 1
+            return ToolResult(ok=False, error="模拟失败")
         if name == "drama_storyboard":
             # 从剧本资产认集号，产出覆盖这些集的分镜资产（真工具的资产格式）
             script = self.store.content(args["script_id"]) if args.get("script_id") else (
@@ -77,11 +82,14 @@ class FakeRegistry:
             a = self.store.create("{}", summary="参考图", creator="tool:drama_render_assets")
             return ToolResult(ok=True, asset_ref=a.id)
         if name == "drama_shots":
+            gp = {"episode": args["episode"]}
+            if self.spec:
+                gp["spec"] = self.spec
             a = self.store.create(
                 "[]",
                 summary=f"提示词·第{args['episode']}集",
                 creator="tool:drama_shots",
-                gen_params={"episode": args["episode"]},
+                gen_params=gp,
             )
             return ToolResult(ok=True, asset_ref=a.id)
         if name == "drama_render_shots":
@@ -120,10 +128,13 @@ def _build(
     total: int = 12,
     enabled: bool = True,
     guard=None,
+    spec: str = "",
 ) -> EpisodePipeline:
     store.bus = bus
     _write_state(root, total)
-    pipe = EpisodePipeline(fake, store, bus, OutputPrefs(root), guard=guard, enabled=enabled)
+    pipe = EpisodePipeline(
+        fake, store, bus, OutputPrefs(root), guard=guard, enabled=enabled, spec=spec
+    )
     notes: list[str] = []
     pipe.note = notes.append
     pipe.attach()
@@ -321,3 +332,155 @@ async def test_save_draft带episode落gen_params():
     # 不传 episode 时不落标记（流水线不把它当剧集）
     r2 = await fns.invoke("save_draft", {"content": "普通稿", "kind": "copy"})
     assert "episode" not in store.get(r2.asset_ref).gen_params
+
+
+# ---------------------------------------------------------------- 失败重派 / 旧规格 / 事件筛选
+
+
+async def test_无关资产事件不触发reconcile(tmp_path):
+    store, bus = AssetStore(), EventBus()
+    fake = FakeRegistry(store)
+    pipe = _build(store, bus, fake, tmp_path, total=3)
+    try:
+        await _settle(pipe)
+        ran = 0
+        orig = pipe._reconcile
+
+        async def counting() -> None:
+            nonlocal ran
+            ran += 1
+            await orig()
+
+        pipe._reconcile = counting  # type: ignore[method-assign]
+        # 渲染时每段视频 / 每张图都会落库（一段 put 2–3 次）：这些不改变流水线视图
+        for i in range(5):
+            a = store.create("", type_=AssetType.VIDEO, summary=f"片段{i}",
+                             creator="tool:gen_video")
+            store.put(a)
+        await asyncio.sleep(0.05)
+        await _settle(pipe)
+        assert ran == 0, "媒体资产落库也跑了全量 reconcile"
+        await _episode(store, 1)
+        await _settle(pipe)
+        assert ran >= 1 and fake.count("drama_storyboard") == 1
+    finally:
+        await pipe.aclose()
+
+
+async def test_文本环节失败自动再试一次(tmp_path):
+    store, bus = AssetStore(), EventBus()
+    fake = FakeRegistry(store)
+    fake.fail["drama_storyboard"] = 1
+    pipe = _build(store, bus, fake, tmp_path, total=12)
+    pipe.retry_delay = 0.05
+    try:
+        await _episode(store, 1)
+        await _settle(pipe)
+        # 冷却过了会自己踢一次（没有别的事件来踢）
+        for _ in range(150):
+            if fake.count("drama_storyboard") >= 2:
+                break
+            await asyncio.sleep(0.02)
+        await _settle(pipe)
+        assert fake.count("drama_storyboard") == 2, "偶发失败的文本环节应该自动再试一次"
+        assert not pipe.failed
+        assert any("自动再试" in n for n in pipe.notes)
+    finally:
+        await pipe.aclose()
+
+
+async def test_失败后输入变了自动重派_不变就等人(tmp_path):
+    store, bus = AssetStore(), EventBus()
+    fake = FakeRegistry(store)
+    fake.fail["drama_storyboard"] = 5
+    pipe = _build(store, bus, fake, tmp_path, total=12)
+    pipe.text_retries = 0  # 不自动再试，直接看失败标记
+    try:
+        await _episode(store, 1)
+        await _settle(pipe)
+        assert fake.count("drama_storyboard") == 1 and pipe.failed == ["storyboard:1"]
+        pipe.kick()
+        await _settle(pipe)
+        assert fake.count("drama_storyboard") == 1, "输入没变，不该反复派"
+
+        fake.fail.clear()
+        await _episode(store, 1)  # 人改了第 1 集剧本：新版本 → 新的输入
+        await _settle(pipe)
+        assert fake.count("drama_storyboard") == 2 and not pipe.failed
+    finally:
+        await pipe.aclose()
+
+
+async def test_auto_retry重派失败的渲染(tmp_path):
+    store, bus = AssetStore(), EventBus()
+    fake = FakeRegistry(store)
+    fake.fail["drama_render_shots"] = 1
+    pipe = _build(store, bus, fake, tmp_path, total=1)
+    try:
+        await _episode(store, 1)
+        await _settle(pipe)
+        assert fake.count("drama_render_shots") == 1 and pipe.failed == ["render:1"]
+        pipe.kick()
+        await _settle(pipe)
+        assert fake.count("drama_render_shots") == 1, "花钱的环节不自动重试"
+
+        assert pipe.retry() == ["render:1"]
+        await _settle(pipe)
+        assert fake.count("drama_render_shots") == 2 and not pipe.failed
+    finally:
+        await pipe.aclose()
+
+
+def _prepopulate(store: AssetStore, shots_spec: str) -> str:
+    """一集已经走到「有提示词、有参考图、还没渲」的存量（store 还没接总线，不发事件）。"""
+    store.create("第1集 剧本", type_=AssetType.SCRIPT, summary="第1集", creator="model",
+                 gen_params={"episode": 1})
+    sb = json.dumps([{"episodeIndex": 1, "episodeTitle": "第1集",
+                      "episodeDesc": "[第1集-1场] 镜头"}], ensure_ascii=False)
+    store.create(sb, type_=AssetType.STORYBOARD, summary="分镜", creator="tool:drama_storyboard")
+    store.create("{}", summary="资产库", creator="tool:drama_assets")
+    store.create("{}", summary="参考图", creator="tool:drama_render_assets")
+    gp = {"episode": 1, **({"spec": shots_spec} if shots_spec else {})}
+    old = store.create("[]", summary="提示词·第1集", creator="tool:drama_shots", gen_params=gp)
+    return old.id
+
+
+async def test_旧规格的提示词先按现行规格重出再渲(tmp_path):
+    store, bus = AssetStore(), EventBus()
+    old = _prepopulate(store, "S1")
+    fake = FakeRegistry(store)
+    fake.spec = "S2"
+    pipe = _build(store, bus, fake, tmp_path, total=1, spec="S2")
+    try:
+        pipe.kick()
+        await _settle(pipe)
+        assert fake.count("drama_shots") == 1, "旧规格的提示词要重出"
+        renders = fake.args_of("drama_render_shots")
+        assert len(renders) == 1 and renders[0]["shots_id"] != old, "不许拿旧规格的去花钱"
+        assert any("旧规格" in n for n in pipe.notes)
+    finally:
+        await pipe.aclose()
+
+
+async def test_规格戳一致不重出_重出后仍旧也只重出一次(tmp_path):
+    store, bus = AssetStore(), EventBus()
+    _prepopulate(store, "S2")
+    fake = FakeRegistry(store)
+    pipe = _build(store, bus, fake, tmp_path, total=1, spec="S2")
+    try:
+        pipe.kick()
+        await _settle(pipe)
+        assert fake.count("drama_shots") == 0 and fake.count("drama_render_shots") == 1
+    finally:
+        await pipe.aclose()
+
+    store2, bus2 = AssetStore(), EventBus()
+    _prepopulate(store2, "")  # 旧版产物没有规格戳
+    fake2 = FakeRegistry(store2)  # 工具产物也不打戳：重出一次就照着渲，不能死循环
+    pipe2 = _build(store2, bus2, fake2, tmp_path, total=1, spec="S2")
+    try:
+        pipe2.kick()
+        await _settle(pipe2)
+        assert fake2.count("drama_shots") == 1 and fake2.count("drama_render_shots") == 1
+    finally:
+        await pipe2.aclose()

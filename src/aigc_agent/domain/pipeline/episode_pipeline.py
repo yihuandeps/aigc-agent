@@ -19,6 +19,10 @@
 - **渲染花钱**：派发前查 CostGuard，超支即暂停渲染派发（刹车不是故障）。
 - **只在 /auto on 时派发**（enabled）；off 时事件照收不动作。
 - 派发全部走 `registry.invoke()`（同 drama_cmd 的直调模式），进 Trace。
+- **失败的环节**记下当时的输入：输入变了（改了剧本、重拆了分镜、换了资产库）自动重派；
+  文本环节（便宜）隔一会儿自动再试一次；花钱的不自动重试，/auto retry 由人发起。
+- **旧规格的视频提示词不直接拿去渲**：规格戳（EpisodeFormat.stamp）对不上就按现行规格
+  重出一遍（文本环节），每集只重出一次。
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -37,6 +42,14 @@ from ..drama.parse import parse_episodes
 from ..output import OutputPrefs
 
 _STATE_FILE = ".drama-state.json"
+# 只有这些资产会改变流水线的视图：剧本 + drama 各环节的产物。
+# 渲染时每段视频、每张图都会落库（一段要 put 2–3 次），之前每次都触发一次全量 reconcile
+_RELEVANT_CREATORS = frozenset({
+    "tool:drama_storyboard", "tool:drama_assets", "tool:drama_render_assets",
+    "tool:drama_shots", "tool:drama_render_shots",
+})
+# 文本环节：失败了值得自动再试一次（便宜；偶发的超时 / 截断常见）
+_TEXT_STAGES = ("storyboard", "assets", "shots")
 
 
 class EpisodePipeline:
@@ -53,6 +66,7 @@ class EpisodePipeline:
         enabled: bool = False,
         max_parallel_text: int = 3,
         max_parallel_renders: int = 2,
+        spec: str = "",
     ) -> None:
         self.registry = registry
         self.assets = assets
@@ -68,7 +82,17 @@ class EpisodePipeline:
         self._worker: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._inflight: set[str] = set()  # 已派发未完成（reconcile 不重复派）
-        self._failed: set[str] = set()  # 失败标记：不自动重试，重试由人决定
+        # 失败标记：环节 → 失败时的输入。输入变了自动重派；/auto retry 全部重派。
+        # 之前是个 set，只有重启才清，修好了输入也不会重跑（2026-09-23 审查）
+        self._failed: dict[str, str] = {}
+        self._inputs: dict[str, str] = {}  # 派发时的输入（失败时照抄进 _failed）
+        self._attempts: dict[str, int] = {}  # 连续失败次数（文本环节自动再试用）
+        self._cooldown: dict[str, float] = {}  # 自动再试之前的冷却截止（monotonic）
+        self.text_retries = 1
+        self.retry_delay = 30.0
+        # 现行规格戳（EpisodeFormat.stamp）；空 = 不校验。每集只按新规格重出一次提示词
+        self.spec = spec
+        self._respec_eps: set[int] = set()
         self._render_paused = False  # 预算刹车
         self._state_warned = False
         # 文本环节（分镜/资产库/提示词）与渲染环节分开限流：
@@ -106,8 +130,29 @@ class EpisodePipeline:
         """换项目时清掉按集号记的状态：失败标记、预算刹车、状态文件提示 ——
         不清的话上一部剧第 3 集的失败标记会挡住新剧的第 3 集（缺口 A）。"""
         self._failed.clear()
+        self._inputs.clear()
+        self._attempts.clear()
+        self._cooldown.clear()
+        self._respec_eps.clear()
         self._render_paused = False
         self._state_warned = False
+
+    def retry(self) -> list[str]:
+        """/auto retry：清掉失败标记和冷却，全部重派。返回被清掉的环节。
+
+        渲染重派只补缺的段（drama_render_shots 默认复用过了质检门的段）；没过质检门的段会重渲。
+        """
+        keys = sorted(self._failed)
+        self._failed.clear()
+        self._attempts.clear()
+        self._cooldown.clear()
+        self._render_paused = False
+        self.kick()
+        return keys
+
+    @property
+    def failed(self) -> list[str]:
+        return sorted(self._failed)
 
     def on_enable(self) -> None:
         """/auto on：踢一次 reconcile，扫存量资产补派（on 之前写的剧本不漏）。"""
@@ -121,7 +166,12 @@ class EpisodePipeline:
 
     def _on_event(self, ev: Event) -> None:
         # 同步回调只入队：EventBus.emit 串行等 handler，这里绝不能做重活。
-        if ev.type is EventType.ASSET_CREATED:
+        if ev.type is not EventType.ASSET_CREATED:
+            return
+        data = ev.data or {}
+        creator = data.get("creator")
+        # 只有剧本和 drama 各环节的产物会改变视图；没带创建者的（老事件）照旧踢
+        if creator is None or creator in _RELEVANT_CREATORS or data.get("type") == "script":
             self.kick()
 
     async def _run(self) -> None:
@@ -151,49 +201,82 @@ class EpisodePipeline:
             if total and ep > total:
                 continue
             key = f"storyboard:{ep}"
-            if self._skip(key) or ep in view["storyboards"]:
+            if self._skip(key, script_id) or ep in view["storyboards"]:
                 continue
             self._spawn(
-                key, self._storyboard(ep, script_id, ethnicity, language), self._text_sem
+                key, self._storyboard(ep, script_id, ethnicity, language), self._text_sem,
+                inputs=script_id,
             )
 
         # ② 全剧剧本齐 → 拆资产库 → 渲参考图（各一次，跨集复用）
         if total and all(ep in view["scripts"] for ep in range(1, total + 1)):
-            if not view["assets_lib"] and not self._skip("assets"):
+            script_ids = ",".join(view["scripts"][ep] for ep in range(1, total + 1))
+            if not view["assets_lib"] and not self._skip("assets", script_ids):
                 self._spawn(
                     "assets",
                     self._assets_lib(view["scripts"], total, ethnicity, language),
                     self._text_sem,
+                    inputs=script_ids,
                 )
             elif (
                 view["assets_lib"]
                 and not view["refs"]
-                and not self._skip("refs")
+                and not self._skip("refs", view["assets_lib"])
                 and await self._budget_ok("image", self._refs_need(view["assets_lib"]), 0.0,
                                           "渲参考图")
             ):
-                self._spawn("refs", self._refs(view["assets_lib"]), self._render_sem)
+                self._spawn(
+                    "refs", self._refs(view["assets_lib"]), self._render_sem,
+                    inputs=view["assets_lib"],
+                )
 
         # ③ 各集视频提示词：需要这一集的分镜 + 资产库（提示词要绑定资产 ID）。
         # 参考图是渲染的前置，不是提示词的 —— 不等它，提示词与渲图并行跑。
+        # 已有提示词但规格戳是旧的、这一集又还没渲：按现行规格重出一次再渲。
+        stale = view["stale_shots"]
         if view["assets_lib"]:
             for ep, sb_id in sorted(view["storyboards"].items()):
                 key = f"shots:{ep}"
-                if self._skip(key) or ep in view["shots"]:
+                inputs = f"{sb_id}|{view['assets_lib']}"
+                if self._skip(key, inputs):
                     continue
-                self._spawn(key, self._shots(ep, sb_id, view["assets_lib"]), self._text_sem)
+                have = view["shots"].get(ep)
+                respec = bool(
+                    have and have in stale and ep not in view["rendered"]
+                    and ep not in self._respec_eps
+                )
+                if have and not respec:
+                    continue
+                if respec:
+                    self._respec_eps.add(ep)
+                    self._say(
+                        f"⚙ 第 {ep} 集的视频提示词是旧规格（{stale[have] or '没有规格戳'}），"
+                        f"按现行规格（{self.spec}）重出一遍再渲"
+                    )
+                self._spawn(
+                    key, self._shots(ep, sb_id, view["assets_lib"]), self._text_sem,
+                    inputs=inputs,
+                )
 
         # ④ 各集渲染：提示词 + 参考图都齐才派，预算超支就刹住（预算恢复后自动解除）
         if not view["refs"]:
             return
         for ep, shots_id in sorted(view["shots"].items()):
             key = f"render:{ep}"
-            if self._skip(key) or ep in view["rendered"]:
+            inputs = f"{shots_id}|{view['refs']}"
+            if self._skip(key, inputs) or ep in view["rendered"]:
                 continue
+            shots_key = f"shots:{ep}"
+            if shots_key in self._inflight:
+                continue  # 提示词正在按新规格重出：等新的落库再渲，别拿旧的花钱
+            if shots_id in stale and (shots_key in self._failed or shots_key in self._cooldown):
+                continue  # 按新规格重出没成：旧规格的不自动渲，等自动再试或人处理
             units, seconds = self._render_need(ep, shots_id)
             if not await self._budget_ok("video", units, seconds, f"渲第 {ep} 集"):
                 break
-            self._spawn(key, self._render(ep, shots_id, view["refs"]), self._render_sem)
+            self._spawn(
+                key, self._render(ep, shots_id, view["refs"]), self._render_sem, inputs=inputs
+            )
 
     async def _budget_ok(
         self, kind: str = "", units: int = 1, seconds: float = 0.0, what: str = "渲染"
@@ -248,8 +331,23 @@ class EpisodePipeline:
         costumes = sum(len(c.costumes) for c in lib.characters)
         return max(1, len(lib.characters) + costumes + len(lib.scenes) + len(lib.props))
 
-    def _skip(self, key: str) -> bool:
-        return key in self._inflight or key in self._failed
+    def _skip(self, key: str, inputs: str = "") -> bool:
+        """这一环现在不派：在跑 / 冷却中（等自动再试）/ 失败了且输入没变。
+
+        失败时的输入和现在的不一样（人改了剧本、手动重拆了分镜、换了资产库）→ 失败标记作废，
+        重派。之前失败标记只有重启才清，修好了输入也不会重跑（2026-09-23 审查）。
+        """
+        if key in self._inflight:
+            return True
+        if time.monotonic() < self._cooldown.get(key, 0.0):
+            return True
+        if key in self._failed:
+            if inputs and self._failed[key] != inputs:
+                del self._failed[key]
+                self._attempts.pop(key, None)
+                return False
+            return True
+        return False
 
     # ---------- 视图：从 AssetStore 重建（幂等 + 重启恢复） ----------
 
@@ -258,6 +356,7 @@ class EpisodePipeline:
         storyboards: dict[int, tuple[int, str]] = {}
         shots: dict[int, tuple[int, str]] = {}
         rendered: dict[int, tuple[int, str]] = {}
+        stamps: dict[str, str] = {}  # 提示词资产 id → 规格戳
         assets_lib = (0, "")
         refs = (0, "")
         # 只看当前项目的 active 资产（缺口 A：之前全库，库里有任何一部剧的资产库，
@@ -279,18 +378,26 @@ class EpisodePipeline:
                     refs = (a.seq, a.id)
             elif a.creator == "tool:drama_shots" and ep:
                 _keep_latest(shots, int(ep), a)
+                stamps[a.id] = str(a.gen_params.get("spec") or "")
             elif a.creator == "tool:drama_render_shots" and ep:
                 # 只有完整的一集才算渲完（有失败段 / 被质检门拦下的段 → complete=False）。
                 # 之前有索引就算完，缺段的集也打「✅ 完成」（2026-09-23 审查）
                 if a.gen_params.get("complete", True):
                     _keep_latest(rendered, int(ep), a)
+        latest_shots = {k: v[1] for k, v in shots.items()}
         return {
             "scripts": {k: v[1] for k, v in scripts.items()},
             "storyboards": {k: v[1] for k, v in storyboards.items()},
             "assets_lib": assets_lib[1],
             "refs": refs[1],
-            "shots": {k: v[1] for k, v in shots.items()},
+            "shots": latest_shots,
             "rendered": {k: v[1] for k, v in rendered.items()},
+            # 规格戳对不上的最新提示词：id → 它的旧戳（没有戳的是旧版产物，记空串）
+            "stale_shots": {
+                sid: stamps.get(sid, "")
+                for sid in latest_shots.values()
+                if self.spec and stamps.get(sid, "") != self.spec
+            },
         }
 
     def _storyboard_eps(self, asset_id: str) -> list[int]:
@@ -350,18 +457,24 @@ class EpisodePipeline:
     # ---------- 派发（后台任务） ----------
 
     def _spawn(
-        self, key: str, coro: Coroutine[Any, Any, None], sem: asyncio.Semaphore
+        self, key: str, coro: Coroutine[Any, Any, None], sem: asyncio.Semaphore,
+        inputs: str = "",
     ) -> None:
         self._inflight.add(key)
+        self._inputs[key] = inputs
+        self._cooldown.pop(key, None)
 
         async def runner() -> None:
             async with sem:
                 try:
                     await coro
                 except Exception as e:  # noqa: BLE001
-                    self._failed.add(key)
-                    self._say(f"⚠ 流水线环节 {key} 异常：{e}")
+                    self._fail(key, f"流水线环节 {key} 异常：{e}",
+                               retry=key.split(":")[0] in _TEXT_STAGES)
                     await self.bus.emit(EventType.WARNING, message=f"流水线 {key} 异常：{e}")
+                else:
+                    if key not in self._failed and key not in self._cooldown:
+                        self._attempts.pop(key, None)  # 成了：连续失败次数清零
                 finally:
                     self._inflight.discard(key)
 
@@ -378,7 +491,7 @@ class EpisodePipeline:
             {"script_id": script_id, "ethnicity": ethnicity, "language": language},
         )
         if not r.ok:
-            self._fail(f"storyboard:{ep}", f"第 {ep} 集分镜失败：{r.error}")
+            self._fail(f"storyboard:{ep}", f"第 {ep} 集分镜失败：{r.error}", retry=True)
             return
         self._say(f"✓ 第 {ep} 集分镜完成")
 
@@ -392,7 +505,7 @@ class EpisodePipeline:
             {"script_ids": ids, "ethnicity": ethnicity, "language": language},
         )
         if not r.ok:
-            self._fail("assets", f"资产库拆解失败：{r.error}")
+            self._fail("assets", f"资产库拆解失败：{r.error}", retry=True)
 
     async def _refs(self, assets_id: str) -> None:
         self._say("⚙ 资产库完成，开始渲参考图（几分钟）…")
@@ -410,7 +523,7 @@ class EpisodePipeline:
             {"storyboard_id": storyboard_id, "assets_id": assets_id, "episode": ep},
         )
         if not r.ok:
-            self._fail(f"shots:{ep}", f"第 {ep} 集提示词失败：{r.error}")
+            self._fail(f"shots:{ep}", f"第 {ep} 集提示词失败：{r.error}", retry=True)
             return
         self._say(f"✓ 第 {ep} 集视频提示词完成")
 
@@ -448,9 +561,23 @@ class EpisodePipeline:
 
     # ---------- 小工具 ----------
 
-    def _fail(self, key: str, msg: str) -> None:
-        self._failed.add(key)
-        self._say(f"⚠ {msg}（不自动重试；修好后有新的资产事件会接着跑其他环节）")
+    def _fail(self, key: str, msg: str, retry: bool = False) -> None:
+        """记失败。retry=True（文本环节）：前 text_retries 次隔 retry_delay 秒自动再试；
+        之后、以及花钱的环节：标失败，输入变了自动重派，否则等 /auto retry。"""
+        n = self._attempts.get(key, 0) + 1
+        self._attempts[key] = n
+        if retry and n <= self.text_retries:
+            self._cooldown[key] = time.monotonic() + self.retry_delay
+            self._say(f"⚠ {msg}（{self.retry_delay:.0f} 秒后自动再试一次）")
+            with contextlib.suppress(RuntimeError):
+                # 晚一点点再踢：事件循环的定时器可能提前一个时钟粒度（Windows 约 15ms）触发，
+                # 正好踢在冷却截止之前就会被 _skip 挡掉，之后再没有人踢
+                asyncio.get_running_loop().call_later(self.retry_delay + 0.1, self.kick)
+            return
+        self._failed[key] = self._inputs.get(key, "")
+        self._say(
+            f"⚠ {msg}（不再自动重试：改好输入会自动重派，或 /auto retry 重派所有失败的环节）"
+        )
 
     def _say(self, msg: str) -> None:
         if self.note is not None:

@@ -304,7 +304,9 @@ class Agent:
         # 按集流水并行管线：/auto on 时剧本每满一批就自动接续分镜→提示词→渲染。
         # 吃 ASSET_CREATED 事件，默认关闭，CLI /auto on 打开（drama 链的手动模式不变）。
         assets.bus = bus
-        pipeline = EpisodePipeline(registry, assets, bus, output_prefs, guard=guard)
+        pipeline = EpisodePipeline(
+            registry, assets, bus, output_prefs, guard=guard, spec=episode_fmt.stamp
+        )
         pipeline.attach()
         # M9：一个入口查历史内容 / 记忆 / 素材库。素材库来源走注册表里的 MCP 工具，
         # server 没连上就当没有这个来源
