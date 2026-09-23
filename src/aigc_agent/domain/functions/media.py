@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
@@ -49,6 +50,18 @@ _LOCK_SPECS: dict[MediaKind, tuple[str, str, str, str, str]] = {
     MediaKind.VIDEO: ("video_lock", "on_video_lock", VIDEO_SWITCH_STAGE, "视频", "镜头"),
     MediaKind.IMAGE: ("image_lock", "on_image_lock", IMAGE_SWITCH_STAGE, "生图", "图"),
 }
+
+# 人采纳换模型时附言里带这些词 = 只这一次：这一轮放行新模型，锁不动。
+# 2026-09-23 审查：之前一采纳就写进会话快照，短剧链也跟着换 —— 想「先用快档试一镜」
+# 或「这一张被护栏拒了换一家出」，之后所有生成都被带走了
+_ONCE = re.compile(r"(只|仅)[换用]?(这|此)?一?(次|回|镜|张|段)|就(这|此)一?次|临时|暂时|once", re.I)
+# 「之后都换」「全部用它」之类是要长期换，哪怕句子里也出现了「只…一次」
+_FOR_GOOD = re.compile(r"(之后|以后|后面|往后)(也)?都|全都|全部|都换")
+
+
+def _adopt_once(reason: str) -> bool:
+    s = reason or ""
+    return bool(_ONCE.search(s)) and not _FOR_GOOD.search(s)
 
 
 def _not_public(refs: list[str]) -> list[str]:
@@ -103,6 +116,8 @@ class MediaFunctions:
         self.image_lock = ""
         self.on_image_lock = None
         self._pending_switch: dict[str, str] = {}
+        # 人说了「只这一次」的：环节名 → 这一轮放行的模型；这一轮真正结束（LOOP_END）就收回
+        self._once: dict[str, str] = {}
         self._specs: dict[str, ToolSpec] = {}
         self._build()
 
@@ -198,7 +213,8 @@ class MediaFunctions:
                         "enum": ["480p", "720p", "1080p", "4k"],
                         # 480p 是 2026-09-22 对着 seedance-2.0-fast 实测过的：
                         # 出 496×864，最省钱，验证分镜方向用它
-                        "description": "验证方向用 480p 最省，成片再上 720p",
+                        "description": "验证方向用 480p 最省（seedance-2.0-fast 实测支持，"
+                        "各模型支持哪些看 list_media_models），成片再上 720p",
                     },
                     "image_urls": {
                         "type": "array",
@@ -275,7 +291,8 @@ class MediaFunctions:
                         "enum": ["480p", "720p", "1080p", "4k"],
                         # 480p 是 2026-09-22 对着 seedance-2.0-fast 实测过的：
                         # 出 496×864，最省钱，验证分镜方向用它
-                        "description": "验证方向用 480p 最省，成片再上 720p",
+                        "description": "验证方向用 480p 最省（seedance-2.0-fast 实测支持，"
+                        "各模型支持哪些看 list_media_models），成片再上 720p",
                     },
                     "duration": {"type": "integer", "description": "公共时长秒，可被单项覆盖"},
                     "parent_id": {"type": "string"},
@@ -526,7 +543,11 @@ class MediaFunctions:
                 return gate
         if not model and self.image_lock:
             shared["model"] = self.image_lock
-        return await self._run_batch(MediaKind.IMAGE, jobs, shared)
+        result = await self._run_batch(MediaKind.IMAGE, jobs, shared)
+        note = self._prefer_note(MediaKind.IMAGE, self.image_lock, prefer) if not model else ""
+        if note and result.ok:
+            result.content = f"{result.content}\n{note}"
+        return result
 
     # ---------- 模型锁：换模型之前必须问用户 ----------
     #
@@ -557,16 +578,29 @@ class MediaFunctions:
                 pass
 
     def on_event(self, event: Any) -> None:
-        """总线回调：人对「模型切换」拍板后，**采纳**才真正换锁；打回/退回不换。"""
-        if getattr(event, "type", None) is not EventType.CHECKPOINT_DECIDED:
-            return
+        """总线回调：人对「模型切换」拍板后，**采纳**才真正换锁；打回/退回不换。
+
+        采纳时附言说「只这一次」（a 只这一次）：这一轮放行新模型，锁不动、不写快照；
+        这一轮真正结束（LOOP_END，挂起等人审的不算）就收回。
+        """
+        etype = getattr(event, "type", None)
         data = getattr(event, "data", None) or {}
+        if etype is EventType.LOOP_END:
+            if data.get("stop_reason") != "awaiting_review":
+                self._once.clear()
+            return
+        if etype is not EventType.CHECKPOINT_DECIDED:
+            return
         node = data.get("node")
         for kind, (_, _, stage, _, _) in _LOCK_SPECS.items():
             if node != stage:
                 continue
             target = self._pending_switch.pop(stage, "")
-            if data.get("decision") == "adopt" and target:
+            if data.get("decision") != "adopt" or not target:
+                continue
+            if _adopt_once(str(data.get("reason") or "")):
+                self._once[stage] = target
+            else:
                 self._set_lock(kind, target)
 
     def _video_model_gate(
@@ -590,6 +624,9 @@ class MediaFunctions:
         """
         attr, _, stage, label, thing = _LOCK_SPECS[kind]
         lock = str(getattr(self, attr, "") or "")
+        if lock and model and model != lock and self._once.get(stage) == model:
+            # 人说了「只这一次」：这一轮放行，锁不动
+            return model, f"（用户只同意这一轮用 {model}；本会话{label}模型仍锁定为 {lock}）", None
         if lock and model and model != lock:
             chosen, why = self.catalog.choose(kind, model, prefer)
             if not chosen:
@@ -597,8 +634,9 @@ class MediaFunctions:
             self._pending_switch[stage] = chosen
             question = (
                 f"要把{label}模型从 {lock} 换成 {chosen} 吗？（本次生成：{summary or '未命名'}）\n"
-                f"换模型会改变画质与风格，之后的{thing}也都用新模型。"
-                f"回复 a 同意换；r 或 j 不换，继续用 {lock}。"
+                f"换模型会改变画质与风格。回复 a 同意换，之后的{thing}也都用新模型；"
+                f"「a 只这一次」只在这一轮用 {chosen}，之后仍用 {lock}；"
+                f"r 或 j 不换，继续用 {lock}。"
             )
             payload = {
                 "question": question,
@@ -612,13 +650,14 @@ class MediaFunctions:
             return "", "", ToolResult(
                 content=(
                     f"{label}模型切换需要用户确认（{lock} → {chosen}），已暂停等待用户决定。"
-                    f"用户同意后再调用一次即可；不同意就继续用 {lock}。"
+                    f"用户同意后再调用一次即可（他说「只这一次」就只在这一轮生效）；"
+                    f"不同意就继续用 {lock}。"
                 ),
                 suspend=True,
                 suspend_payload=payload,
             )
         if lock and not model:
-            return lock, "", None
+            return lock, self._prefer_note(kind, lock, prefer), None
         chosen, why = self.catalog.choose(kind, model, prefer)
         if not chosen:
             return "", "", ToolResult(ok=False, error=why)
@@ -627,6 +666,34 @@ class MediaFunctions:
             note = f"{label}模型已锁定为 {chosen}（{why}）：之后都用它，要换会先问用户。"
             return chosen, note, None
         return chosen, "", None
+
+    def _prefer_note(self, kind: MediaKind, lock: str, prefer: str) -> str:
+        """有锁时 prefer 不参与选型。之前悄悄忽略 ——「先用 fast 档验证方向」实际还是锁定的
+        quality 模型在跑，钱照花（2026-09-23 审查）。现在说出来，并告诉模型怎么真换。"""
+        if prefer not in ("quality", "fast"):
+            return ""  # balanced 是默认值，分不出是不是有意传的
+        spec = self.catalog.get(kind, lock)
+        if spec is None or spec.tier == prefer:
+            return ""
+        # 优先推荐同一家的那一档（seedance-2.0 → seedance-2.0-fast），换家画风变得更多
+        family = lock.split("-")[0]
+        same = [
+            m for m in self.catalog.models(kind) if m.tier == prefer and m.id.startswith(family)
+        ]
+        if same:
+            alt = min(same, key=lambda m: m.cost).id
+        else:
+            alt, _ = self.catalog.choose(kind, "", prefer)
+        label = _LOCK_SPECS[kind][3]
+        how = (
+            f"要按 {prefer} 档出，带 model={alt} 再调一次 —— 会先问用户（可以只同意这一次）"
+            if alt and alt != lock
+            else "要换模型得先问用户"
+        )
+        return (
+            f"prefer={prefer} 没生效：本会话{label}模型锁定为 {lock}（{spec.tier} 档），"
+            f"这次仍用它。{how}。"
+        )
 
     async def _fn_gen_videos(
         self,
@@ -661,7 +728,11 @@ class MediaFunctions:
                 return gate
         if not model and self.video_lock:
             shared["model"] = self.video_lock
-        return await self._run_batch(MediaKind.VIDEO, jobs, shared)
+        result = await self._run_batch(MediaKind.VIDEO, jobs, shared)
+        note = self._prefer_note(MediaKind.VIDEO, self.video_lock, prefer) if not model else ""
+        if note and result.ok:
+            result.content = f"{result.content}\n{note}"
+        return result
 
     async def _fn_list_media_models(self, kind: str = "all") -> ToolResult:
         parts = []
@@ -753,6 +824,15 @@ class MediaFunctions:
             return gate
         model = chosen
         spec = self.catalog.get(MediaKind.VIDEO, chosen)
+        res_note = ""
+        listed = list(getattr(spec, "resolutions", None) or []) if spec else []
+        if resolution and listed and resolution not in listed:
+            # 2026-09-23 审查：工具描述推荐 480p，目录里 seedance-2.0-fast 却只列 720p ——
+            # 两边对不上时至少说出来，别让人以为按 480p 出、按 480p 花的
+            res_note = (
+                f"⚠ 模型目录里 {chosen} 没列 {resolution}（列的是 {'/'.join(listed)}），"
+                "服务端可能按别的分辨率出；实际分辨率以成片为准"
+            )
         limit = int(getattr(spec, "max_refs", 0) or 0) if spec else 0
         n_vid, n_aud = len(video_urls or []), len(audio_urls or [])
         if limit and len(pics) + n_vid + n_aud > limit:
@@ -797,8 +877,9 @@ class MediaFunctions:
             resolution=resolution or None,
             **refs,
         )
-        if lock_note and result.ok:
-            result.content = f"{result.content}\n{lock_note}"
+        notes = [n for n in (lock_note, res_note) if n]
+        if notes and result.ok:
+            result.content = "\n".join([result.content, *notes])
         return result
 
     async def _generate(

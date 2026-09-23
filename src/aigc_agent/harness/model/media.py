@@ -306,8 +306,9 @@ class ApiMartProvider:
         urls = extract_urls(payload)
         if urls:
             task.urls = urls
-            # 有些实现拿到结果时状态字段仍是 running，以有无产物为准
-            if task.status is TaskStatus.RUNNING:
+            # 有些实现拿到结果时状态字段仍是 running，以有无产物为准 —— 但进度明说没到头的不算：
+            # 有的实现先吐预览/中间产物的链接，之前一见 URL 就判成功（2026-09-23 审查）
+            if task.status is TaskStatus.RUNNING and not _in_progress(payload):
                 task.status = TaskStatus.SUCCEEDED
         if task.status is TaskStatus.FAILED and not task.error:
             task.error = _err_text(payload) or "生成失败，未给出原因"
@@ -317,6 +318,21 @@ class ApiMartProvider:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+
+def _in_progress(payload: Any) -> bool:
+    """进度字段明说还没完：0<p<1（小数制）或 1<p<100（百分制），「45%」这种也认。
+
+    缺字段、0、1、100 都不算没完 —— 0 常见于「这家不更新进度」，1 可能是小数制的 100%。
+    """
+    raw = _deep_get(payload, "progress")
+    if isinstance(raw, str):
+        raw = raw.strip().rstrip("%")
+    try:
+        p = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return 0 < p < 1 or 1 < p < 100
 
 
 def _safe_json(resp: Any) -> dict[str, Any]:

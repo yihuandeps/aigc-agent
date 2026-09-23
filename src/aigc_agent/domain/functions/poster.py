@@ -5,8 +5,9 @@
 
 为什么不让生图模型直接画字：中文它画不对，改一个字就要重生成一次。本地叠字改字免费、
 字体统一，AIGC 角标也顺手打上（平台要求画面显式标识）。
-底图若是生成接口给的临时外链，先抓到本地再用，并把资产的 uri 改成本地路径 ——
-外链会过期，打包时也得有文件。
+底图先用本地副本（产物目录里的 / Agent 在 blobs/ 自留的）；都没有才去抓远端临时外链，
+抓下来记在 gen_params.blob。uri 不改 —— 改成本地路径，这张图以后当参考图会被当成
+「不是公网链接」拒掉（2026-09-23 审查）。
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
-from ..assets.store import AssetStore, AssetType
+from ..assets.store import AssetStore, AssetType, local_copy
 from ..media import poster as P
 from ..media.ffmpeg import download
 
@@ -165,6 +166,10 @@ class PosterFunctions:
         a = self.assets.get(asset_id)
         if a.type is not AssetType.IMAGE:
             raise ValueError(f"{asset_id} 是 {a.type.value} 资产，底图得是 image")
+        # 之前不看本地副本、直接重下远端链接：生成超过约 24 小时链接就过期，必然失败
+        local = local_copy(a)
+        if local is not None:
+            return local.read_bytes()
         uri = a.uri or ""
         if uri.startswith(("http://", "https://")):
             ext = Path(urlparse(uri).path).suffix.lower()
@@ -172,12 +177,12 @@ class PosterFunctions:
             target = target / f"{a.id}{ext if ext in _IMAGE_EXT else '.png'}"
             ok, err = await download(uri, target)
             if not ok:
-                raise RuntimeError(f"底图 {asset_id} 下载失败：{err}")
-            a.gen_params = {**a.gen_params, "source_url": uri}
-            a.uri = str(target)
-            self.assets.put(a)  # 外链是临时的：落到本地，打包时才带得上文件
+                raise RuntimeError(
+                    f"底图 {asset_id} 没有本地副本，远端链接也下载失败"
+                    f"（生成的链接约 24 小时过期）：{err}"
+                )
+            # 抓下来的记在 blob（local_copy 认它）；uri 保持远端链接，参考图链还要用
+            a.gen_params = {**a.gen_params, "blob": str(target)}
+            self.assets.put(a)
             return target.read_bytes()
-        p = Path(uri) if uri else None
-        if p is None or not p.exists():
-            raise FileNotFoundError(f"{asset_id} 没有可用的图片文件：{uri or '（无 uri）'}")
-        return p.read_bytes()
+        raise FileNotFoundError(f"{asset_id} 没有可用的图片文件：{uri or '（无 uri）'}")

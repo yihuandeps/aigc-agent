@@ -45,6 +45,8 @@ class MediaModel(BaseModel):
     def brief(self) -> str:
         """进上下文的形态，约 20 token。模型照着这个自己挑。"""
         extra = f"，最长 {self.max_duration}s" if self.max_duration else ""
+        if self.resolutions:
+            extra += "，" + "/".join(self.resolutions)
         return f"{self.id}（{self.tier}·成本{self.cost}/5）：{self.strengths}{extra}"
 
 

@@ -265,15 +265,16 @@ class Agent:
         registry.register(VisionFunctions(gateway, assets, files, registry))
         # 抖音分支（2026-09-18）：关键词+风格 → RPA 热点 → 归纳成新内容 → 素材（问人 / 联网）→ 出片
         registry.register(MaterialFunctions(assets, workspace))
-        registry.register(
-            ShortVideoFunctions(
-                gateway, assets, registry, catalog, bus=bus, output=output_prefs, files=files,
-                hosting=hosting,
-            )
+        short_video = ShortVideoFunctions(
+            gateway, assets, registry, catalog, bus=bus, output=output_prefs, files=files,
+            hosting=hosting,
         )
+        registry.register(short_video)
         # 生图 / 生视频（prefs = 产物目录，生成成功自动落本地副本）
         media_fns = MediaFunctions(media_gw, catalog, assets, prefs=output_prefs)
         registry.register(media_fns)
+        # 出片档位跟会话锁对账：锁着的模型才是真正出片的那个（确认单按它报）
+        short_video.video_lock_source = lambda: media_fns.video_lock
         registry.register(AudioFunctions(audio_gw, catalog, assets))  # TTS / 转写
         registry.register(DouyinFunctions(assets, workspace))  # 抖音素材
         registry.register(VideoEditFunctions(assets, workspace, prefs=output_prefs))  # M14

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ...harness.events.bus import EventBus, EventType
+from ...harness.model.media import MediaKind
 from ...harness.tools.provider import (
     PermissionLevel,
     ProviderHealth,
@@ -82,6 +83,8 @@ class ShortVideoFunctions:
         self.recipes_dir = recipes_dir
         # 素材托管：产品参考图是本地文件时换成公网链接（生成接口只收 http(s)）
         self.hosting = hosting
+        # 会话锁定的视频模型（装配层接 MediaFunctions.video_lock）：锁着时 tier 不参与选型
+        self.video_lock_source: Any = None
         self._specs: dict[str, ToolSpec] = {}
         self._build()
 
@@ -302,6 +305,28 @@ class ShortVideoFunctions:
 
     def _cfg(self, key: str, default: Any) -> Any:
         return (getattr(self.catalog, "drama", {}) or {}).get(key, default)
+
+    def _tier_note(self, vtier: str, explicit: bool) -> tuple[str, str]:
+        """(锁定的视频模型, 档位没生效的说明)。
+
+        会话锁着视频模型时 gen_video 不按 prefer 选型 —— 之前 tier 参数和配方的 video_tier
+        悄悄不起作用，确认单上还写着「档位 fast」（2026-09-23 审查）。"""
+        try:
+            locked = str(self.video_lock_source() or "") if self.video_lock_source else ""
+        except Exception:  # noqa: BLE001
+            locked = ""
+        if not locked:
+            return "", ""
+        get = getattr(self.catalog, "get", None)
+        spec = get(MediaKind.VIDEO, locked) if callable(get) else None
+        tier = str(getattr(spec, "tier", "") or "")
+        if not tier or tier == vtier:
+            return locked, ""
+        origin = "" if explicit else "（配方默认）"
+        return locked, (
+            f"档位 {vtier}{origin} 没生效：本会话视频模型锁定为 {locked}（{tier} 档），"
+            "镜头都用它生成；要换档得先征得用户同意换模型"
+        )
 
     # ---------- 风格 ----------
 
@@ -529,6 +554,9 @@ class ShortVideoFunctions:
         vtier = tier or str(recipe.models.get("video_tier", "fast"))
         mapping = {**brief.materials, **{str(k): v for k, v in (materials or {}).items()}}
         notes: list[str] = []
+        locked, tier_note = self._tier_note(vtier, explicit=bool(tier))
+        if tier_note:
+            notes.append(tier_note)
 
         # ---- 出镜素材（口播出镜）：它的原声是主音轨，字幕从它转写，B-roll 穿插在它上面 ----
         if aroll:
@@ -587,7 +615,9 @@ class ShortVideoFunctions:
             secs = len(to_generate) * recipe.seconds_each
             q = (
                 f"「{brief.title}」要新生成 {len(to_generate)} 段视频"
-                f"（每段 {recipe.seconds_each}s，共约 {secs}s，档位 {vtier}），"
+                f"（每段 {recipe.seconds_each}s，共约 {secs}s，"
+                + (f"模型 {locked}（会话锁定）" if locked else f"档位 {vtier}")
+                + "），"
                 f"复用 / 用素材 {len(clips)} 段"
                 + ("，并出一次配音" if recipe.voiceover.get("enabled") else "")
                 + "。确认就开始生成。"
