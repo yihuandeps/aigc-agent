@@ -64,6 +64,17 @@ async def _default_get(
     return resp.status_code, data, resp.text
 
 
+def _orientation_ok(width: int, height: int, orientation: str) -> bool:
+    """素材方向对不对得上。量不出尺寸的放过（交给合成时裁切铺满）。"""
+    if not width or not height or orientation not in ("portrait", "landscape", "square"):
+        return True
+    if orientation == "portrait":
+        return height > width
+    if orientation == "landscape":
+        return width > height
+    return abs(width - height) <= max(width, height) * 0.1
+
+
 def _pixels(f: dict[str, Any]) -> int:
     return int(f.get("width") or 0) * int(f.get("height") or 0)
 
@@ -319,6 +330,10 @@ class MaterialFunctions:
         }
         if kind == "video":
             url = "https://pixabay.com/api/videos/"
+            # 视频接口不支持 orientation：多要一些，拿回来按宽高自己筛（2026-09-23 审查：横屏
+            # 素材混进竖屏成片，第 1 镜是横屏时整片都成了横屏）
+            if orientation in ("portrait", "landscape", "square"):
+                params["per_page"] = max(20, n * 4)
         else:
             url = "https://pixabay.com/api/"
             params["image_type"] = "photo"
@@ -328,11 +343,16 @@ class MaterialFunctions:
         if status != 200 or not isinstance(data, dict):
             return [], f"HTTP {status} {text[:120]}"
         out: list[dict[str, Any]] = []
-        for h in (data.get("hits") or [])[:n]:
+        for h in data.get("hits") or []:
+            if len(out) >= n:
+                break
             if kind == "video":
                 vids = h.get("videos") or {}
                 f = vids.get("large") or vids.get("medium") or vids.get("small") or {}
                 if not f.get("url"):
+                    continue
+                if not _orientation_ok(int(f.get("width") or 0), int(f.get("height") or 0),
+                                       orientation):
                     continue
                 out.append({
                     "handle": f"pixabay:v:{h.get('id')}", "kind": "video", "source": "pixabay",

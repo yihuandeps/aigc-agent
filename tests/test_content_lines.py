@@ -32,7 +32,8 @@ SKILLS = Path(__file__).resolve().parents[1] / "skills"
 def test_四条产线_各自映射到skill筛选用的内容形态():
     assert [ln.key for ln in LINES] == ["drama", "douyin", "ad", "design"]
     assert get_line("design").content_type == "图像"
-    assert {get_line(k).content_type for k in ("drama", "douyin", "ad")} == {"短视频"}
+    # 三条视频产线各有各的形态（都属于「短视频」），skill 预筛才分得开（2026-09-23 审查）
+    assert [get_line(k).content_type for k in ("drama", "douyin", "ad")] == ["短剧", "抖音", "广告"]
     assert get_line("nope") is None and get_line("") is None
 
 
@@ -80,7 +81,17 @@ def test_选了短剧_创作与提示词skill都在():
     hub = SkillHub(SKILLS)
     hub.load()
     names = {s.name for s in hub.candidates(get_line("drama").content_type)}
-    assert {"drama-script", "seedance-prompting", "douyin-short"} <= names
+    assert {"drama-script", "seedance-prompting", "compliance-redlines"} <= names
+    assert "douyin-short" not in names, "抖音的抓热点流程不该进短剧的视野"
+
+
+def test_选了广告或抖音_各拿各的skill():
+    hub = SkillHub(SKILLS)
+    hub.load()
+    ad = {s.name for s in hub.candidates(get_line("ad").content_type)}
+    assert "seedance-prompting" in ad and "douyin-short" not in ad and "drama-script" not in ad
+    dy = {s.name for s in hub.candidates(get_line("douyin").content_type)}
+    assert {"douyin-short", "seedance-prompting"} <= dy and "drama-script" not in dy
 
 
 def test_不限定时全部skill都在():

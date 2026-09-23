@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import json
 import os
 import re
 import shutil
+import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,13 +54,16 @@ class Probe:
         )
 
 
-async def run(cmd: list[str], timeout: float = FFMPEG_TIMEOUT) -> tuple[int, str]:
+async def run(
+    cmd: list[str], timeout: float = FFMPEG_TIMEOUT, cwd: Path | None = None
+) -> tuple[int, str]:
     """跑外部命令。超时/崩溃归一成 (code, stderr)，不抛出去打断 loop。"""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        cwd=str(cwd) if cwd else None,
     )
     try:
         _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -64,7 +71,63 @@ async def run(cmd: list[str], timeout: float = FFMPEG_TIMEOUT) -> tuple[int, str
         proc.kill()
         await proc.wait()
         return -1, f"超时（>{timeout:.0f}s）"
+    except asyncio.CancelledError:
+        # /stop、工具超时取消了这次调用：ffmpeg 子进程不杀就在后台接着跑、占着文件
+        # （2026-09-23 审查）
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        raise
     return proc.returncode or 0, err.decode("utf-8", errors="replace")
+
+
+@functools.lru_cache(maxsize=1)
+def _ffmpeg_major() -> int:
+    try:
+        out = subprocess.run(  # noqa: S603, S607 — 固定命令
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    m = re.search(r"ffmpeg version n?(\d+)", out)
+    return int(m.group(1)) if m else 0
+
+
+def _stage_inputs(paths: list[Path], work: Path) -> list[str]:
+    """输入文件硬链接（跨盘就复制）进工作目录、起短名。ffmpeg 在工作目录里跑，命令行只带短名 ——
+    Windows 命令行 32K 上限，长中文路径的素材一百多刀就撑爆（2026-09-23 审查）。"""
+    names: dict[Path, str] = {}
+    out: list[str] = []
+    for p in paths:
+        if p not in names:
+            dst = work / f"i{len(names)}{p.suffix or '.mp4'}"
+            try:
+                os.link(p, dst)
+            except OSError:
+                shutil.copyfile(p, dst)
+            names[p] = dst.name
+        out.append(names[p])
+    return out
+
+
+def _graph_args(filt: str, work: Path) -> list[str]:
+    """滤镜图太长也写进文件：ffmpeg 7 起是 -/filter_complex <文件>，
+    老版本是 -filter_complex_script。"""
+    if len(filt) < 6000:
+        return ["-filter_complex", filt]
+    (work / "graph.txt").write_text(filt, encoding="utf-8")
+    if _ffmpeg_major() >= 7:
+        return ["-/filter_complex", "graph.txt"]
+    return ["-filter_complex_script", "graph.txt"]
+
+
+def _fit(w: int, h: int, fill: bool) -> str:
+    """缩放到画布：fill=裁切铺满（横屏素材进竖屏成片不留黑边），否则等比缩放补边。"""
+    if fill:
+        return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+    return (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+    )
 
 
 async def download(url: str, target: Path) -> tuple[bool, str]:
@@ -89,7 +152,7 @@ async def download(url: str, target: Path) -> tuple[bool, str]:
     return True, ""
 
 
-async def probe(path: Path) -> Probe:
+async def probe(path: Path, timeout: float = 60.0) -> Probe:
     proc = await asyncio.create_subprocess_exec(
         "ffprobe",
         "-v",
@@ -102,7 +165,17 @@ async def probe(path: Path) -> Probe:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, _ = await proc.communicate()
+    try:
+        # 之前没有超时：文件坏了 / 网络盘卡住时 ffprobe 挂着，整个合成跟着挂
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return Probe()
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        raise
     try:
         data = json.loads(out.decode("utf-8", errors="replace"))
     except Exception:  # noqa: BLE001
@@ -123,7 +196,10 @@ async def probe(path: Path) -> Probe:
 
 
 async def concat(
-    clips: list[Path], out: Path, target_size: tuple[int, int] | None = None
+    clips: list[Path],
+    out: Path,
+    target_size: tuple[int, int] | None = None,
+    fill: bool = False,
 ) -> tuple[bool, str]:
     """按顺序拼接多段视频。
 
@@ -140,11 +216,22 @@ async def concat(
         first = await probe(clips[0])
         w, h = first.width or 1080, first.height or 1920
 
-    cmd: list[str] = ["ffmpeg", "-y"]
-    for c in clips:
-        cmd += ["-i", str(c)]
+    work = out.parent / f".concat-{uuid.uuid4().hex[:8]}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        return await _concat_in(clips, out, w, h, fill, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
-    # 每段先缩放补边到统一尺寸，再拼接。补边而不是裁剪，避免切掉主体。
+
+async def _concat_in(
+    clips: list[Path], out: Path, w: int, h: int, fill: bool, work: Path
+) -> tuple[bool, str]:
+    cmd: list[str] = ["ffmpeg", "-y"]
+    for name in _stage_inputs(clips, work):
+        cmd += ["-i", name]
+
+    # 每段先缩放到统一尺寸（默认补边，fill 时裁切铺满），再拼接。
     # 有没有音轨要逐段查。**混着来是常态**：配过音的段有，没台词的段没有。
     # 之前这里写死 a=0 只拼视频，结果每段辛苦混好的配音在拼接时被整个丢掉，
     # 成片"无音轨" —— 前面全部成功，最后一步静默清零，很难归因。
@@ -153,10 +240,7 @@ async def concat(
 
     parts = []
     for i in range(len(clips)):
-        parts.append(
-            f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}]"
-        )
+        parts.append(f"[{i}:v]{_fit(w, h, fill)},setsar=1,fps=30[v{i}]")
 
     streams = ""
     if keep_audio:
@@ -176,7 +260,7 @@ async def concat(
         streams = "".join(f"[v{i}]" for i in range(len(clips)))
         filt = ";".join(parts) + f";{streams}concat=n={len(clips)}:v=1:a=0[outv]"
 
-    cmd += ["-filter_complex", filt, "-map", "[outv]"]
+    cmd += [*_graph_args(filt, work), "-map", "[outv]"]
     if keep_audio:
         cmd += ["-map", "[outa]", "-c:a", "aac", "-b:a", "192k"]
     cmd += [
@@ -188,9 +272,9 @@ async def concat(
         "20",
         "-pix_fmt",
         "yuv420p",
-        str(out),
+        str(out.resolve()),
     ]
-    code, err = await run(cmd)
+    code, err = await run(cmd, cwd=work)
     if code != 0 or not out.exists():
         return False, _tail(err)
     return True, ""
@@ -201,6 +285,7 @@ async def concat_cuts(
     cuts: list[tuple[int, float, float]],
     out: Path,
     target_size: tuple[int, int] | None = None,
+    fill: bool = False,
 ) -> tuple[bool, str]:
     """按剪辑表拼接：同一段素材可以被切成多刀、在成片里出现多次。
 
@@ -221,36 +306,38 @@ async def concat_cuts(
         first = await probe(sources[0])
         w, h = first.width or 1080, first.height or 1920
 
-    cmd: list[str] = ["ffmpeg", "-y"]
-    for idx, _, _ in cuts:
-        cmd += ["-i", str(sources[idx])]
-
-    parts = []
-    for i, (_, start, dur) in enumerate(cuts):
-        parts.append(
+    work = out.parent / f".cuts-{uuid.uuid4().hex[:8]}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        names = _stage_inputs([sources[idx] for idx, _, _ in cuts], work)
+        cmd: list[str] = ["ffmpeg", "-y"]
+        for name in names:
+            cmd += ["-i", name]
+        fit = _fit(w, h, fill)
+        parts = [
             f"[{i}:v]trim=start={start:.3f}:duration={dur:.3f},setpts=PTS-STARTPTS,"
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}]"
-        )
-    streams = "".join(f"[v{i}]" for i in range(len(cuts)))
-    filt = ";".join(parts) + f";{streams}concat=n={len(cuts)}:v=1:a=0[outv]"
-
-    cmd += [
-        "-filter_complex",
-        filt,
-        "-map",
-        "[outv]",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        str(out),
-    ]
-    code, err = await run(cmd)
+            f"{fit},setsar=1,fps=30[v{i}]"
+            for i, (_, start, dur) in enumerate(cuts)
+        ]
+        streams = "".join(f"[v{i}]" for i in range(len(cuts)))
+        filt = ";".join(parts) + f";{streams}concat=n={len(cuts)}:v=1:a=0[outv]"
+        cmd += [
+            *_graph_args(filt, work),
+            "-map",
+            "[outv]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            str(out.resolve()),
+        ]
+        code, err = await run(cmd, cwd=work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     if code != 0 or not out.exists():
         return False, _tail(err)
     return True, ""

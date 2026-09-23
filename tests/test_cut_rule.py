@@ -247,7 +247,8 @@ def test_配方快切上限不超过全局单镜上限():
     r = Recipe(name="x", cut={"enabled": True, "max_seconds": 4})
     assert r.cut_max == 3.0, "配方写 4 也按 3 切"
     assert Recipe(name="y", cut={"enabled": True, "max_seconds": 2}).cut_max == 2.0
-    assert Recipe(name="z", cut={"enabled": False, "max_seconds": 4}).cut_max == 0.0
+    # 关了快切也守全局上限（2026-09-23 审查：之前返回 0，合成时整段拼、一镜 8 秒）
+    assert Recipe(name="z", cut={"enabled": False, "max_seconds": 4}).cut_max == 3.0
     assert Recipe(name="w", cut={"enabled": True}).cut_max == 3.0, "没写上限就用全局的"
     for p in sorted(RECIPES_DIR.glob("*.yaml")):
         data: dict[str, Any] = __import__("yaml").safe_load(p.read_text(encoding="utf-8")) or {}

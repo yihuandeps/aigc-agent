@@ -254,7 +254,11 @@ async def test_出片_素材直用_缺的并发生成_配音字幕合成_重跑�
     reply = {"brief_id": made.asset_ref, "reply": f"第2镜 {clip}"}
     bid = (await fns.invoke("resolve_materials", reply)).asset_ref
 
-    r = await fns.invoke("short_video_produce", {"brief_id": bid})
+    # 要新生成镜头：先停下来报镜头数和秒数，一分钱没花（2026-09-23 审查）
+    ask = await fns.invoke("short_video_produce", {"brief_id": bid})
+    assert ask.suspend and ask.suspend_payload["major"] is True and not reg.of("gen_video")
+    assert "要新生成 2 段视频" in ask.suspend_payload["question"]
+    r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     gens = reg.of("gen_video")
     assert [g["summary"] for g in gens] == [
@@ -289,7 +293,7 @@ async def test_没给实拍素材_改用生成并标出_图片素材做成镜头
     reg = Registry(store)
     fns = _fns(store, reg)
     bid = (await fns.invoke("short_video_brief", {"keyword": "k", "style": "tech-short"})).asset_ref
-    r = await fns.invoke("short_video_produce", {"brief_id": bid})
+    r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok and "第2镜需要实拍素材但没提供" in r.content
     assert len(reg.of("gen_video")) == 3
 
@@ -316,7 +320,8 @@ async def test_没给实拍素材_改用生成并标出_图片素材做成镜头
     try:
         reg.calls.clear()
         r = await fns.invoke(
-            "short_video_produce", {"brief_id": bid, "materials": {"2": photo.id}, "reuse": False}
+            "short_video_produce",
+            {"brief_id": bid, "materials": {"2": photo.id}, "reuse": False, "confirm": True},
         )
     finally:
         mod.ffmpeg.still_to_clip = orig  # type: ignore[assignment]

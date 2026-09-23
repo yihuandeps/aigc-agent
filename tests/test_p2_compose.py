@@ -96,6 +96,7 @@ async def test_顺序拼接_配音_字幕_导出并带血缘(tmp_path: Path):
             "subtitle_id": sub.id,
             "out_dir": str(out_dir),
             "filename": "测试_成片.mp4",
+            "keep_whole": True,  # 整段顺序拼（不传切点时默认按 ≤3s 快切）
         },
     )
     assert r.ok, r.error
@@ -116,6 +117,65 @@ async def test_顺序拼接_配音_字幕_导出并带血缘(tmp_path: Path):
     # 执行痕迹按资产依赖连边：成片这次调用消费了四份资产
     node = trace.producer_of(asset.id)
     assert node is not None and set(node.inputs) >= {clips[0].id, voice.id, sub.id}
+
+
+async def test_没传切点默认按全局上限快切_短剧片段不切(tmp_path: Path):
+    """2026-09-23 审查：max_cut_seconds 省略就整段拼 —— 配方关了快切的片子一镜 8 秒。"""
+    registry, store, _, clips, _, _ = await _setup(tmp_path)
+    r = await registry.invoke(
+        "compose_video",
+        {"clips": [c.id for c in clips], "out_dir": str(tmp_path / "o1"), "filename": "a.mp4"},
+    )
+    assert r.ok, r.error
+    assert "没传切点" in r.content and "刀" in r.content
+    # 短剧片段（带 shots_id 标签）生成时已按时间线硬切过，拼接不能再切
+    for c in clips:
+        c.gen_params["tags"] = {"shots_id": "as_x", "scene": "[第1集-1场]"}
+        store.put(c)
+    r2 = await registry.invoke(
+        "compose_video",
+        {"clips": [c.id for c in clips], "out_dir": str(tmp_path / "o2"), "filename": "b.mp4"},
+    )
+    assert r2.ok, r2.error
+    assert store.get(r2.asset_ref).gen_params["steps"] == ["拼接 2 段"], "整段拼，没有再切"
+
+
+async def test_同名导出不覆盖(tmp_path: Path):
+    registry, _, _, clips, _, _ = await _setup(tmp_path)
+    args = {"clips": [clips[0].id], "out_dir": str(tmp_path / "out"), "filename": "同名.mp4",
+            "keep_whole": True}
+    first = await registry.invoke("compose_video", args)
+    second = await registry.invoke("compose_video", args)
+    assert first.ok and second.ok
+    assert (tmp_path / "out" / "同名.mp4").exists() and (tmp_path / "out" / "同名-v2.mp4").exists()
+    assert second.content != first.content
+
+
+async def test_口播出镜_原声做音轨_BROLL穿插_画幅固定(tmp_path: Path):
+    """2026-09-23 审查：口播出镜配方成片没声音没字幕，出镜画面被切碎轮转。"""
+    registry, store, _, clips, _, _ = await _setup(tmp_path)
+    talk = tmp_path / "src" / "talk.mp4"
+    code, err = await ffmpeg.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=green:s=426x240:d=5:r=30",
+        "-f", "lavfi", "-i", "sine=frequency=300:duration=5", "-shortest",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(talk),
+    ])
+    assert code == 0, err
+    a = store.create("", type_=AssetType.VIDEO, summary="出镜", creator="human:import")
+    a.uri = str(talk)
+    store.put(a)
+    r = await registry.invoke(
+        "compose_video",
+        {"clips": [c.id for c in clips], "aroll_id": a.id, "out_dir": str(tmp_path / "out"),
+         "filename": "talk.mp4", "max_cut_seconds": 1.5, "min_cut_seconds": 0.8,
+         "aspect_ratio": "9:16"},
+    )
+    assert r.ok, r.error
+    assert "出镜" in r.content and "B-roll" in r.content
+    info = await ffmpeg.probe(tmp_path / "out" / "talk.mp4")
+    assert info.has_audio, "出镜人的原声就是音轨"
+    assert abs(info.duration - 5.0) < 0.4, info.duration
+    assert (info.width, info.height) == (1080, 1920), "按画幅定画布，横屏素材裁切铺满"
 
 
 async def test_快切模式镜头不超上限且总长对齐(tmp_path: Path):

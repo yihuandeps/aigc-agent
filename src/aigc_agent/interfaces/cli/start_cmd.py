@@ -78,7 +78,9 @@ def register(app: typer.Typer) -> None:
 
 
 def _go_video(topic: str) -> None:
-    from .video_cmd import make as video_make
+    import asyncio
+
+    from .video_cmd import _make
 
     if not topic:
         topic = console.input("想做什么方向？（如：科技 / 职场 / 健康）").strip()
@@ -86,7 +88,11 @@ def _go_video(topic: str) -> None:
         console.print("[red]没有方向就没法拉热榜定选题。[/]")
         raise typer.Exit(1)
     console.print(f"[dim]跑的是：agent video make \"{topic}\"[/]\n")
-    video_make(topic=topic)
+    # 直接调 typer 命令函数时，没传的参数拿到的是 OptionInfo 对象、一进去就 TypeError
+    # （2026-09-23 审查实测）—— 调底层实现，参数写全
+    asyncio.run(
+        _make(topic, "tech-short", "", 0, "", "", False, False, False, False, False, 0.0)
+    )
 
 
 def _go_drama(topic: str, file: str) -> None:

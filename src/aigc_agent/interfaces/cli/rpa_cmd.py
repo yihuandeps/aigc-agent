@@ -106,13 +106,14 @@ def collect(
 async def _collect(site: str, keyword: str, limit: int, pace: str) -> None:
     from ...app import Agent
 
-    agent = Agent.create()
+    # 用户亲手敲了采集命令，这就是对这次 L-external 动作的确认（之前没有询问器，一律被拒）
+    agent = Agent.create(auto_approve=True)
     await agent.setup(mcp=False)
 
     tool = "xhs_collect" if site == "xhs" else "douyin_hot_rpa"
-    args = {"limit": limit} if site != "xhs" else {
-        "keyword": keyword, "limit": limit, "pace": pace
-    }
+    args: dict[str, object] = {"limit": limit, "keyword": keyword}
+    if site == "xhs":
+        args["pace"] = pace
 
     console.print(f"[dim]采集中（{pace} 节奏，会比较慢，这是有意的）…[/]")
     r = await agent.registry.invoke(tool, args)

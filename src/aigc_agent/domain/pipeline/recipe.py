@@ -108,11 +108,12 @@ class Recipe:
         """单个镜头最长几秒。0 = 不快切。
 
         不会超过全局单镜上限（config/drama.yaml cut.max_seconds，用户 2026-09-20 定的
-        每镜 ≤3 秒）：配方里写 4 也按 3 切。"""
-        if not self.cut_enabled:
-            return 0.0
-        own = float(self.cut.get("max_seconds", 0))
+        每镜 ≤3 秒）：配方里写 4 也按 3 切；**配方关了快切也按全局上限切**（2026-09-23 审查：
+        之前 cut.enabled=false 返回 0，合成时整段拼接，一镜 8 秒）。"""
         cap = global_max_cut(RECIPES_DIR.parent)
+        if not self.cut_enabled:
+            return cap
+        own = float(self.cut.get("max_seconds", 0))
         return min(own, cap) if own > 0 else cap
 
     @property

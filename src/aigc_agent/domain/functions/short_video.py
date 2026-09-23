@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,11 @@ from .drama import _run_parallel
 from .media import retryable_failure
 
 PLANNER_ROLE = "short_video_planner"
+# 带产品参考图时加在镜头提示词最前面（身份锁：只继承产品本身，不继承参考图的背景构图）
+_REF_LOCK = (
+    "【参考锁定】@图片1 是产品本体（身份锁）：外形轮廓、颜色、材质、盖子与铭牌位置必须与参考图"
+    "一致；只继承产品本身，不继承参考图的背景、构图和光线。"
+)
 _MAX_SOURCE_CHARS = 20_000  # 喂给规划模型的热点材料总上限
 
 
@@ -64,6 +70,7 @@ class ShortVideoFunctions:
         output: Any = None,
         files: Any = None,
         recipes_dir: Path | None = None,
+        hosting: Any = None,
     ) -> None:
         self.gateway = gateway
         self.store = store
@@ -73,6 +80,8 @@ class ShortVideoFunctions:
         self.output = output  # OutputPrefs：图转镜头等中间产物落哪
         self.files = files  # FileFunctions：用户贴的素材路径按同一套边界解析
         self.recipes_dir = recipes_dir
+        # 素材托管：产品参考图是本地文件时换成公网链接（生成接口只收 http(s)）
+        self.hosting = hosting
         self._specs: dict[str, ToolSpec] = {}
         self._build()
 
@@ -167,7 +176,12 @@ class ShortVideoFunctions:
             description=(
                 "素材都定了再调。materials 传 {镜头序号: 资产id}（用户给的或素材站下的；"
                 "图片会自动做成静止镜头），没传素材的实拍镜头会改用 AI 生成并在结果里标出来。"
-                "画面按风格配方的快切规则剪，长度以配音为准。跑完用 view_video 看一遍成片。"
+                "口播出镜：用户的出镜视频传 aroll（它的原声当音轨、字幕从它转写，"
+                "B-roll 穿插）。广告：产品图传 ref_images（每个生成镜头都带上当身份锁），"
+                "个别镜头不同就用 shot_refs。"
+                "要新生成镜头时会先停下来报镜头数和秒数，人确认后带 confirm=true 再调。"
+                "画面按简报顺序快切（每刀 ≤3s），长度以配音 / 出镜原声为准。"
+                "跑完用 view_video 看成片。"
             ),
             parameters={
                 "type": "object",
@@ -189,6 +203,24 @@ class ShortVideoFunctions:
                     "no_voiceover": {"type": "boolean"},
                     "no_subtitle": {"type": "boolean"},
                     "voice": {"type": "string", "description": "指定音色，省略按文案自动挑"},
+                    "aroll": {
+                        "type": "string",
+                        "description": "口播出镜素材（用户对着镜头说话、带原声的视频）的资产 id",
+                    },
+                    "ref_images": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "所有生成镜头都带的参考图（产品图资产 id 或链接）",
+                    },
+                    "shot_refs": {
+                        "type": "object",
+                        "description": '个别镜头单独的参考图：{"3": ["as_xxx"]}',
+                        "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "人已经确认过这次要生成的镜头数和成本（第一次调不要传）",
+                    },
                 },
                 "required": ["brief_id"],
             },
@@ -304,7 +336,14 @@ class ShortVideoFunctions:
                 missing.append(aid)
                 continue
             piece = body.strip()[: max(1000, budget // max(1, len(ids)))]
-            parts.append(f"### 来源 {a.summary or aid}（{aid}）\n{piece}")
+            kw = str((a.gen_params or {}).get("keyword") or "")
+            if kw:
+                scope = f" · 按关键词「{kw}」搜的"
+            elif a.creator in ("tool:douyin_hot_rpa", "tool:douyin_hot_list"):
+                scope = " · 全站热榜，不一定和关键词相关"
+            else:
+                scope = ""
+            parts.append(f"### 来源 {a.summary or aid}（{aid}）{scope}\n{piece}")
             used.append(aid)
             budget -= len(piece)
             if budget <= 0:
@@ -323,12 +362,21 @@ class ShortVideoFunctions:
             return ToolResult(ok=False, error="没有文本网关，写不了简报")
         text, used, missing = self._sources_text(sources or [])
         lo, hi = recipe.duration_bounds
-        prompt = brief_prompt(keyword, recipe.style_label, recipe.style_desc, text, lo, hi, notes)
+        voiceover = bool(recipe.voiceover.get("enabled"))
+        prompt = brief_prompt(
+            keyword, recipe.style_label, recipe.style_desc, text, lo, hi, notes,
+            prompt_hint=str(recipe.shots.get("prompt_hint") or ""),
+            script_hint=str(recipe.voiceover.get("script_hint") or ""),
+            voiceover=voiceover,
+            shot_seconds=recipe.cut_max or 3.0,
+        )
         try:
             resp = await self.gateway.chat(PLANNER_ROLE, [{"role": "user", "content": prompt}])
         except KeyError:
             resp = await self.gateway.chat("main_agent", [{"role": "user", "content": prompt}])
-        brief, warns = parse_brief(resp.text, keyword, recipe.key, lo, hi)
+        brief, warns = parse_brief(
+            resp.text, keyword, recipe.key, lo, hi, voiceover=voiceover
+        )
         if brief is None:
             return ToolResult(ok=False, error="简报解析失败：" + "；".join(warns))
         brief.sources = used
@@ -465,6 +513,10 @@ class ShortVideoFunctions:
         no_voiceover: bool = False,
         no_subtitle: bool = False,
         voice: str = "",
+        aroll: str = "",
+        ref_images: list[str] | None = None,
+        shot_refs: dict[str, list[str]] | None = None,
+        confirm: bool = False,
     ) -> ToolResult:
         brief, _, err = self._brief(brief_id)
         if brief is None:
@@ -478,11 +530,30 @@ class ShortVideoFunctions:
         mapping = {**brief.materials, **{str(k): v for k, v in (materials or {}).items()}}
         notes: list[str] = []
 
+        # ---- 出镜素材（口播出镜）：它的原声是主音轨，字幕从它转写，B-roll 穿插在它上面 ----
+        if aroll:
+            why = self._aroll_problem(aroll)
+            if why:
+                return ToolResult(ok=False, error=why, meta={"charged": False})
+
+        # ---- 镜头数不能多于刀数：多出来的镜头生成了也进不了成片（2026-09-23 审查：8 个镜头
+        #      只切 6 刀，第 7、8 镜付了钱不出现）。出镜模式的时间线跟着出镜素材走，不在此列 ----
+        shots = list(enumerate(brief.shots, 1))
+        cut_min = max(0.5, float(recipe.cut_min or 1.2))
+        room = max(1, math.floor(brief.duration / cut_min + 1e-9))
+        if not aroll and len(shots) > room:
+            cut = ", ".join(str(i) for i, _ in shots[room:])
+            notes.append(
+                f"简报有 {len(shots)} 个镜头，{brief.duration}s 按每刀 ≥{cut_min:g}s 最多切 "
+                f"{room} 刀 —— 第 {cut} 镜进不了成片，没有生成"
+            )
+            shots = shots[:room]
+
         # ---- 每个镜头：用户/素材站的素材 → 复用上次生成的 → 现在生成 ----
         prev = self._previous_clips(brief_id) if reuse else {}
         clips: dict[int, str] = {}
         to_generate: list[int] = []
-        for i, shot in enumerate(brief.shots, 1):
+        for i, shot in shots:
             mat = mapping.get(str(i))
             if mat:
                 cid, why = await self._material_clip(mat, shot.seconds or recipe.seconds_each, i)
@@ -491,12 +562,52 @@ class ShortVideoFunctions:
                     continue
                 notes.append(f"第{i}镜素材 {mat} 用不了（{why}），改用 AI 生成")
             elif shot.source == "real":
+                if aroll:
+                    continue  # 真人出镜的镜头就是出镜素材本身，不另生成
                 need = shot.real_need or shot.desc
                 notes.append(f"第{i}镜需要实拍素材但没提供（{need}），已改用 AI 生成")
             if i in prev:
                 clips[i] = prev[i]
             else:
                 to_generate.append(i)
+
+        # ---- 参考图（广告的产品身份锁）：换成公网链接，生成时逐镜带上 ----
+        common, err = await self._ref_urls(ref_images or [])
+        if err:
+            return ToolResult(ok=False, error=err, meta={"charged": False})
+        per_shot: dict[str, list[str]] = {}
+        for k, ids in (shot_refs or {}).items():
+            urls, err = await self._ref_urls(list(ids or []))
+            if err:
+                return ToolResult(ok=False, error=err, meta={"charged": False})
+            per_shot[str(k)] = urls
+
+        # ---- 出片前报成本，人点头了再花钱（2026-09-23 审查：之前不报镜头数也不预估调用次数）----
+        if to_generate and not confirm:
+            secs = len(to_generate) * recipe.seconds_each
+            q = (
+                f"「{brief.title}」要新生成 {len(to_generate)} 段视频"
+                f"（每段 {recipe.seconds_each}s，共约 {secs}s，档位 {vtier}），"
+                f"复用 / 用素材 {len(clips)} 段"
+                + ("，并出一次配音" if recipe.voiceover.get("enabled") else "")
+                + "。确认就开始生成。"
+            )
+            return ToolResult(
+                content=(
+                    f"{q}\n已暂停等人确认。人采纳后用同样的参数加 confirm=true 再调一次 "
+                    "short_video_produce；打回就按人的意见改简报。"
+                    + ("\n" + "\n".join(f"  · {n}" for n in notes) if notes else "")
+                ),
+                suspend=True,
+                suspend_payload={
+                    "question": q,
+                    "stage": "出片确认",
+                    "target": "出片确认",
+                    "assets": [brief_id],
+                    "major": True,
+                },
+                meta={"charged": False},
+            )
 
         # ---- 生成：并发 + 网络类失败重试 ----
         failed: list[str] = []
@@ -513,8 +624,12 @@ class ShortVideoFunctions:
             async def gen(i: int) -> tuple[int, str, str]:
                 nonlocal done
                 shot = brief.shots[i - 1]
-                args = {
-                    "prompt": recipe.shot_prompt(shot.desc, level),
+                refs = per_shot.get(str(i)) or common
+                prompt = recipe.shot_prompt(shot.desc, level)
+                if refs:
+                    prompt = _REF_LOCK + prompt
+                args: dict[str, Any] = {
+                    "prompt": prompt,
                     "prefer": vtier,
                     "aspect_ratio": recipe.output.get("aspect_ratio", "9:16"),
                     "duration": recipe.seconds_each,
@@ -522,6 +637,8 @@ class ShortVideoFunctions:
                     "summary": f"{brief.title}·第{i}镜",
                     "local_name": recipe_shot_name(brief.title, i),
                 }
+                if refs:
+                    args["image"] = refs  # 产品图是身份锁：之前 produce 根本没有传参考图的通道
                 r = None
                 for attempt in range(retries + 1):
                     r = await self.registry.invoke("gen_video", args)
@@ -539,12 +656,16 @@ class ShortVideoFunctions:
                     clips[i] = aid
                 else:
                     failed.append(f"第{i}镜：{e[:90]}")
-        if not clips:
+        if not clips and not aroll:
             return ToolResult(ok=False, error="一个镜头都没有：\n" + "\n".join(failed))
 
-        # ---- 配音 ----
+        # ---- 配音：配方开了才配；「实拍为主」的配方没给出镜素材时用 TTS 兜底，不然成片没声音 ----
         audio_id = ""
-        vo_on = bool(recipe.voiceover.get("enabled")) and not no_voiceover and brief.script
+        vo_wanted = bool(recipe.voiceover.get("enabled"))
+        if not vo_wanted and not aroll and str(recipe.style.get("footage") or "") == "real":
+            vo_wanted = True
+            notes.append("没有出镜素材：用 TTS 口播兜底（不然成片没有声音）")
+        vo_on = vo_wanted and not no_voiceover and bool(brief.script) and not aroll
         if vo_on:
             picked, speed, why = await self._pick_voice(recipe, brief, voice)
             r = await self.registry.invoke(
@@ -563,31 +684,36 @@ class ShortVideoFunctions:
             else:
                 notes.append(f"配音失败，成片无声：{(r.error or '')[:100]}")
 
-        # ---- 字幕：转写拿时间轴，文字回贴原稿 ----
+        # ---- 字幕：转写拿时间轴。TTS 的文字回贴原稿；出镜素材按出镜人实际说的 ----
         sub_id = ""
-        if recipe.subtitle.get("enabled") and audio_id and not no_subtitle:
+        sub_src = audio_id or aroll
+        if recipe.subtitle.get("enabled") and sub_src and not no_subtitle:
             r = await self.registry.invoke(
                 "transcribe",
-                {"asset_id": audio_id, "format": "srt",
+                {"asset_id": sub_src, "format": "srt",
                  "language": str(recipe.subtitle.get("language") or "zh")},
             )
             if r.ok:
                 sub_id = r.asset_ref
-                try:
-                    fixed, changed = align_script(brief.script, self.store.content(sub_id))
-                except KeyError:
-                    fixed, changed = "", 0
-                if changed:
-                    rev = self.store.revise(
-                        sub_id, fixed, summary="字幕·按原稿校正", creator="pipeline:align"
-                    )
-                    sub_id = rev.id
-                    notes.append(f"字幕：按原稿校正 {changed} 条")
+                if audio_id:
+                    try:
+                        fixed, changed = align_script(brief.script, self.store.content(sub_id))
+                    except KeyError:
+                        fixed, changed = "", 0
+                    if changed:
+                        rev = self.store.revise(
+                            sub_id, fixed, summary="字幕·按原稿校正", creator="pipeline:align"
+                        )
+                        sub_id = rev.id
+                        notes.append(f"字幕：按原稿校正 {changed} 条")
+                else:
+                    notes.append("字幕：按出镜人的原声转写")
             else:
                 notes.append(f"字幕失败，成片无字幕：{(r.error or '')[:100]}")
 
-        # ---- 合成 ----
-        ordered = [clips[i] for i in sorted(clips)]
+        # ---- 合成：按简报顺序排刀（每镜至少一刀、以最后一镜收尾），画布按配方画幅 ----
+        order = sorted(clips)
+        ordered = [clips[i] for i in order]
         r = await self.registry.invoke(
             "compose_video",
             {
@@ -599,12 +725,16 @@ class ShortVideoFunctions:
                 "max_cut_seconds": recipe.cut_max,
                 "min_cut_seconds": recipe.cut_min,
                 "total_seconds": brief.duration,
+                "aroll_id": aroll,
+                "cut_order": "brief",
+                "weights": [float(brief.shots[i - 1].seconds or 1.0) for i in order],
+                "aspect_ratio": str(recipe.output.get("aspect_ratio", "9:16")),
             },
         )
         record = self.store.create(
             json.dumps(
-                {"clips": {str(i): clips[i] for i in sorted(clips)}, "audio": audio_id,
-                 "subtitle": sub_id, "composed": r.asset_ref if r.ok else ""},
+                {"clips": {str(i): clips[i] for i in order}, "audio": audio_id,
+                 "subtitle": sub_id, "aroll": aroll, "composed": r.asset_ref if r.ok else ""},
                 ensure_ascii=False, indent=2,
             ),
             type_=AssetType.STORYBOARD,
@@ -617,7 +747,7 @@ class ShortVideoFunctions:
         kept = len(clips) - fresh
         head = (
             f"「{brief.title}」{brief.duration}s · 镜头 {len(clips)} 个"
-            f"（新生成 {fresh}，复用/素材 {kept}）"
+            f"（新生成 {fresh}，复用/素材 {kept}）" + ("· 出镜素材为主" if aroll else "")
         )
         body = "\n".join(f"  · {n}" for n in notes)
         warn = ("\n\n失败：\n  " + "\n  ".join(failed)) if failed else ""
@@ -631,6 +761,47 @@ class ShortVideoFunctions:
             f"建议 view_video(source=\"{r.asset_ref}\") 看一遍：字幕、变脸、穿帮。",
             asset_ref=r.asset_ref,
         )
+
+    def _aroll_problem(self, asset_id: str) -> str:
+        """出镜素材能不能用：要是视频、本地有文件（剪辑和转写都要读它）。能用返回空串。"""
+        try:
+            a = self.store.get(asset_id)
+        except KeyError:
+            return f"出镜素材 {asset_id} 不存在"
+        if a.type is not AssetType.VIDEO:
+            return f"出镜素材 {asset_id} 是 {a.type.value}，要视频"
+        if local_copy(a) is None:
+            return f"出镜素材 {asset_id} 本地没有文件（先 fs_import 登记用户给的视频）"
+        return ""
+
+    async def _ref_urls(self, ids: list[str]) -> tuple[list[str], str]:
+        """参考图 → 公网链接（生成接口只收 http(s)）。已是链接的原样用；本地图走托管。"""
+        out: list[str] = []
+        for x in ids:
+            x = str(x or "").strip()
+            if not x:
+                continue
+            if x.startswith(("http://", "https://")):
+                out.append(x)
+                continue
+            try:
+                a = self.store.get(x)
+            except KeyError:
+                return [], f"参考图 {x} 不存在"
+            if self.hosting is not None and getattr(self.hosting, "enabled", False):
+                url, err = await self.hosting.ensure_asset(self.store, a, 20)
+                if url and not err:
+                    out.append(url)
+                    continue
+                return [], f"参考图 {x} 托管失败：{err}"
+            if (a.uri or "").startswith(("http://", "https://")):
+                out.append(str(a.uri))
+                continue
+            return [], (
+                f"参考图 {x} 只有本地文件，生成接口只收公网链接 —— 先 host_file 拿链接，"
+                "或在 config/hosting.yaml 配好素材托管"
+            )
+        return out, ""
 
     async def _pick_voice(self, recipe: Recipe, brief: Brief, voice: str) -> tuple[str, float, str]:
         want = voice or str(recipe.voiceover.get("voice") or "auto")
@@ -654,8 +825,11 @@ class ShortVideoFunctions:
     def _previous_clips(self, brief_id: str) -> dict[int, str]:
         """这份简报上次出片时成功的镜头：序号 → 片段资产 id（能拼的才算）。"""
         out: dict[int, str] = {}
+        # resolve_materials 用 revise 出新版简报（新 id）：之前只认 parent_ids[0] == brief_id，
+        # 只改了一个镜头的素材，所有 AI 镜头都重新生成（2026-09-23 审查）
+        lineage = self._brief_lineage(brief_id)
         for a in self.store.find(creator="tool:short_video_produce"):
-            if not a.parent_ids or a.parent_ids[0] != brief_id:
+            if not a.parent_ids or a.parent_ids[0] not in lineage:
                 continue
             try:
                 rows = json.loads(self.store.content(a.id)).get("clips") or {}
@@ -669,6 +843,21 @@ class ShortVideoFunctions:
                 if i not in out and self._playable(cid):
                     out[i] = cid
         return out
+
+    def _brief_lineage(self, brief_id: str) -> set[str]:
+        """这份简报和它 revise 出来之前的各版（只沿 resolve_materials 的改版链往上走）。"""
+        ids = {brief_id}
+        cur = brief_id
+        for _ in range(50):
+            try:
+                a = self.store.get(cur)
+            except KeyError:
+                break
+            if a.creator != "tool:resolve_materials" or not a.parent_ids:
+                break
+            cur = a.parent_ids[0]
+            ids.add(cur)
+        return ids
 
     def _playable(self, asset_id: str) -> bool:
         try:

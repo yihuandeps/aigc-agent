@@ -676,12 +676,25 @@ def local_copy(asset: Asset) -> Path | None:
     return None
 
 
-def rights_of(asset: Asset) -> str:
-    """版权状态，按创建者判：generated（本系统生成）/ human（人给的）/ unknown。
+# 从外面拿别人的内容回来的工具：它们的产物不是「本系统生成」
+_FETCHERS = ("tool:fetch_douyin", "tool:fetch_stock_media", "tool:fetch_media_url",
+             "tool:browse_and_copy")
 
-    M9 检索和 M15 机审共用这一个口径，别各判各的。
+
+def rights_of(asset: Asset) -> str:
+    """版权状态：generated（本系统生成）/ human（人给的）/ licensed（素材站、授权写清了）/
+    unknown（来源不明：别人的原片、授权没写清）。
+
+    M9 检索和 M15 机审共用这一个口径，别各判各的。2026-09-23 审查：之前只看创建者 ——
+    fetch_media_url / fetch_douyin 下回来的别人的原片 creator 是 tool:*，被判成「自己生成的」，
+    机审查不出版权问题。
     """
     c = asset.creator or ""
+    lic = str((asset.gen_params or {}).get("license") or "").strip().lower()
+    if c in _FETCHERS:
+        if not lic or lic.startswith("unknown") or "来源不明" in lic:
+            return "unknown"
+        return "licensed"
     if c.startswith(("model:", "tool:", "pipeline:", "stub")):
         return "generated"
     if c.startswith("human"):

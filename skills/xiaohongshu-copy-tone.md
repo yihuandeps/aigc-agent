@@ -2,7 +2,7 @@
 name: xiaohongshu-copy-tone
 description: 小红书的语气、标题与排版规范，写小红书正文、标题或话题标签时必读
 scope: content_type
-applies_to: [图文, 短视频]
+applies_to: [图文, 抖音]
 stage: [正文, 排版]
 priority: 60
 version: 0.0.1

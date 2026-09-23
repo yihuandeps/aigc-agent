@@ -97,12 +97,20 @@ class RpaFunctions:
             ),
             "douyin_hot_rpa": ToolSpec(
                 name="douyin_hot_rpa",
-                summary="用浏览器抓抖音热榜页词条",
+                summary="用浏览器抓抖音热榜页词条（全站热榜；带 keyword 只保留相关的）",
                 permission=PermissionLevel.EXTERNAL,
-                description="只读热榜词条。要点进视频拿链接请用 browse_and_copy。",
+                description=(
+                    "只读热榜词条，是**全站热榜**，不按关键词搜 —— "
+                    "带 keyword 时只保留和它相关的条目，"
+                    "一条都不相关就如实报。按关键词找热点用 douyin_hot_list(keyword=…)。"
+                    "要点进视频拿链接请用 browse_and_copy。"
+                ),
                 parameters={
                     "type": "object",
-                    "properties": {"limit": {"type": "integer", "description": "默认 20"}},
+                    "properties": {
+                        "limit": {"type": "integer", "description": "默认 20"},
+                        "keyword": {"type": "string", "description": "只保留和它相关的条目"},
+                    },
                 },
             ),
         }
@@ -181,26 +189,56 @@ class RpaFunctions:
             posts, err = await collect_xiaohongshu(s, keyword, limit, scrolls, p)
         if err:
             return ToolResult(ok=False, error=err)
-        return self._pack(posts, f"小红书·{keyword or '发现页'}", "xhs_collect")
+        return self._pack(posts, f"小红书·{keyword or '发现页'}", "xhs_collect", keyword=keyword)
 
-    async def _fn_douyin_hot_rpa(self, limit: int = 20) -> ToolResult:
+    async def _fn_douyin_hot_rpa(self, limit: int = 20, keyword: str = "") -> ToolResult:
         if not have_playwright():
             return ToolResult(ok=False, error="未装 playwright")
         async with BrowserSession(self.profile) as s:
-            posts, err = await collect_douyin_hot(s, limit, load_pace())
+            # 带关键词时多抓一些再筛
+            posts, err = await collect_douyin_hot(s, max(limit, 50) if keyword else limit,
+                                                  load_pace())
         if err:
             return ToolResult(ok=False, error=err)
-        return self._pack(posts, "抖音热榜（RPA）", "douyin_hot_rpa")
+        if keyword:
+            # 2026-09-23 审查：之前 keyword 没往下传，全站热榜被当成「相关热点」喂给简报，
+            # 规划模型硬套无关热点当出处
+            hits = [p for p in posts if _relevant(p.title, keyword)][:limit]
+            if not hits:
+                return ToolResult(
+                    ok=False,
+                    error=(
+                        f"抖音热榜 {len(posts)} 条里没有和「{keyword}」相关的"
+                        "（RPA 只能抓全站热榜）。"
+                        f"按关键词找用 douyin_hot_list(keyword=\"{keyword}\") 或 "
+                        f"xhs_collect(keyword=\"{keyword}\")"
+                    ),
+                )
+            return self._pack(hits, f"抖音热榜（RPA）·与「{keyword}」相关", "douyin_hot_rpa",
+                              keyword=keyword)
+        return self._pack(posts, "抖音热榜（RPA）·全站", "douyin_hot_rpa")
 
-    def _pack(self, posts: list[Any], title: str, tool: str) -> ToolResult:
+    def _pack(self, posts: list[Any], title: str, tool: str, keyword: str = "") -> ToolResult:
         body = "\n".join(p.line(i) for i, p in enumerate(posts, 1))
         asset = self.store.create(
             body,
             type_=AssetType.TEXT,
             summary=f"{title}·{len(posts)}条",
             creator=f"tool:{tool}",
+            gen_params={"keyword": keyword} if keyword else {},
         )
         return ToolResult(content=f"{title}（{len(posts)} 条）\n{body}", asset_ref=asset.id)
+
+
+def _relevant(title: str, keyword: str) -> bool:
+    """热榜词条和关键词沾不沾边：整词出现，或关键词里任意两个相邻的字出现（中文没有空格分词）。"""
+    t = (title or "").lower()
+    k = "".join((keyword or "").lower().split())
+    if not t or not k:
+        return False
+    if k in t:
+        return True
+    return any(k[i : i + 2] in t for i in range(len(k) - 1))
 
 
 def _entry(site: str, keyword: str) -> tuple[str, list[str], str]:

@@ -3402,6 +3402,8 @@ class DramaFunctions:
                 "clips": [d["asset"] for d in ordered],
                 "out_dir": out_dir,
                 "filename": filename or (episode_export_name(episode) if episode else "短剧.mp4"),
+                # 片段生成时已按时间线硬切过（每镜 ≤3s），拼接时不能再切，否则台词被剪断
+                "keep_whole": True,
             },
         )
         if not res.ok:

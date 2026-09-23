@@ -2,7 +2,7 @@
 name: drama-script
 description: 微短剧剧本创作，从选题到 50-100 集完稿。用户说"写短剧""做个微短剧剧本""短剧选题""分集大纲""剧本审核"或要做付费短剧时用。
 scope: content_type
-applies_to: [短视频, 文案]
+applies_to: [短剧, 文案]
 stage: [选题, 策划, 脚本, 审核]
 priority: 70
 version: 1.2.0

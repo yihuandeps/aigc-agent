@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +22,10 @@ from ...harness.tools.provider import (
     ToolSpec,
 )
 from ..assets.store import AssetStore, AssetType, local_copy
+from ..drama.format import global_max_cut
 from ..media import ffmpeg
-from ..pipeline.cutting import describe, plan_cuts
+from ..media.naming import unique_path
+from ..pipeline.cutting import describe, plan_aroll_cuts, plan_cuts
 
 _EXT = {AssetType.VIDEO: ".mp4", AssetType.AUDIO: ".mp3", AssetType.IMAGE: ".png"}
 
@@ -110,6 +113,33 @@ class VideoEditFunctions:
                             "否则画面短于旁白会把旁白截断。没配音时才用这个值。"
                         ),
                     },
+                    "aroll_id": {
+                        "type": "string",
+                        "description": (
+                            "口播出镜素材（真人对着镜头说话、带原声）的资产 id：它是主画面和整条"
+                            "音轨，clips 当 B-roll 穿插盖在画面上，口型对得上"
+                        ),
+                    },
+                    "cut_order": {
+                        "type": "string",
+                        "enum": ["brief", "rotate"],
+                        "description": "brief（默认）= 按 clips 顺序排刀、每段至少一刀；"
+                        "rotate = 各段轮流取（纯混剪）",
+                    },
+                    "weights": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "各段分几刀的权重（如简报里每镜的秒数），省略 = 平均",
+                    },
+                    "keep_whole": {
+                        "type": "boolean",
+                        "description": "整段顺序拼、不快切（只有素材本身已经剪好时才用；"
+                        "短剧片段会自动认出来）",
+                    },
+                    "aspect_ratio": {
+                        "type": "string",
+                        "description": "成片画幅，如 9:16：画布按它定，横屏素材裁切铺满，不留黑边",
+                    },
                 },
                 "required": ["clips"],
             },
@@ -181,6 +211,19 @@ class VideoEditFunctions:
         self.store.put(a)
         return target, ""
 
+    def _all_drama(self, clips: list[str]) -> bool:
+        """这批片段是不是短剧渲染出来的（带 shots_id 标签）：生成时已按时间线硬切过，不能再切。"""
+        if not clips:
+            return False
+        for aid in clips:
+            try:
+                tags = (self.store.get(aid).gen_params or {}).get("tags") or {}
+            except KeyError:
+                return False
+            if not isinstance(tags, dict) or not tags.get("shots_id"):
+                return False
+        return True
+
     # ---------- 实现 ----------
 
     async def _fn_fetch_asset_file(self, asset_ids: list[str]) -> ToolResult:
@@ -221,14 +264,36 @@ class VideoEditFunctions:
         max_cut_seconds: float = 0.0,
         min_cut_seconds: float = 1.2,
         total_seconds: float = 0.0,
+        aroll_id: str = "",
+        cut_order: str = "brief",
+        weights: list[float] | None = None,
+        keep_whole: bool = False,
+        aspect_ratio: str = "",
     ) -> ToolResult:
         if not ffmpeg.have_ffmpeg():
             return ToolResult(ok=False, error="环境里没有 ffmpeg/ffprobe，无法合成")
-        if not clips:
+        clips = list(clips or [])
+        if not clips and not aroll_id:
             return ToolResult(ok=False, error="clips 为空，至少要一段视频")
 
-        work = self.workspace / "compose" / f"c{int(time.time())}"
+        # 同一秒里两次合成（并行两集）不能共用工作目录
+        work = self.workspace / "compose" / f"c{int(time.time())}-{uuid.uuid4().hex[:6]}"
         work.mkdir(parents=True, exist_ok=True)
+        steps: list[str] = []
+
+        # 快切规则（用户 2026-09-20 定：每个镜头 ≤3 秒）：没传切点就按全局上限切 —— 之前
+        # max_cut_seconds 省略就整段拼，一镜 8 秒。短剧片段例外：生成时已按时间线硬切过，
+        # 再切会把台词剪断（片段带 shots_id 标签，认得出来）
+        cap = global_max_cut()
+        if not aroll_id and not keep_whole and (not max_cut_seconds or max_cut_seconds <= 0):
+            if self._all_drama(clips):
+                keep_whole = True
+            else:
+                max_cut_seconds = cap
+                steps.append(f"没传切点，按全局每刀 ≤{cap:g}s 快切")
+        if max_cut_seconds and max_cut_seconds > cap:
+            max_cut_seconds = cap
+        target = _canvas(aspect_ratio)
 
         # 1. 落盘
         paths: list[Path] = []
@@ -237,6 +302,11 @@ class VideoEditFunctions:
             if not p:
                 return ToolResult(ok=False, error=err)
             paths.append(p)
+        apath_a: Path | None = None
+        if aroll_id:
+            apath_a, err = await self._localize(aroll_id)
+            if not apath_a:
+                return ToolResult(ok=False, error=err)
 
         # 2. 配音先落盘 —— 成片时长要对齐口播，剪之前就得知道旁白多长
         apath: Path | None = None
@@ -247,8 +317,25 @@ class VideoEditFunctions:
 
         # 3. 拼接（可选快切）
         stage = work / "concat.mp4"
-        steps: list[str] = []
-        if max_cut_seconds and max_cut_seconds > 0:
+        if apath_a is not None:
+            # 口播出镜：出镜人是主画面、原声是整条音轨，B-roll 穿插（2026-09-23 审查：之前出镜
+            # 素材也被轮转、原声被丢，成片没声音没字幕）
+            a_len = (await ffmpeg.probe(apath_a)).duration or 0.0
+            b_lens = [(await ffmpeg.probe(pth)).duration or 0.0 for pth in paths]
+            cuts = plan_aroll_cuts(a_len, b_lens, max_cut_seconds or cap, min_cut_seconds)
+            if not cuts:
+                return ToolResult(ok=False, error="出镜素材时长探测不到，排不出剪辑表")
+            ok, err = await ffmpeg.concat_cuts(
+                [apath_a, *paths], [(c.clip, c.start, c.dur) for c in cuts], stage,
+                target_size=target, fill=target is not None,
+            )
+            if not ok:
+                return ToolResult(ok=False, error=f"出镜剪辑失败：{err}")
+            n_b = sum(1 for c in cuts if c.clip)
+            steps.append(f"出镜 {a_len:.0f}s 为主、穿插 B-roll {n_b} 刀（{describe(cuts)}）")
+            if not apath:
+                apath = apath_a  # 出镜人的原声就是音轨
+        elif max_cut_seconds and max_cut_seconds > 0 and not keep_whole:
             lens = [(await ffmpeg.probe(pth)).duration or 0.0 for pth in paths]
             # 有配音时**以配音长度为准**，而不是 total_seconds。
             # 画面短于旁白的话，mux_audio 会按画面长度把音频截掉 ——
@@ -256,17 +343,23 @@ class VideoEditFunctions:
             # 28 秒也可能是 35 秒，只有对齐音频才不会切词。
             voice_len = (await ffmpeg.probe(apath)).duration if apath else 0.0
             total = voice_len or total_seconds or sum(lens)
-            cuts = plan_cuts(lens, total, max_cut_seconds, min_cut_seconds)
+            # 默认按 clips 的顺序排刀（每段至少一刀、以最后一段收尾）：之前 i % n 轮转，
+            # 5 个镜头排成 1-2-3-4-5-1，多出来的镜头付了钱不出现（2026-09-23 审查）
+            cuts = plan_cuts(
+                lens, total, max_cut_seconds, min_cut_seconds,
+                ordered=cut_order != "rotate", weights=weights,
+            )
             if not cuts:
                 return ToolResult(ok=False, error="素材时长探测不到，排不出剪辑表")
             ok, err = await ffmpeg.concat_cuts(
-                paths, [(c.clip, c.start, c.dur) for c in cuts], stage
+                paths, [(c.clip, c.start, c.dur) for c in cuts], stage,
+                target_size=target, fill=target is not None,
             )
             if not ok:
                 return ToolResult(ok=False, error=f"快切拼接失败：{err}")
             steps.append(f"{len(paths)} 段素材剪成 {describe(cuts)}")
         else:
-            ok, err = await ffmpeg.concat(paths, stage)
+            ok, err = await ffmpeg.concat(paths, stage, target_size=target, fill=target is not None)
             if not ok:
                 return ToolResult(ok=False, error=f"拼接失败：{err}")
             steps.append(f"拼接 {len(paths)} 段")
@@ -297,8 +390,10 @@ class VideoEditFunctions:
         # 6. 导出
         target_dir = self._export_dir(out_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
-        name = _safe_name(filename) or f"video_{int(time.time())}.mp4"
-        final = target_dir / name
+        name = _safe_name(filename) or f"video_{time.strftime('%Y%m%d-%H%M%S')}.mp4"
+        # 同名不覆盖（2026-09-23 审查：{topic}_{date} 同一天重出直接盖掉旧成片，旧资产指向的文件
+        # 就变成了新内容）—— 撞名自动加 -2、-3
+        final = unique_path(target_dir, name)
         final.write_bytes(stage.read_bytes())
 
         info = await ffmpeg.probe(final)
@@ -312,7 +407,10 @@ class VideoEditFunctions:
                 + ([subtitle_id] if subtitle_id else [])
             ),
             creator="tool:compose_video",
-            gen_params={"clips": clips, "steps": steps},
+            gen_params={
+                "clips": clips, "steps": steps, "local": str(final),
+                **({"aroll": aroll_id} if aroll_id else {}),
+            },
         )
         asset.uri = str(final)
         asset.mime = "video/mp4"
@@ -327,6 +425,16 @@ class VideoEditFunctions:
             ),
             asset_ref=asset.id,
         )
+
+
+_CANVAS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080),
+           "3:4": (1080, 1440), "4:3": (1440, 1080)}
+
+
+def _canvas(aspect_ratio: str) -> tuple[int, int] | None:
+    """成片画布。给了画幅就按它，不再按第一段素材的尺寸 —— 第一镜是横屏素材时整片都成了横屏
+    （2026-09-23 审查）。没给返回 None（沿用老行为）。"""
+    return _CANVAS.get((aspect_ratio or "").strip())
 
 
 def _safe_name(name: str) -> str:

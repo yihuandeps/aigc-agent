@@ -157,24 +157,48 @@ def brief_prompt(
     min_seconds: int,
     max_seconds: int,
     notes: str = "",
+    *,
+    prompt_hint: str = "",
+    script_hint: str = "",
+    voiceover: bool = True,
+    shot_seconds: float = 3.0,
 ) -> str:
-    """给规划模型：从抓来的热点里分析归纳出新内容，并决定怎么做、做多长。"""
+    """给规划模型：从抓来的热点里分析归纳出新内容，并决定怎么做、做多长。
+
+    prompt_hint / script_hint：配方里这个风格最关键的写法要求（2026-09-23 审查：之前只喂风格名和
+    适用场景，ugc-vlog / product-ad 的写法要点只有老链在用，新链的简报根本没看到）。
+    voiceover=False：这个风格不配 TTS 口播（口播出镜靠出镜人原声、产品片靠画面）。
+    """
     facts = sources_text.strip() or "（没有抓到任何热点数据 —— 只能按常识写，务必在 risks 里注明）"
     extra = f"\n\n用户额外要求：{notes}" if notes else ""
+    chars = int(max_seconds * CHARS_PER_SECOND)
+    hints = ""
+    if prompt_hint.strip():
+        hints += f"\n\n这个风格的画面写法（配方要求，照做）：\n{prompt_hint.strip()}"
+    if script_hint.strip():
+        hints += "\n\n这个风格的口播写法：\n" + script_hint.strip().replace("{chars}", str(chars))
+    vo = (
+        "口播按每秒 4.5 字控制。"
+        if voiceover
+        else "**这个风格不配 TTS 口播**：script 写出镜人对着镜头要说的话（口播出镜）或旁白备选，"
+        "时长按画面和内容定，不按字数拉长。"
+    )
     return (
-        f"关键词：{keyword}\n风格：{style_label} —— {style_desc}{extra}\n\n"
-        "下面是刚从抖音/小红书抓到的相关热点（真实数据，带热度或互动数）：\n\n"
+        f"关键词：{keyword}\n风格：{style_label} —— {style_desc}{extra}{hints}\n\n"
+        "下面是抓到的热点材料（真实数据，带热度或互动数）。注意：标着「全站热榜」的和关键词"
+        "不一定有关 —— 只拿和关键词真正相关的条目当依据，无关的不要硬套成出处：\n\n"
         f"{facts}\n\n"
         "请完成三件事：\n"
         "1. **分析归纳**：把这些热点交叉比对，找出真正在发生的事、大家关心的点、"
         "还没被讲透的角度，归纳成一段**新的内容**（不是复述某一条）。事实只能来自上面的材料，"
         "每条依据标明出处；材料里没有的数字不要编，用定性描述。\n"
         f"2. **决定做法与时长**：时长在 {min_seconds}–{max_seconds} 秒之间，由内容密度决定"
-        "（信息点多、需要举例就长；一个爆点讲透就短），说明理由。口播按每秒 4.5 字控制。\n"
+        f"（信息点多、需要举例就长；一个爆点讲透就短），说明理由。{vo}\n"
         "3. **分镜与素材来源**：每个镜头写成具体可拍的画面。能用 AI 生成的标 source=generate；"
         "必须用真实画面的（真实产品/人物/事件现场、真实数据截图、用户本人出镜）标 source=real，"
         "写清 real_need（要什么素材）和 search_terms（去素材站搜的英文关键词，2–4 个）。"
-        "画面里不要出现文字、字幕、logo。\n\n"
+        "画面里不要出现文字、字幕、logo。镜头按播放顺序排（成片按这个顺序剪），"
+        "镜头数不要多于「时长 ÷ 每刀秒数」—— 多出来的镜头进不了成片。\n\n"
         "只输出一个 JSON：\n"
         "{\n"
         '  "angle": "切入角度一句话",\n'
@@ -185,7 +209,7 @@ def brief_prompt(
         '  "duration_seconds": 30,\n'
         '  "why_duration": "为什么是这个时长",\n'
         '  "script": "口播全文",\n'
-        '  "shots": [{"desc": "画面", "seconds": 5, "source": "generate", '
+        f'  "shots": [{{"desc": "画面", "seconds": {shot_seconds:g}, "source": "generate", '
         '"real_need": "", "search_terms": []}],\n'
         '  "risks": ["事实存疑/合规/版权提示"]\n'
         "}"
@@ -202,9 +226,17 @@ def _unwrap_json(text: str) -> str:
 
 
 def parse_brief(
-    text: str, keyword: str, style: str, min_seconds: int, max_seconds: int
+    text: str,
+    keyword: str,
+    style: str,
+    min_seconds: int,
+    max_seconds: int,
+    voiceover: bool = True,
 ) -> tuple[Brief | None, list[str]]:
-    """解析规划模型的输出并校验。返回 (简报, 警告)。解析不出来简报为 None。"""
+    """解析规划模型的输出并校验。返回 (简报, 警告)。解析不出来简报为 None。
+
+    voiceover=False 的风格不按口播字数拉长时长（2026-09-23 审查：实测关了口播的配方
+    15 秒被拉到 20 秒）。"""
     try:
         data = json.loads(_unwrap_json(text))
     except json.JSONDecodeError as e:
@@ -243,7 +275,7 @@ def parse_brief(
         )
         want = clamped
     need = math.ceil(len(b.script) / CHARS_PER_SECOND)
-    if need > want * 1.15:
+    if voiceover and need > want * 1.15:
         new = min(max_seconds, need)
         warns.append(f"口播 {len(b.script)} 字约需 {need}s，时长从 {want}s 调到 {new}s")
         if need > max_seconds:
@@ -319,12 +351,16 @@ def parse_material_reply(text: str, indices: list[int]) -> dict[int, tuple[str, 
         return {i: ("online", "") for i in indices}
     if re.search(r"(都|全部|全都)\s*生成", t):
         return {i: ("generate", "") for i in indices}
-    # 逐镜：第3镜 xxx  /  3: xxx  /  3 xxx
-    for m in re.finditer(r"(?:第\s*(\d+)\s*镜|(?<![\d.])(\d+)\s*[:：、])\s*([^\n；;]+)", t):
+    # 逐镜：第3镜 xxx  /  3: xxx。一段到下一个「第N镜」为止 —— 之前只按换行和分号断，
+    # 「第1镜 生成，第2镜 联网找」只认出第 1 镜；路径后面跟着逗号还会把后半句吞进路径
+    marks = list(_MARK.finditer(t))
+    for k, m in enumerate(marks):
         i = int(m.group(1) or m.group(2))
         if i not in indices:
             continue
-        body = m.group(3).strip().strip("「」\"' ")
+        end = marks[k + 1].start() if k + 1 < len(marks) else len(t)
+        body = re.split(r"[\n；;]", t[m.end() : end], maxsplit=1)[0]
+        body = body.strip().strip("「」\"' ").rstrip("，,。、 ").strip("「」\"' ")
         # 先认路径：目录名里可能带"生成""联网"这种词（如 E:\AI生成\...），不能先按关键词判
         if _looks_like_path(body):
             out[i] = ("file", body)
@@ -334,6 +370,8 @@ def parse_material_reply(text: str, indices: list[int]) -> dict[int, tuple[str, 
             out[i] = ("generate", "")
     return out
 
+
+_MARK = re.compile(r"第\s*(\d+)\s*镜|(?<![\d.\w])(\d+)\s*[:：、]")
 
 _PATH_HINT = re.compile(
     r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|~[\\/]|\./)|\.(?:mp4|mov|mkv|webm|avi|m4v|png|jpe?g|webp|gif)$",

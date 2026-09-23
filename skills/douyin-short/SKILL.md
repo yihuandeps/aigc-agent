@@ -2,7 +2,7 @@
 name: douyin-short
 description: 做一条抖音/小红书短视频：用户给关键词、确认风格后，先 RPA 抓两平台热点，归纳成新内容，再定时长与分镜、补实拍素材（问人或联网找）、出片复核。用户说"做条抖音""做个短视频""这个关键词做条视频"时用。
 scope: content_type
-applies_to: [短视频]
+applies_to: [抖音]
 stage: [选题, 策划, 脚本, 分镜]
 priority: 75
 version: 1.0.0

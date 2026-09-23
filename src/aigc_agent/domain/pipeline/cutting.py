@@ -46,26 +46,141 @@ def plan_cuts(
     max_seconds: float = 3.0,
     min_seconds: float = 1.2,
     seed: int | None = None,
+    ordered: bool = False,
+    weights: list[float] | None = None,
 ) -> list[Cut]:
     """排出一张剪辑表，总长正好等于 total。
 
     max_seconds 是硬约束 —— 返回的每一刀都不会超过它。
+    ordered=True：按素材顺序排（简报顺序），每段素材至少一刀、最后一刀落在最后一段；
+    weights 给各段的分量（简报里每镜的秒数），分量大的多分几刀。
     """
     usable = [s for s in clip_seconds if s > 0]
     if not usable or total <= 0:
         return []
     if total <= max_seconds:
         return [Cut(0, 0.0, min(total, clip_seconds[0]))]
+    if ordered:
+        return _plan_ordered(clip_seconds, total, max_seconds, min_seconds, seed, weights)
 
     lens = _lengths(total, max_seconds, min_seconds, seed)
     return _assign(lens, clip_seconds)
 
 
+def _plan_ordered(
+    clip_seconds: list[float],
+    total: float,
+    max_s: float,
+    min_s: float,
+    seed: int | None,
+    weights: list[float] | None,
+) -> list[Cut]:
+    """按简报顺序排刀（2026-09-23 审查）：之前 i % n 轮转 —— 5 个镜头排成 1-2-3-4-5-1，
+    广告没能以英雄帧收尾；8 个镜头只切 6 刀时，第 7、8 镜付了钱却不出现在成片里。"""
+    n_clips = len(clip_seconds)
+    hi = math.floor(total / min_s + 1e-9) if min_s > 0 else n_clips
+    n = max(_cut_count(total, max_s, min_s), min(n_clips, max(1, hi)))
+    lens = _lengths(total, max_s, min_s, seed, n=n)
+    w = weights if weights and len(weights) == n_clips else [1.0] * n_clips
+    counts = _apportion(len(lens), w)
+    cuts: list[Cut] = []
+    k = 0
+    for c, cnt in enumerate(counts):
+        cuts += _windows(c, lens[k : k + cnt], clip_seconds[c])
+        k += cnt
+    return cuts
+
+
+def _apportion(n: int, weights: list[float]) -> list[int]:
+    """n 刀按权重分给各段，每段至少 1 刀（刀数不够时只有前 n 段有）。最大余数法。"""
+    m = len(weights)
+    if n < m:
+        return [1] * n + [0] * (m - n)
+    ws = [max(0.0, float(x)) for x in weights]
+    if not sum(ws):
+        ws = [1.0] * m
+    total_w = sum(ws)
+    raw = [n * x / total_w for x in ws]
+    cnt = [max(1, int(r)) for r in raw]
+    # 保底 1 刀抬多了：从分得比份额多、又不止 1 刀的里面扣
+    while sum(cnt) > n:
+        i = max((i for i in range(m) if cnt[i] > 1), key=lambda i: cnt[i] - raw[i])
+        cnt[i] -= 1
+    # 还差：按余数大的补
+    for i in sorted(range(m), key=lambda i: raw[i] - cnt[i], reverse=True)[: n - sum(cnt)]:
+        cnt[i] += 1
+    return cnt
+
+
+def _windows(clip: int, durs: list[float], avail: float) -> list[Cut]:
+    """同一段素材的几刀在素材里错开取（中间跳过一截），接起来是跳切，不是连续帧看不出切点。"""
+    if not durs:
+        return []
+    takes = [min(d, avail) for d in durs]
+    gap = max(0.0, avail - sum(takes)) / len(takes) if len(takes) > 1 else 0.0
+    out: list[Cut] = []
+    t = 0.0
+    for d in takes:
+        start = min(t, max(avail - d, 0.0))
+        out.append(Cut(clip, round(start, 3), round(d, 3)))
+        t = start + d + gap
+    return out
+
+
+def plan_aroll_cuts(
+    aroll_seconds: float,
+    broll_seconds: list[float],
+    max_seconds: float = 3.0,
+    min_seconds: float = 1.2,
+    every: int = 2,
+    seed: int | None = None,
+) -> list[Cut]:
+    """口播出镜：出镜素材（A-roll，下标 0）是主画面、它的原声是整条音轨；每隔 every 刀
+    插一刀 B-roll（下标 1..）盖住画面，声音仍是出镜人的。成片时间线 = 出镜素材的时间线，
+    A-roll 的刀按原时间取，口型对得上。每刀 ≤ max_seconds，第一刀和最后一刀都是出镜人。
+
+    2026-09-23 审查：之前出镜素材和 B-roll 一起轮转、原声被 a=0 丢掉 —— 成片没声音没字幕，
+    出镜画面每 5 刀才回来一次。
+    """
+    if aroll_seconds <= 0:
+        return []
+    lens = _lengths(aroll_seconds, max_seconds, min_seconds, seed)
+    cuts: list[Cut] = []
+    cursors = [0.0] * len(broll_seconds)
+    t = 0.0
+    b = 0
+    for i, d in enumerate(lens):
+        use_b = bool(broll_seconds) and i % (every + 1) == every and i < len(lens) - 1
+        if use_b:
+            c = b % len(broll_seconds)
+            b += 1
+            avail = broll_seconds[c]
+            take = min(d, avail)
+            start = cursors[c] if cursors[c] + take <= avail + 1e-6 else 0.0
+            cuts.append(Cut(c + 1, round(start, 3), round(take, 3)))
+            cursors[c] = start + take
+            t += take
+        else:
+            take = min(d, max(0.0, aroll_seconds - t))
+            if take <= 1e-3:
+                break
+            cuts.append(Cut(0, round(t, 3), round(take, 3)))
+            t += take
+    # B-roll 比计划短时时间线会提前结束：剩下的用出镜人补齐（每刀仍不超过上限）
+    while aroll_seconds - t > 1e-3:
+        d = min(max_seconds, aroll_seconds - t)
+        cuts.append(Cut(0, round(t, 3), round(d, 3)))
+        t += d
+    return cuts
+
+
 # ---------- 单刀时长 ----------
 
 
-def _lengths(total: float, max_s: float, min_s: float, seed: int | None) -> list[float]:
-    n = _cut_count(total, max_s, min_s)
+def _lengths(
+    total: float, max_s: float, min_s: float, seed: int | None, n: int | None = None
+) -> list[float]:
+    n = n or _cut_count(total, max_s, min_s)
     rng = random.Random(seed if seed is not None else 0)
     factors = [rng.uniform(_JITTER_LOW, _JITTER_HIGH) for _ in range(n)]
 

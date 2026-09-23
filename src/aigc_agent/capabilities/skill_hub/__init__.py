@@ -46,6 +46,8 @@ _SKIP_PREFIX = "_"
 _FM = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.S)
 
 # scope 特异性：冲突时越具体的越优先
+# 细分的内容形态 → 上位形态
+_PARENT_TYPE = {"短剧": "短视频", "抖音": "短视频", "广告": "短视频"}
 _SCOPE_RANK = {"account": 3, "content_type": 2, "pipeline_stage": 1, "global": 0}
 
 # 这个优先级及以上的 skill（合规类）不参与预算降级、永不被挤出
@@ -122,9 +124,16 @@ class Skill:
         return head + nl + nl.join(lines)
 
     def matches(self, content_type: str = "", stage: str = "") -> bool:
-        """规则预筛。模型判断之前先用规则滤掉不相关的，不消耗任何 token。"""
-        if content_type and self.applies_to and content_type not in self.applies_to:
-            return False
+        """规则预筛。模型判断之前先用规则滤掉不相关的，不消耗任何 token。
+
+        「短剧 / 抖音 / 广告」都属于「短视频」：写 applies_to: [短视频] 的 skill 三条视频产线
+        都生效；写得具体的（[抖音]）只在那条产线出现。
+        """
+        if content_type and self.applies_to:
+            wanted = {content_type, _PARENT_TYPE.get(content_type, content_type)}
+            wanted |= {k for k, v in _PARENT_TYPE.items() if v == content_type}
+            if not wanted & set(self.applies_to):
+                return False
         return not (stage and self.stage and stage not in self.stage)
 
     @property

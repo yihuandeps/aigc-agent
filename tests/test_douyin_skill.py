@@ -36,7 +36,7 @@ def test_frontmatter符合skill_hub约定():
     assert fm["name"] == "douyin-viral-analyzer"
     assert fm["status"] == "active"
     assert fm["scope"] == "content_type"
-    assert fm["applies_to"] == ["短视频"]
+    assert fm["applies_to"] == ["抖音"]
     assert set(fm["stage"]) <= {"选题", "策划", "脚本", "分镜", "正文", "配图", "排版", "审核"}
     assert 0 <= fm["priority"] <= 100
 

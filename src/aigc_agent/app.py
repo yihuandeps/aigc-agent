@@ -265,7 +265,8 @@ class Agent:
         registry.register(MaterialFunctions(assets, workspace))
         registry.register(
             ShortVideoFunctions(
-                gateway, assets, registry, catalog, bus=bus, output=output_prefs, files=files
+                gateway, assets, registry, catalog, bus=bus, output=output_prefs, files=files,
+                hosting=hosting,
             )
         )
         # 生图 / 生视频（prefs = 产物目录，生成成功自动落本地副本）

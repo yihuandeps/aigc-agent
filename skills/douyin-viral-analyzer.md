@@ -2,7 +2,7 @@
 name: douyin-viral-analyzer
 description: 拆解抖音/TikTok 爆款短视频，反推爆款原因并产出可复刻的脚本公式与选题变体。用户贴抖音链接/分享口令、说"分析这条抖音""为什么这条火了""我要复刻这条""竞品视频分析"时用。
 scope: content_type
-applies_to: [短视频]
+applies_to: [抖音]
 stage: [选题, 策划, 脚本]
 priority: 70
 version: 1.0.0
