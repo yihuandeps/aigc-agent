@@ -1,0 +1,65 @@
+# ============================================================
+# 口播出镜 —— 真人讲，AI 出 B-roll
+# ============================================================
+# 适合：观点/解读/避坑类。主画面是用户自己的出镜实拍（或一段固定机位的口播素材），
+# 中间穿插 AI 生成的示意镜头。没有出镜素材时会向用户要，或退化成纯 B-roll + 配音。
+
+name: 口播出镜
+description: 45 秒竖屏，真人出镜口播为主，AI 生成 B-roll 穿插，字幕
+
+style:
+  label: 口播出镜
+  when: 讲观点、做解读、说避坑，需要"人"的可信度；主画面是真人出镜，穿插 AI 示意镜头
+  footage: real
+  min_seconds: 30
+  max_seconds: 60
+
+output:
+  duration: 45
+  aspect_ratio: "9:16"
+  resolution: "720p"
+  filename: "{topic}_{date}.mp4"
+
+grounding:
+  enabled: true
+  source: douyin_hot
+  category: ""
+  top: 15
+  pick_hint: |
+    选有争议、有分歧、大家会站队的点 —— 口播的价值在观点，不在信息量。
+
+cut:
+  enabled: true
+  max_seconds: 4 # 口播镜头可以稍长，切太碎会打断说话的连贯
+  min_seconds: 2
+
+shots:
+  count: 5
+  seconds_each: 8
+  style: 自然光，浅景深，手持轻微晃动，生活化场景，真实感
+  realism: auto
+  prompt_hint: |
+    B-roll 镜头是"给口播配画面"，要具体、单一主体、一眼看懂；
+    不要出现文字、logo；不要再生成一个"讲话的人" —— 说话的人是用户自己的实拍。
+
+voiceover:
+  enabled: false # 口播由出镜素材自带；没有出镜素材时改成 true 用 TTS 兜底
+  voice: auto
+  speed: 1.0
+  instruct: 自然口语，像和朋友聊天
+  script_hint: |
+    这是要对着镜头说的话。短句、口语、有态度，一句只说一件事，
+    总字数不要超过 {chars} 字。
+
+subtitle:
+  enabled: true
+  source: asr
+  language: zh
+
+models:
+  video_tier: balanced
+  tts_model: ""
+
+review:
+  after_script: true
+  after_compose: true

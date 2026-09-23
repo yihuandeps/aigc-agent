@@ -1,0 +1,241 @@
+/* ========== 页面 ========== */
+@page {
+  size: A4;
+  margin: 18mm 16mm 20mm 16mm;
+  @bottom-center {
+    content: counter(page) " / " counter(pages);
+    font-family: -apple-system, "PingFang SC", sans-serif;
+    font-size: 9pt;
+    color: #999;
+  }
+}
+
+/* ========== 基础排版 ========== */
+* { box-sizing: border-box; }
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Helvetica Neue", sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.7;
+  color: #1d1d1f;
+  background: #ffffff;
+  margin: 0;
+  padding: 0;
+  font-feature-settings: "kern" 1, "liga" 1;
+}
+
+/* ========== 标题层级 ========== */
+h1 {
+  font-size: 22pt;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  color: #1d1d1f;
+  margin: 0 0 24pt 0;
+  padding-bottom: 14pt;
+  border-bottom: 2pt solid #cc2229;
+  line-height: 1.35;
+  page-break-after: avoid;
+}
+
+h2 {
+  font-size: 15pt;
+  font-weight: 700;
+  color: #1d1d1f;
+  margin: 28pt 0 12pt 0;
+  padding-left: 10pt;
+  border-left: 4pt solid #cc2229;
+  line-height: 1.4;
+  page-break-after: avoid;
+}
+
+h3 {
+  font-size: 12.5pt;
+  font-weight: 600;
+  color: #2c2c2e;
+  margin: 18pt 0 8pt 0;
+  line-height: 1.5;
+  page-break-after: avoid;
+}
+
+h4 {
+  font-size: 11pt;
+  font-weight: 600;
+  color: #48484a;
+  margin: 14pt 0 6pt 0;
+  line-height: 1.5;
+  page-break-after: avoid;
+}
+
+/* ========== 段落 & 强调 ========== */
+p {
+  margin: 0 0 10pt 0;
+  text-align: justify;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+strong, b {
+  font-weight: 600;
+  color: #1d1d1f;
+}
+
+em, i {
+  font-style: italic;
+  color: #3a3a3c;
+}
+
+/* ========== 引用块（用作核心金句） ========== */
+blockquote {
+  margin: 14pt 0;
+  padding: 12pt 16pt 12pt 18pt;
+  background: #faf7f4;
+  border-left: 4pt solid #cc2229;
+  border-radius: 0 4pt 4pt 0;
+  font-size: 11pt;
+  font-weight: 500;
+  color: #2c2c2e;
+  line-height: 1.65;
+  page-break-inside: avoid;
+}
+
+blockquote p { margin: 0; }
+blockquote p + p { margin-top: 6pt; }
+
+/* ========== 列表 ========== */
+ul, ol {
+  margin: 8pt 0 12pt 0;
+  padding-left: 22pt;
+}
+
+li {
+  margin-bottom: 5pt;
+  line-height: 1.65;
+}
+
+li > ul, li > ol {
+  margin: 5pt 0 5pt 0;
+}
+
+/* ========== 表格 ========== */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12pt 0 16pt 0;
+  font-size: 9.8pt;
+  page-break-inside: avoid;
+  background: white;
+  border: 1pt solid #e5e5e7;
+  border-radius: 4pt;
+  overflow: hidden;
+}
+
+th {
+  background: #2c2c2e;
+  color: #ffffff;
+  font-weight: 600;
+  text-align: left;
+  padding: 8pt 10pt;
+  letter-spacing: 0.2px;
+  font-size: 9.5pt;
+}
+
+td {
+  padding: 7pt 10pt;
+  border-top: 0.5pt solid #e5e5e7;
+  vertical-align: top;
+  line-height: 1.5;
+}
+
+tbody tr:nth-child(even) td {
+  background: #fafafa;
+}
+
+tbody tr:hover td {
+  background: #fef5f5;
+}
+
+/* 让表格内的数字右对齐更易读 */
+td:last-child, th:last-child {
+  /* 可按需调整 */
+}
+
+/* ========== 代码 ========== */
+code {
+  font-family: "SF Mono", "Menlo", "Monaco", "Consolas", monospace;
+  font-size: 9.5pt;
+  background: #f2f2f4;
+  padding: 1pt 5pt;
+  border-radius: 3pt;
+  color: #cc2229;
+}
+
+pre {
+  background: #1d1d1f;
+  color: #e8e8ed;
+  padding: 12pt 14pt;
+  border-radius: 5pt;
+  font-size: 9pt;
+  line-height: 1.55;
+  overflow-x: auto;
+  margin: 12pt 0;
+  page-break-inside: avoid;
+}
+
+pre code {
+  background: none;
+  color: inherit;
+  padding: 0;
+  font-size: inherit;
+}
+
+/* ========== 图片（高光时刻截图） ========== */
+img {
+  display: block;
+  max-width: 88%;
+  margin: 14pt auto 6pt auto;
+  border-radius: 6pt;
+  box-shadow: 0 1pt 6pt rgba(0,0,0,0.12);
+  page-break-inside: avoid;
+}
+
+/* 图片下面紧跟的段落作为 caption */
+img + em, p > em:only-child {
+  display: block;
+  text-align: center;
+  font-size: 9pt;
+  color: #6e6e73;
+  font-style: italic;
+  margin: 0 auto 18pt auto;
+  max-width: 80%;
+}
+
+/* ========== 分割线 ========== */
+hr {
+  border: none;
+  height: 1pt;
+  background: linear-gradient(to right, transparent, #d2d2d7 30%, #d2d2d7 70%, transparent);
+  margin: 22pt 0;
+}
+
+/* ========== 链接 ========== */
+a {
+  color: #cc2229;
+  text-decoration: none;
+  border-bottom: 0.5pt dotted #cc2229;
+}
+
+/* ========== 工具类（在 markdown 里用 attr_list 标记） ========== */
+
+/* 第一节 H1 不前置分页 */
+h1:first-of-type {
+  page-break-before: avoid;
+}
+
+/* 后面的 H1 强制分页（如果文档有多 H1） */
+h1 + * { page-break-before: avoid; }
+body > h1 ~ h1 { page-break-before: always; }

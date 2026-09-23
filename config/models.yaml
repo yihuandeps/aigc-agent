@@ -1,0 +1,296 @@
+# ============================================================
+# 模型配置 —— 由 Model Gateway (M2) 读取
+# ============================================================
+#
+# 原则：
+#   1. 密钥一律用 ${ENV_VAR} 引用，绝不写进本文件。
+#   2. 按 modality 分族（chat / image / video / audio / embedding）。
+#      Gateway 屏蔽提供方差异，上层只说"我要一张封面图"，不关心谁生成。
+#   3. 主 Agent 的 chat 走 Kimi，但这是配置不是依赖——换供应商只改这里。
+# ============================================================
+
+
+# ============================================================
+# 文本 —— 全部任务统一走 Kimi K3
+# ============================================================
+#
+# 所有涉及文本的调用（主 Agent、记忆提取、条件判断、摘要、子代理、
+# 合规初审）都用同一个模型。好处是行为一致、调试简单、没有"这段怎么
+# 变笨了"的困惑。
+#
+# 但**角色名这层壳保留**：下面 roles 里每个键都是一个具名角色，
+# 现在全部指向 kimi_k3。将来某个高频角色想换便宜模型时，只改这里
+# 一行，不用回头找调用点。
+#   —— 同 ToolProvider 接口的思路：留住接缝，哪怕当前只有一个实现。
+# ============================================================
+
+text:
+
+  providers:
+
+    kimi_k3:
+      vendor: moonshot
+      protocol: openai_compatible
+
+      # ⚠️ 2026-09-11 实测校准：Kimi Code 和 platform.moonshot.cn 是**两条产品线**，
+      #    端点完全不同。sk-kimi- 前缀的 key 打 api.moonshot.cn 一律 401，
+      #    正确端点是下面这个。之前排查了很久，别再改回去。
+      base_url: https://api.kimi.com/coding/v1
+
+      api_key: ${KIMI_API_KEY}
+
+      # 可用：k3(1M) / k3-256k / kimi-for-coding(K2.8) / kimi-for-coding-highspeed
+      # 选 k3-256k：与 capability_budget.yaml 的 256K 预算对齐
+      model: k3-256k
+
+      context_window: 262144
+      # ⚠️ 这些模型 supports_thinking_type = "only"，**强制思考**。
+      #    max_tokens 是「推理 + 正文」的总额度，给小了会只有推理没有正文
+      #    （实测 max_tokens=120 时 117 个全花在推理上，content 为空）。
+      #    所以这里给得比一般模型宽。
+      max_output_tokens: 8192
+
+      retry:
+        max_attempts: 3
+        # 连接类错误（代理抖动/DNS/VPN 重连）单独给更深的重试：这类服务端根本没收到请求，
+        # 重发没有副作用。2026-09-19 实测：3 次 0.5s/1.0s 总共才等 1.5 秒，
+        # 代理抖一下就整轮判死，6 次迭代 ¥1 的活白做。
+        connect_max_attempts: 6      # 0.5+1+2+4+8+15 ≈ 30 秒的容忍
+        backoff: exponential
+        initial_delay_ms: 500
+        max_delay_ms: 15000
+        jitter: 0.25
+        retry_on: [429, 500, 502, 503, 504, timeout]
+
+      timeout_seconds: 180
+      stream: true
+
+      # 强制思考的模型不许调这些，传了直接 400
+      unsupported_params: [temperature, top_p]
+
+      # ⚠️ 这个端点（Kimi Code）是**订阅额度制**，不按 token 开账单：额度每 7 天
+      #    刷新、另有 5 小时滚动频控窗口，用完可买「加油包」按实际用量扣费。
+      #    所以下面填的是 platform.kimi.com 公布的 kimi-k3 **参考价**（2026-09-12 核对：
+      #    输入 ¥20 / 命中缓存 ¥2 / 输出 ¥100，每百万 token）。用途只有一个：
+      #    让 Cost Guard 能按金额估算本次任务吃了多少额度。它不是账单，账单看
+      #    kimi.com 的用量页。换到 platform.kimi.com 的按量 key 时这三个数就是真价。
+      pricing:
+        input_per_mtok: 20
+        output_per_mtok: 100
+        cached_input_per_mtok: 2     # 十分之一 —— 这就是批量驱逐要保住的收益
+
+    # 短剧流水线专用。用户的三段 system prompt 是按 Gemini 调的，
+    # 换模型会让那些约束的效果漂移（族裔锁定、台词逐字还原这些尤其敏感）。
+    # ⚠️ APIMart 上**没有纯 gemini-3.1-flash**，只有 lite 和 pro：
+    #    三步都是长文本结构化输出，lite 容易塌（漏集、JSON 截断），所以用 pro。
+    gemini_31:
+      vendor: google-via-apimart
+      protocol: openai_compatible
+      base_url: https://api.apimart.ai/v1
+      api_key: ${APIMART_API_KEY}
+      model: gemini-3.1-pro-preview
+      timeout_seconds: 300          # 拆整集剧本输出很长，180 会超时
+
+
+  # 降级链：主模型不可用时按顺序尝试
+  fallback_chain: []
+    # 建议至少配一个备用，避免单点故障导致整个 Agent 停摆。
+
+
+  # ---------- 角色映射 ----------
+  # 每个角色代表一类文本任务。现在全部指向 kimi_k3。
+  roles:
+
+    main_agent:       kimi_k3    # 主对话 Loop（M1）
+    node_agent:       kimi_k3    # Graph 的 agent 节点内 Loop（M1）
+    subagent:         kimi_k3    # 子代理（M10）
+
+    memory_extract:   kimi_k3    # 关键词提取，M8.2 轻量模式
+                                 # ⚠️ 高频：每 5 轮触发一次，打包 5 轮内容
+    memory_consolidate: kimi_k3  # 冲突消解/晋升/提炼，M8.2 完整模式
+    memory_recall:    kimi_k3    # 生成 Memory Brief
+
+    router_decision:  kimi_k3    # Graph 的 router 节点条件判断
+                                 # 能用规则判的优先走规则，别调模型
+    summarize:        kimi_k3    # 上下文压缩、资产摘要
+    skill_select:     kimi_k3    # Skill Hub 的候选筛选（M7）
+    compliance_check: kimi_k3    # 合规初审（M15）
+    drama:            gemini_31  # 短剧三段式：分镜脚本 / 资产库 / 视频提示词
+    drama_prose:      gemini_31  # 一句话想法 → 剧本 / 扩写：散文输出，不套 drama 的 JSON 约束
+    episode_writer:   kimi_k3    # 逐集写剧本的子代理（2026-09-17 写作从主循环搬出来）
+    realism_check:    kimi_k3    # 人物参考图生成后的真实感校验（看图判磨皮/毛孔/硬光，2026-09-18）
+    vision:           kimi_k3    # 看图 / 看视频（view_image / view_video，2026-09-18）
+    short_video_planner: kimi_k3 # 抖音分支：热点 → 归纳新内容 + 定时长/分镜/素材来源（2026-09-18）
+    voice_select:     kimi_k3    # 按文案语气挑音色与语速
+    storyboard:       kimi_k3    # 剧本/参考视频 → 分镜（角色护照）
+                                 # ⚠️ 参考视频那条路会一次喂十几张图
+
+
+  # ---------- 分角色参数覆盖 ----------
+  # 同一个模型，不同角色的调用参数可以不同。
+  # thinking.effort 可选 low / high / max。强制思考的模型上，
+  # 抽取/路由这类机械任务用 low 省钱省时，创作类用 high。
+  role_params:
+    memory_extract:
+      temperature: 0.1           # 抽取任务要稳定，不要发挥
+      max_output_tokens: 2048    # 含推理额度，别再压低
+      response_format: json      # 输出 Keyword[] 结构，见 M8.0
+      thinking_effort: low
+    router_decision:
+      temperature: 0
+      max_output_tokens: 1024    # 原来给 256，强制思考下会被推理吃光
+      thinking_effort: low
+    skill_select:
+      thinking_effort: low
+    summarize:
+      thinking_effort: low
+    compliance_check:
+      temperature: 0
+      thinking_effort: high      # 合规判断要想清楚
+    main_agent:
+      temperature: 0.7           # 创作类留发挥空间
+      thinking_effort: high
+    node_agent:
+      temperature: 0.7
+      thinking_effort: high
+    drama:
+      temperature: 0.8           # 分镜是创作，要留发挥空间
+      max_output_tokens: 32768   # 一集十几场、每场上百字，给不够会被截断
+      response_format: json      # 三步的契约都是严格 JSON
+    drama_prose:
+      temperature: 0.8
+      max_output_tokens: 32768   # 写剧本/扩写是散文，不要 JSON —— 之前被 drama 的 json 连带，
+                                 # 吐出 {"script": "..."} 还得剥壳
+    episode_writer:
+      temperature: 0.8
+      thinking_effort: high      # 创作类
+      max_output_tokens: 16384   # 一集 800–1500 字 + 推理额度；8192 被推理吃光过两次
+    realism_check:
+      thinking_effort: low       # 看图打分，不需要深思
+      response_format: json
+      max_output_tokens: 1024
+    vision:
+      thinking_effort: low       # 描述看到的东西，不需要推理
+      max_output_tokens: 3000    # 一段视频八帧的分镜级描述要写不少字
+    short_video_planner:
+      temperature: 0.6
+      thinking_effort: medium    # 要交叉比对热点、判断时长，比写描述多想一步
+      response_format: json
+      max_output_tokens: 6000    # 简报 + 口播 + 分镜一起出
+    voice_select:
+      temperature: 0.3           # 选音色要稳，不要每次跑出不同结果
+      thinking_effort: low       # 从十几个选项里挑一个，不需要深思
+      max_output_tokens: 1024
+    storyboard:
+      temperature: 0.7           # 分镜是创作，要留发挥空间
+      # 但**不能用 high**：参考视频那条路一次要读十几张图，
+      # 高强度思考叠上视觉输入会直接顶穿 180 秒超时（实测 8 帧就挂）。
+      # 画面编排靠的是把要求写清楚，不是靠模型多想。
+      thinking_effort: low
+      max_output_tokens: 8192    # 十几个镜头的英文提示词，给够
+
+
+  # ---------- 成本提示 ----------
+  # 全部走 K3 意味着高频后台任务也按主模型计价。三个高频点：
+  #   · memory_extract  每 5 轮一次
+  #   · router_decision 每次图运行 × 分支节点数
+  #   · skill_select    每次节点启动
+  # 起步阶段量小，不用管。等 Cost Guard 的日志跑出真实占比后再看要不要
+  # 把其中某个角色单独换成便宜模型——改上面 roles 的一行即可。
+
+
+# ---------- 其余 modality：待定 ----------
+# 见 ARCHITECTURE.md 开放问题 #2。Kimi K3 覆盖全部文本任务，
+# 下面这些非文本 modality 要各自选供应商。
+# M2 的 ModelProvider 接口已经把差异隔离了，定下来后在这里加配置即可，
+# 不动上层代码。
+
+# 图像与视频都走 APIMart 聚合网关（OpenAI 兼容 + 异步任务）。
+# 具体挑哪个模型由 config/media_models.yaml 的目录决定，模型可自由选型。
+image: &apimart
+  default: apimart
+  providers:
+    apimart:
+      vendor: apimart
+      protocol: apimart_task           # 提交 → 轮询 /v1/tasks/{id} → 取回
+      base_url: https://api.apimart.ai/v1
+      api_key: ${APIMART_API_KEY}
+      submit_path: /{kind}s/generations
+      poll_path: /tasks/{task_id}
+      timeout_seconds: 60
+
+    # 只用来做 TTS。接它的唯一理由：APIMart 那 364 个模型里没有一个
+    # 中文原生 TTS，只有 OpenAI 的英文音色库，中文口播听着假是先天的。
+    # 启用方式：填好下面两个环境变量 + media_models.yaml 里 tts_provider: minimax
+    minimax:
+      vendor: minimax
+      protocol: minimax_t2a            # POST /v1/t2a_v2，音频是 hex 字符串
+      # ⚠️ **国内站和国际站是两条产品线**，账号和余额都不通：
+      #      platform.minimax.cn  → api.minimax.cn      （用这个）
+      #      platform.minimaxi.com → api.minimaxi.com
+      #    和 Kimi Code vs platform.moonshot.cn 是同一类坑，别改回去。
+      #    备用域名 api-bj.minimaxi.com 也通同一个账号。
+      base_url: https://api.minimax.cn
+      api_key: ${MINIMAX_API_KEY}
+      # 新式 sk-api- key **不需要** GroupId，传了反而 1004 token not match group。
+      # 只有老式 key 才填。
+      group_id: ${MINIMAX_GROUP_ID}
+      timeout_seconds: 120
+
+video: *apimart                        # 同一个网关，异步任务模型见 M2
+
+# TTS 同步返回音频字节流、ASR 走 multipart 上传 —— 与异步任务模型不同，
+# 由 M2 的 audio.py 处理。
+audio: *apimart
+
+embedding:
+  default: null      # TODO 仅在 M8.1 需要向量检索时才用得上；
+  providers: {}      #      起步阶段关键词倒排索引就够，可以先不接
+
+
+# ---------- 按节点覆盖 ----------
+# Graph 的不同节点可以覆盖参数。key 为 M11 图定义里的节点 id。
+# 文本模型统一是 K3，所以这里通常只用来调参数（温度、输出长度），
+# 而不是换模型。
+node_overrides: {}
+  # 例：
+  # draft_outline: { temperature: 0.9 }    # 大纲阶段要发散
+  # final_polish:  { temperature: 0.3 }    # 定稿阶段要收敛
+
+
+# ---------- 缓存 ----------
+# ✅ 2026-09-12 实测（agent doctor --cache）：同一段 3,598 token 的前缀连发两次，
+#    第二次 usage.cached_tokens = 3,598（100% 命中）。是**自动前缀缓存**，
+#    不需要显式创建缓存对象 —— M3 的批量驱逐（evict_at=15）设计直接生效。
+#    换端点后重跑一次 doctor --cache 再改这里；缓存命中率在 chat 的 /stat 里看。
+cache:
+  mode: auto_prefix                      # auto_prefix | explicit | none
+  enabled: true
+
+
+# ---------- 成本护栏 ----------
+# 对应 ARCHITECTURE.md 的 Cost Guard 横切模块
+# 两套口径同时拦（见 harness/model/budget.py）：
+#   金额 —— 按上面的参考价累计文本花费 + media_models.yaml 里填了 price 的媒体调用
+#   次数 —— 媒体生成按次计费不按 token，目录没填单价也拦得住
+# 接线点：媒体调用在权限闸门（M5）处计次；文本从 COST 事件记；Loop 每轮问一次累计。
+cost_guard:
+  # 一次 30 秒短视频文本侧约 ¥1 上下（按参考价）；60 集短剧批量出稿会到百元级。
+  # 200 是给跑飞留的刹车，不是日常预算。
+  per_task_limit: 200                    # 单次任务上限（元），超了挂起交给人
+  # 项目级 / 日级跨会话累计，靠台账 workspace/costs/ledger.jsonl（P5）。
+  # 「项目」= 一次会话的 session_id（agent chat --session xxx 可指定），没指定就是 default。
+  # 三级是「或」的关系，最低的先拦：项目/日级必须 ≥ 单任务，否则 200 用不满。
+  per_project_limit: 400                 # 单个内容项目上限（元），留 2 个任务的余量
+  daily_limit: 800                       # 单日上限（元），所有会话合计
+  on_exceed: pause_and_ask               # 超限时挂起问人，人点头只放行这一次；deny = 直接拒
+  # 次数上限 = 实际链路用量留一倍余量（一集短剧 6 段视频 + 7 张图；一条短视频 6 段）
+  call_limits:
+    image: 24
+    video: 14
+    audio: 40
+  # 单日媒体调用次数（跨会话）。没单价时这是唯一有效的日级刹车
+  daily_call_limits:
+    image: 120
+    video: 60
+    audio: 200

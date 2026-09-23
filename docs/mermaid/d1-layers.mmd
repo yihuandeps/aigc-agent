@@ -1,0 +1,18 @@
+flowchart TB
+    subgraph L3["L3 交互层"]
+        direction LR
+        A1["CLI 入口：对话 · 短剧 · 短视频 · 素材 · 采集"]
+    end
+    subgraph L2["L2 领域层 —— 懂内容生产"]
+        direction LR
+        B1["工具面 40+"] ~~~ B2["资产库与血缘"] ~~~ B3["短剧规则<br/>服装 · 音色 · 一致性 · 一集规格"] ~~~ B4["流水线<br/>配方 · 剪辑 · 字幕 · 按集流水"]
+    end
+    subgraph L1["L1 能力层 —— 通用但非内核"]
+        direction LR
+        C1["Skill Hub"] ~~~ C2["Memory"] ~~~ C3["MCP Hub"] ~~~ C4["SubAgents"] ~~~ C5["能力区预算"]
+    end
+    subgraph L0["L0 内核层 —— 不知道内容是什么"]
+        direction LR
+        D1["执行引擎<br/>Loop · Graph · 痕迹"] ~~~ D2["模型网关<br/>重试 · 流式 · 计费"] ~~~ D3["上下文<br/>滑窗 · 压缩 · 组装"] ~~~ D4["工具运行时<br/>注册 · 分发 · 披露"] ~~~ D5["权限闸 + 成本闸"] ~~~ D6["事件总线"]
+    end
+    L3 --> L2 --> L1 --> L0

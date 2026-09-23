@@ -1,0 +1,65 @@
+# ============================================================
+# 情绪混剪 —— 画面讲故事，旁白点题
+# ============================================================
+# 适合：生活方式、情绪共鸣、城市/产品氛围类。镜头多、切得密、旁白少而准；
+# 真实素材（用户自己的照片/视频、可商用素材站）和 AI 镜头混用。
+
+name: 情绪混剪
+description: 20 秒竖屏，密集镜头 + 少量旁白 + 字幕，实拍与 AI 镜头混用
+
+style:
+  label: 情绪混剪
+  when: 讲氛围、讲感受、讲一种生活方式；镜头多切得密，旁白少而准，实拍与生成混用
+  footage: mixed
+  min_seconds: 15
+  max_seconds: 30
+
+output:
+  duration: 20
+  aspect_ratio: "9:16"
+  resolution: "720p"
+  filename: "{topic}_{date}.mp4"
+
+grounding:
+  enabled: true
+  source: douyin_hot
+  category: ""
+  top: 15
+  pick_hint: |
+    选画面感强、有情绪的，不选需要解释半天的。
+
+cut:
+  enabled: true
+  max_seconds: 2
+  min_seconds: 1.2
+
+shots:
+  count: 8
+  seconds_each: 8
+  style: 电影感，暖调或冷调统一，浅景深，缓慢推拉，颗粒质感
+  realism: auto
+  prompt_hint: |
+    每个镜头一个意象，构图干净，动作缓慢；镜头之间色调统一。
+    不要文字、logo、人脸大特写。
+
+voiceover:
+  enabled: true
+  voice: auto
+  speed: 0.95
+  instruct: 低语感，克制，留白
+  script_hint: |
+    旁白是点题不是解说：三到五句，每句一个意象或一个转折，
+    总字数不要超过 {chars} 字，宁少勿多。
+
+subtitle:
+  enabled: true
+  source: asr
+  language: zh
+
+models:
+  video_tier: balanced
+  tts_model: ""
+
+review:
+  after_script: true
+  after_compose: false

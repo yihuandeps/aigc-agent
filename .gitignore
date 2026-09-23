@@ -1,0 +1,27 @@
+# 密钥
+.env
+.env.local
+*.key
+*.pem
+
+# 运行时产物
+/workspace/
+!/workspace/.gitkeep
+
+# 缓存与日志
+*.log
+.cache/
+__pycache__/
+node_modules/
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+*.egg-info/
+/blobs/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.venv/

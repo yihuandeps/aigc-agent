@@ -1,0 +1,469 @@
+# ============================================================
+# 媒体生成模型目录 —— 由 M13 Generation Adapters 读取
+# ============================================================
+#
+# 这是**数据不是代码**：APIMart 上新模型时，往这里加一条就能用，
+# 不动任何 Python。模型也是照着这份目录自己挑合适的。
+#
+# ⚠️ 本文件的模型 id 已于 2026-09-11 对照 GET /v1/models 的真实返回校准
+#    （364 个模型）。之前凭文档和命名惯例猜的 id 有一半是错的，别再凭感觉填。
+#    重新校准：
+#      curl --proxy $HTTPS_PROXY https://api.apimart.ai/v1/models \
+#           -H "Authorization: Bearer $APIMART_API_KEY"
+#
+# 字段说明：
+#   tier      quality | balanced | fast —— 模型挑选时的主要依据
+#   strengths 一句话，进上下文供模型判断该用哪个（约 20 token）
+#   cost      1-5，5 最贵（给模型选型看的相对档位）
+#   price     元/张（图）或 元/段（视频），可选。网关不回传金额，填了这个
+#             Cost Guard 才能按金额累计并写进资产的 gen_cost；没填只按次数拦。
+#             照 apimart.ai 控制台的单价填，别猜。
+# ============================================================
+
+provider: apimart
+
+# 参考素材走哪个请求字段（字段名不对接口**不报错只是忽略**，所以留成配置）。
+#   image  实测 2026-09-12：生图/生视频的参考图都收 image=[url]（image_urls 会被丢掉）
+#   video  参考视频（前序片段、音色锚点），按 APIMart seedance 文档默认 video_urls，
+#          提示词里 @视频1 对应列表第 1 个。若实测不生效，试 "image"（和参考图合并成一个列表）
+#   audio  参考音频（@音频1），最多 3 个、合计 ≤15s
+ref_fields:
+  image: image
+  image_alias: image_urls   # 参考图再按 seedance 文档的名字送一份（两个都送不会错，防"零参考"）；写 "" 关掉
+  video: video_urls
+  audio: audio_urls
+
+image:
+  defaults:
+    quality: seedream-4-5
+    balanced: gpt-image-2
+    fast: qwen-image-2.0
+
+  models:
+    - id: seedream-4-5
+      tier: quality
+      cost: 3
+      strengths: 中文场景与人物质感好，海报封面首选
+      aspect_ratios: ["1:1", "3:4", "4:3", "9:16", "16:9"]
+
+    - id: seedream-5-0-lite
+      tier: balanced
+      cost: 2
+      strengths: seedream 新版轻量档，出图快、中文友好
+      aspect_ratios: ["1:1", "3:4", "9:16", "16:9"]
+
+    # ---------- 短剧资产生图（用户指定 banana2）----------
+    # "banana2" = Nano Banana Pro。APIMart 上的 id 是这个。
+    - id: gemini-3-pro-image-preview
+      tier: quality
+      cost: 4
+      strengths: 角色形象与参考图一致性最好，短剧资产首选
+      aspect_ratios: ["16:9", "9:16", "3:4", "4:3", "1:1"]
+    - id: gemini-3.1-flash-image-preview
+      tier: balanced
+      cost: 2
+      strengths: 更快更省，方向验证用
+      aspect_ratios: ["16:9", "9:16", "3:4", "4:3", "1:1"]
+
+    - id: gpt-image-2
+      tier: balanced
+      cost: 3
+      strengths: 指令遵循强，画面里要写字时用它
+      aspect_ratios: ["1:1", "3:2", "2:3"]
+
+    - id: gpt-image-2.5-flare
+      tier: quality
+      cost: 4
+      strengths: 质感与细节最好，成片大图用
+      aspect_ratios: ["1:1", "3:2", "2:3"]
+
+    - id: flux-2-pro
+      tier: quality
+      cost: 4
+      strengths: 写实与光影强，产品图/场景图
+      aspect_ratios: ["1:1", "16:9", "9:16", "4:3"]
+
+    - id: flux-kontext-pro
+      tier: balanced
+      cost: 3
+      strengths: 图生图与局部改写，保持主体一致
+      supports_edit: true
+
+    - id: qwen-image-3.0
+      tier: balanced
+      cost: 2
+      strengths: 中文排版与文字渲染好
+      aspect_ratios: ["1:1", "16:9", "9:16"]
+
+    - id: qwen-image-2.0
+      tier: fast
+      cost: 1
+      strengths: 最便宜，批量出草图和多候选用
+      aspect_ratios: ["1:1", "16:9", "9:16"]
+
+    - id: midjourney
+      tier: quality
+      cost: 4
+      strengths: 风格化与审美上限高，但可控性弱
+
+video:
+  defaults:
+    quality: veo3.1-quality
+    balanced: veo3.1-fast
+    fast: veo3.1-lite
+
+  models:
+    - id: veo3.1-quality
+      tier: quality
+      cost: 5
+      strengths: 画质与运镜最好，成片用
+      max_duration: 8
+      resolutions: ["720p", "1080p", "4k"]
+      aspect_ratios: ["16:9", "9:16"]
+
+    - id: veo3.1-fast
+      tier: balanced
+      cost: 3
+      strengths: 质量与速度平衡，日常分镜用这个
+      max_duration: 8
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16"]
+
+    - id: veo3.1-lite
+      tier: fast
+      cost: 2
+      strengths: 最便宜，快速验证分镜方向
+      max_duration: 8
+      resolutions: ["720p"]
+      aspect_ratios: ["16:9", "9:16"]
+
+    - id: sora-2
+      tier: quality
+      cost: 5
+      strengths: 复杂场景与物理连贯性强
+      max_duration: 12
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16"]
+
+    - id: sora-2-pro
+      tier: quality
+      cost: 5
+      strengths: sora 高配档，长镜头与细节最好
+      max_duration: 12
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16"]
+
+    # 用户指定的短剧出片模型
+    - id: seedance-2.0
+      tier: quality
+      cost: 5
+      strengths: 短剧成片，支持参考图与前序视频延续
+      max_duration: 15
+      # 参考素材上限（图 + 视频 + 音频）。实测 2026-09-20：5 张参考图按两个字段双送 = 10 个 →
+      # HTTP 400 "at most 9 reference images"，那一段就没生成。媒体层提交前按它拦、短剧渲染按它裁。
+      max_refs: 9
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16"]
+
+    - id: seedance-2.5
+      tier: quality
+      cost: 4
+      strengths: 中文语境与国内审美贴合，首尾帧控制好
+      max_duration: 10
+      max_refs: 9
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16", "1:1"]
+
+    - id: seedance-2.0-fast
+      tier: fast
+      cost: 2
+      strengths: seedance 快档，批量试分镜
+      max_duration: 10
+      max_refs: 9
+      resolutions: ["720p"]
+      aspect_ratios: ["16:9", "9:16", "1:1"]
+
+    - id: kling-v3
+      tier: balanced
+      cost: 4
+      strengths: 人物动作自然，口播/人物类分镜
+      max_duration: 10
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16", "1:1"]
+
+    - id: kling-v3-omni
+      tier: quality
+      cost: 5
+      strengths: kling 全能档，多主体与复杂交互
+      max_duration: 10
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16", "1:1"]
+
+    - id: MiniMax-Hailuo-2.3
+      tier: balanced
+      cost: 3
+      strengths: 运镜有电影感，氛围类镜头
+      max_duration: 10
+      resolutions: ["720p", "1080p"]
+      aspect_ratios: ["16:9", "9:16"]
+
+# ============================================================
+# 语音 —— TTS 与 ASR
+# ============================================================
+# 调用形状和图/视频不同（TTS 同步返二进制、ASR 传文件），走 M2 的
+# audio.py 而不是异步任务模型。见 ARCHITECTURE.md M2。
+#
+# ⚠️ 之前这里填的 qwen-audio-3.0-tts-flash/plus 是**猜的，实际不存在**。
+#    真实可用的是下面这些（OpenAI 兼容的 TTS 系列）。
+#    音色也随之改成 OpenAI 标准音色集，不是 Qwen 那 9 个。
+
+audio:
+  # ---------- TTS 走哪家 ----------
+  # apimart  = OpenAI 那套（nova/shimmer/...）。**中文口播听着假**，
+  #            因为是英文原生音色库，这是先天的，调参数改文案只能缓解。
+  # minimax  = 中文原生。只需要 .env 里的 MINIMAX_API_KEY。
+  #
+  # ⚠️ 实测 2026-09-12：sk-api- 前缀的新 key **不要传 GroupId**，
+  #    传了会 1004 token not match group；不传直接过鉴权。
+  #    老式 key 才需要 MINIMAX_GROUP_ID。
+  #    端点是 api.minimaxi.com —— api.minimaxi.chat 会 2049 invalid api key。
+  tts_provider: minimax
+
+  defaults:
+    tts: gpt-4o-mini-tts
+    asr: whisper-1
+    # 换 minimax 之后用这个（转写仍走 whisper-1，不受影响）
+    tts_minimax: speech-2.8-hd
+
+  # 中文内容 nova / shimmer 较自然，男声用 onyx；英文 alloy / echo 都稳
+  default_voice: nova
+  # 换 provider 就换整套音色名。拿 nova 去请求 MiniMax 它**不会报错**，
+  # 而是静默换成自己的默认音色 —— 你以为选了某个音色，实际拿到的是别的。
+  default_voice_minimax: "Chinese (Mandarin)_News_Anchor"
+
+  # ⚠️ 音色不是所有模型都支持。tts-1 / tts-1-hd 只认最早那 6 个
+  #    （alloy echo fable onyx nova shimmer），传 coral/sage/ash 会直接 400。
+  #    新音色只有 gpt-4o-mini-tts 系列能用。
+  legacy_voices: [alloy, echo, fable, onyx, nova, shimmer]
+
+  # ⚠️ instructions（语气指令）实测经 APIMart 转发**不生效**：
+  #    下"每句之间停顿三秒"这种极端指令，合成时长毫无变化。
+  #    想控节奏只能靠 speed 参数 + 文案本身怎么写。
+
+  models:
+    - id: gpt-4o-mini-tts
+      kind: tts
+      tier: balanced
+      cost: 2
+      strengths: 支持 instructions 控制语气情绪，口播首选
+    - id: tts-1
+      kind: tts
+      tier: fast
+      cost: 1
+      strengths: 最便宜最快，批量与长稿分段合成
+    - id: tts-1-hd
+      kind: tts
+      tier: quality
+      cost: 3
+      strengths: 音质更好，成片配音用
+    - id: gpt-audio-mini
+      kind: tts
+      tier: balanced
+      cost: 2
+      strengths: 新一代音频模型轻量档
+
+    # ---------- MiniMax 国内站（中文原生）----------
+    # 取自 platform.minimax.cn 官方文档，2026-09-12 核对。
+    # **没有 speech-2.5-***（那是我早先猜的，国内站不存在）。
+    - id: speech-2.8-hd
+      kind: tts
+      provider: minimax
+      tier: quality
+      cost: 4
+      strengths: 最新高清档，中文最自然，成片配音用
+    - id: speech-2.8-turbo
+      kind: tts
+      provider: minimax
+      tier: balanced
+      cost: 3
+      strengths: 最新快速档，试音与批量
+    - id: speech-2.6-hd
+      kind: tts
+      provider: minimax
+      tier: quality
+      cost: 3
+      strengths: 上一代高清，2.8 不可用时的退路
+    - id: speech-2.6-turbo
+      kind: tts
+      provider: minimax
+      tier: fast
+      cost: 2
+      strengths: 上一代快速档
+    - id: speech-02-hd
+      kind: tts
+      provider: minimax
+      tier: balanced
+      cost: 2
+      strengths: 老版高清
+    - id: speech-01-turbo
+      kind: tts
+      provider: minimax
+      tier: fast
+      cost: 1
+      strengths: 最省，方向验证用
+    - id: whisper-1
+      kind: asr
+      tier: balanced
+      cost: 1
+      strengths: 99+ 语种，可直接输出 srt/vtt 字幕
+
+  # OpenAI 兼容 TTS 的标准音色集
+  voices:
+    - { name: nova, lang: multi, note: 女声，明亮自然，中文口播首选 }
+    - { name: shimmer, lang: multi, note: 女声，柔和温暖 }
+    - { name: coral, lang: multi, note: 女声，活泼有亲和力 }
+    - { name: sage, lang: multi, note: 女声，沉稳知性 }
+    - { name: alloy, lang: multi, note: 中性声，平稳通用 }
+    - { name: echo, lang: multi, note: 男声，清晰中性 }
+    - { name: onyx, lang: multi, note: 男声，低沉厚重，知识类 }
+    - { name: ash, lang: multi, note: 男声，年轻有活力 }
+    - { name: fable, lang: multi, note: 叙述感强，故事类 }
+
+  # ---------- MiniMax 音色 ----------
+  # ⚠️ **这批 id 还没用真 key 核对过**。之前猜 qwen-audio-3.0-tts-* 猜错过，
+  #    所以这里只作候选：拿到 key 后跑 `agent models --voices` 对一遍，
+  #    不对就照 platform.minimaxi.com 的音色列表改。
+  #    MiniMax 的 voice_id 是字符串，也支持你自己克隆的音色 id。
+  # ---------- MiniMax 音色（国内站）----------
+  # ⚠️ voice_setting.voice_id 是**必填**的（不传会 2013 invalid params），
+  #    这点和 OpenAI 相反，没指定时代码自动补 Chinese (Mandarin)_News_Anchor。
+  #
+  # 下面这些是从 /v1/get_voice 实拉的，**不是猜的**。系统音色共 303 个，
+  # 其中普通话 26 个，这里只列适合资讯口播的几个。
+  # 想看全部：POST https://api.minimax.cn/v1/get_voice {"voice_type":"system"}
+  # 这个接口**不扣费**，余额为 0 也能调 —— 排查"key 不对还是没钱"时很有用。
+  voices_minimax:
+    # note 会原样喂给模型做自动选音色，所以**写清楚适合什么内容**，
+    # 只写音色名（"沉稳高管"）模型挑不准。
+    #
+    # ——— 资讯 / 科普 ———
+    - { name: "Chinese (Mandarin)_News_Anchor", note: 新闻女声，干练清晰，资讯播报、硬新闻 }
+    - { name: "Chinese (Mandarin)_Male_Announcer", note: 播报男声，正式有力，官方通报、政经 }
+    - { name: "Chinese (Mandarin)_Reliable_Executive", note: 沉稳高管，理性克制，商业分析、行业观察 }
+    - { name: "Chinese (Mandarin)_Wise_Women", note: 阅历姐姐，沉稳有分量，深度解读、经验分享 }
+    # ——— 叙述 / 故事 ———
+    - { name: "Chinese (Mandarin)_Radio_Host", note: 电台男主播，娓娓道来有呼吸感，叙事、人物故事、夜间向 }
+    - { name: "Chinese (Mandarin)_Lyrical_Voice", note: 抒情男声，情绪饱满，煽情、回忆、情感向 }
+    - { name: "Chinese (Mandarin)_Gentleman", note: 温润男声，斯文舒缓，知识科普、生活美学 }
+    - { name: "Chinese (Mandarin)_Gentle_Senior", note: 温柔学姐，亲和耐心，教程、答疑、入门讲解 }
+    # ——— 轻松 / 生活 ———
+    - { name: "Chinese (Mandarin)_Warm_Bestie", note: 温暖闺蜜，像朋友聊天，种草、测评、日常分享 }
+    - { name: "Chinese (Mandarin)_Sweet_Lady", note: 甜美女声，轻快讨喜，美妆、美食、好物 }
+    - { name: "Chinese (Mandarin)_Sincere_Adult", note: 真诚青年，不油不装，个人观点、vlog 口播 }
+    - { name: "Chinese (Mandarin)_Gentle_Youth", note: 温润青年，清爽自然，通用口播 }
+    - { name: "Chinese (Mandarin)_Southern_Young_Man", note: 南方小哥，带点口音更接地气，市井、探店 }
+    - { name: "Chinese (Mandarin)_Crisp_Girl", note: 清脆少女，活力足语速快，潮流、二次元、年轻向 }
+    # ——— 有戏剧性 ———
+    - { name: "Chinese (Mandarin)_Mature_Woman", note: 傲娇御姐，有攻击性，吐槽、犀利点评 }
+    - { name: "Chinese (Mandarin)_Unrestrained_Young_Man", note: 不羁青年，洒脱带劲，热血、运动、励志 }
+    - { name: "Chinese (Mandarin)_Humorous_Elder", note: 搞笑大爷，喜感强，段子、反差幽默 }
+    - { name: "Chinese (Mandarin)_Kind-hearted_Elder", note: 花甲奶奶，慈祥，怀旧、家庭、温情 }
+
+# ---------- 短剧流水线 ----------
+# 资产生图与分镜生视频用哪个模型。改这里就能换，不用动代码。
+drama:
+  image_model: gpt-image-2      # 角色主形象 / 服装 / 场景 / 道具
+  video_model: seedance-2.0     # 分镜片段
+  # 人物参考图的真实感校验（2026-09-18）：生成后让视觉模型看一眼有没有毛孔/斑点/硬光，
+  # 不合格用更狠的提示词重生成一次。每张多一次文本调用 + 可能的一次生图费。
+  # 实测 7 张主形象提示词里写了毛孔雀斑，出来还是磨皮脸 —— 光靠提示词不够，得校验。
+  realism_gate: "true"          # 关掉写 "false"
+  realism_retries: "1"          # 不合格允许重生成几次；"0" = 只校验不重生成
+  # 真实感档位（2026-09-18 下午用户看成片：雀斑皱纹太明显、人物太丑，要减到原来的 1/3）：
+  #   subtle   真实但干净：细看有毛孔和纹理，雀斑至多零星几点极淡，不要明显皱纹（默认）
+  #   natural  早上那版的力度：少量雀斑、可见毛孔、肤色不均
+  #   strong   明显做旧，老人/病人/流浪者这类人设才用
+  # 影响：人物图/视频提示词的硬约束、第①②③步的写作规则、校验目标、描述里过重瑕疵的压轻。
+  realism_level: "subtle"
+  # 角色音色锁定（2026-09-18）：集数一多同一角色的声音会漂（每段视频各自发声）。
+  # 渲染时把说话角色的音色卡锁进提示词，并把该角色的锚点片段（第一段独白）作为
+  # 参考视频传给模型（@视频N 取音色）。锚点存成资产，跨集沿用。
+  # 单段视频网络类失败（连接失败 / 5xx / 轮询网络错误）自动原样重试几次；400 与超时不重试。
+  # 再加上 drama_render_shots 默认 reuse=true：重跑只补失败的段，成功的不再花钱。
+  video_retries: "1"
+  # 画面里不许有字幕/文字（用户 2026-09-18 定的最高优先级约束）。提示词层面所有 gen_video
+  # 都带禁令；这里是第二道：每段生成后抽 4 帧给视觉模型看，发现字幕就用更硬的提示词重生成，
+  # 还有就在结果里标「仍有字幕」交人复核。每段多一次文本调用，发现字幕才多一次生成费。
+  subtitle_gate: "true"
+  subtitle_retries: "1"         # 发现字幕后允许重生成几次；"0" = 只检查不重生成
+  # 镜头门（用户 2026-09-20 定的硬性要求：每个镜头 ≤3 秒，上限在 config/drama.yaml cut.max_seconds）：
+  # 每段生成后用 ffmpeg 场景切换检测量出最长镜头（纯本地计算，不花模型钱），超过上限 + 容差
+  # 就用更硬的提示词重生成；还超就在结果里标「仍有超过 3 秒的镜头」交人复核。
+  cut_gate: "true"
+  cut_retries: "1"              # 超时长后允许重生成几次；"0" = 只检查不重生成
+  cut_scene_threshold: "0.3"    # 场景切换判定阈值（0–1）：硬切通常 >0.5，同镜头运镜一般 <0.2
+  cut_tolerance: "0.5"          # 容差（秒）：切换点检测有帧级误差，最长镜头 ≤ 上限 + 容差算合格
+  # 引用门（用户 2026-09-20 定的规则：没有引用成功的镜头不许生成，要在生成前拦住，不能生成完再说）。
+  # 渲染前逐段核对：引用的参考图都在包里、描述里出现的角色都带了参考图、链接没过期、
+  # 参考数不超过模型上限；任一不过就整批不发起。ref_probe 再对每个参考图链接发一次 HEAD 请求
+  # 确认可访问（几十个链接约两三秒），链接已失效（4xx）也拦；网络不通只提示不拦。
+  ref_probe: "true"
+  # 人物一致性门（2026-09-18 用户反馈：参考图传了也漂）：每段视频/每张带参考的人物图生成后，
+  # 把参考图和抽帧一起给视觉模型逐人判断是不是同一个人（0–10 分），不合格把差异写进提示词
+  # 重生成；都不过留分最高的并标「仍与参考图不符」。提示词里同时用 @图片N 逐张点名参考图。
+  identity_gate: "true"
+  identity_retries: "1"
+  identity_pass_score: "7"      # 几分算同一个人（面容审查也用这个分数线）
+  # 面容审查（2026-09-22 用户提的）：生成过程里同一个角色会攒出好几张脸（换了模型、
+  # 重生成、手动补图），后面渲视频引用到哪张全凭运气，成片就变脸。drama_render_assets
+  # 跑完自动查一遍：同名角色的图归堆 → 和基准逐张比对 → **只留一张**
+  # （你钉过的 > 参考图包在用的 > 产物里最新的），其余移进 workspace/trash（不真删）。
+  # 几张脸各自成群、又没人钉过时会挂起问你。默认只看主形象层 —— 服装图生成时已经过了
+  # 一道 identity_gate，再查一遍是重复花钱；要复核服装图用 drama_audit_faces(deep=true)。
+  # 干净的工作区里每个角色只有一张候选，一次视觉调用都不会发。
+  face_audit: "true"            # 关掉写 "false"
+  # 参考图链接约 24h 失效（见 ref_url_ttl_hours）：过期后渲染前会提示先 drama_refresh_refs
+  voice_anchor: "true"          # 关掉写 "false"（仍会锁音色卡文字，只是不传参考视频）
+  ref_url_ttl_hours: "20"       # 生成结果的链接多久后视为过期（APIMart 文档：24h）；"0" = 不过期
+  max_video_refs: "3"           # 一段最多带几个参考视频（前序片段 + 音色锚点），seedance 2.0 上限 3
+  # 版式是**硬约束不是创作**，由服务端定死：
+  #   角色主形象 3:4、服装/场景/道具 16:9、视频 9:16 720p
+  #
+  # ⚠️ 换生图模型前先确认它**支持参考图**（image=[url]）。
+  #    角色换装要靠参考图保住同一张脸，不支持的话整条一致性链就断了。
+  #    已实测可用：gpt-image-2、gemini-3-pro-image-preview
+  #    验法：同一句"参考图里的物体放到沙滩上"，带参考图出的是参考图里那个东西，
+  #          不带出的是随机物体。四个候选字段名都返回 200，只有 image 真生效。
+
+# ---------- 轮询 ----------
+# 视频动辄几分钟，必须异步。见 ARCHITECTURE.md M2「异步任务模型」。
+polling:
+  # 用户 2026-09-18 定的口径：**每 3 秒轮询一次，最多 200 次**（backoff 1.0 = 固定间隔）。
+  # 200 × 3s = 600s 的等待，加上每次请求本身的耗时；下面的时间预算放宽到 900s，
+  # 只作兜底（服务端一直不报 running 之类），实际由次数上限说了算。
+  interval: 3.0 # 轮询间隔（秒）
+  backoff: 1.0 # 每次乘这个系数；1.0 = 固定 3 秒
+  max_interval: 3.0
+  max_polls: 200 # 轮询请求次数上限，0 = 不限
+  # 网络抖动容忍：轮询连续这么多次网络错误才判失败。之前一次 ConnectError 就判死，
+  # 服务端还在跑、照样计费，片段却丢了（2026-09-18 实测「轮询 2 次 ConnectError」）。
+  max_transient: 10
+  submit_retries: 2 # 提交阶段网络错误重试次数（HTTP 400 之类不重试）
+  max_wait_image: 600.0 # 图像超时（开跑后才计时）
+  max_wait_video: 900.0 # 视频超时（开跑后才计时），兜底用，正常由 max_polls 先到
+  # 排队时间不吃生成预算：从任务**真正开跑**（状态变 running）才起算。
+  # max_queue 是排队 watchdog：这么久还没开跑才判「排队超时」。
+  max_queue: 900.0
+
+# ---------- 生成并发 ----------
+# 批量渲染（drama_render_assets / drama_render_shots）的客户端并发上限。
+# 只压同一层里**无依赖**的任务：依赖永远排队 —— 服装等角色主形象出图、
+# 镜头等前序片段出片，与这里的数无关。0 = 不限。
+#
+# ⚠️ 实测 2026-09-17（qwen-image-2.0，本账号）：6 并发全过；8 并发成功 7；
+#    12 并发两次都只成功 6，超出部分提交即被秒拒
+#    （"The service is receiving a lot of requests"，失败不计生成费）。
+#    所以图片上限就是 ≈6 —— 填高了不会更快，只会多出一批失败项。
+concurrency:
+  image: 6   # 实测上限（见上面）。账号升档后重测再调
+  video: 8   # 视频单段贵，没实测过并发上限；先保守，跑稳了再往上抬

@@ -1,0 +1,87 @@
+# ============================================================
+# 产品广告 —— 投放级产品片，英雄镜头 + 微距 + 慢动作
+# ============================================================
+# 来源：awesome-seedance 模板 product-commercial-shotlist（27 条人工核对案例；策划内容 CC BY 4.0）。
+# 核心结论：**开头先写死广告美学词，它决定后面每个镜头的光线逻辑**；每个微距都指名拍什么；
+# 关键词堆在最末尾；logo / slogan 别指望模型渲染，留一个干净的收尾帧后期加字。
+# 细节与锚定案例：load_skill_reference(skill="seedance-prompting", name="03-商业与产品")
+#
+# 适合：美妆、饮品、珠宝、香水、数码 —— 要读成"投放级制作"，不能读成创作者视频。
+# 和 ugc-vlog 是两个极端，**不要混着写**：高端广告光 + 手机 UGC 质感 = 塑料感。
+
+name: 产品广告
+description: 15 秒竖屏投放级产品广告，产品图当身份锁，英雄镜头 + 微距 + 慢动作，文字后期加
+
+style:
+  label: 产品广告
+  when: 美妆/饮品/珠宝/数码这类要读成投放级制作的产品片；产品图当身份锁，画面高端，不要 UGC 感
+  footage: generate # 产品片全靠生成；用户给的产品图走参考图（身份锁），不当实拍素材剪进去
+  min_seconds: 8
+  max_seconds: 20
+
+output:
+  duration: 15
+  aspect_ratio: "9:16"
+  resolution: "720p"
+  filename: "{topic}_{date}.mp4"
+
+# 产品广告的选题来自产品本身，不抓热榜
+grounding:
+  enabled: false
+  source: douyin_hot
+  category: ""
+  top: 0
+  pick_hint: ""
+
+cut:
+  enabled: true
+  max_seconds: 3
+  min_seconds: 1.0 # 案例库：单镜低于 1 秒左右，模型就解析不出单独动作了；"8 秒塞 8 镜"是典型翻车
+
+shots:
+  count: 5
+  seconds_each: 8
+
+  # 广告美学词表（案例库：英文原词更稳），拼进每个镜头 —— 它决定所有镜头的光线逻辑
+  style: >-
+    投放级广告美学（premium beauty-commercial aesthetics, luxury advertising aesthetic），
+    变形宽银幕镜头感（anamorphic），体积光，浅景深，统一调色，单一主体居中，
+    表面材质与反光清晰可辨
+
+  # 产品片多数没有真人，皮肤真实感那段不挂（挂了会被当成画面内容）。有真人出镜再改成 auto
+  realism: ""
+
+  prompt_hint: |
+    先写**英雄产品**：材质、轮廓、表面处理、光在它上面怎么走（金属反光扫过包装、
+    液体里的光带、玻璃的折射）。有产品图就写明"@图片1 是产品身份锁：逐件写轮廓、盖子、
+    铭牌位置、材质"，并说清哪张图定的是终帧构图。
+    然后每镜：
+    - **指名拍什么**：泡沫质地、液体飘带、钻石色散、粉末扬起、金属反光扫过 —— 不指名的
+      微距只会给一个通用虚化特写。
+    - 一拍只放一种物理效果：液体、烟雾、粉末各占一个镜头，别堆在一起。
+    - 镜头之间有递进：环境/氛围 → 产品入画 → 微距细节 → 使用/效果 → 英雄帧。
+    - 最后一镜是**干净的英雄帧**：产品单独入画、构图留白，给后期上字用。
+    - 避开印刷标签的特写（品牌文字几乎必错）；不让模型渲染 logo 和 slogan；
+      不要人脸大特写；不要手机 UGC 质感。
+
+voiceover:
+  enabled: false # 广告靠画面 + 后期字幕；要口播就改 true
+  voice: auto
+  speed: 1.0
+  instruct: 克制、有质感，像高端品牌的旁白
+  script_hint: |
+    如果要旁白：slogan 式短句，每句不超过 8 个字，三到四句，不要功能罗列。
+    总字数不要超过 {chars} 字。
+
+subtitle:
+  enabled: false # 上屏文字后期合成（带出现时段），不走 ASR
+  source: asr
+  language: zh
+
+models:
+  video_tier: quality # 投放级成片
+  tts_model: ""
+
+review:
+  after_script: true
+  after_compose: true

@@ -1,0 +1,90 @@
+# ============================================================
+# 手持 vlog —— 用相机缺陷换真实感
+# ============================================================
+# 来源：awesome-seedance 模板 handheld-ugc-vlog（案例库里最富的一类，92 条人工核对案例；
+# 策划内容 CC BY 4.0）。核心结论：**真实感是用"毛病"买来的，不是用"画质"买来的**——
+# 指名一个具体的消费级器材，把它的操作缺陷写成要求，再手动关掉电影感。
+# 细节与锚定案例：load_skill_reference(skill="seedance-prompting", name="02-真实感与UGC")
+#
+# 适合：日常、旅拍、健身、做饭、出门前准备 —— 要"像真有人随手拍的"，不是"像很贵的"。
+
+name: 手持 vlog
+description: 30 秒竖屏，手机随手拍质感，出镜者边做事边说，相机缺陷换真实感，实拍与生成混用
+
+style:
+  label: 手持vlog
+  when: 要私人感、像真有人随手拍的：日常、旅拍、健身、做饭；画面故意带手机/DV 的毛病，不要电影感
+  footage: mixed # 用户自己的实拍片段优先，缺的镜头按同一套"手机随手拍"质感生成补上
+  min_seconds: 15
+  max_seconds: 45
+
+output:
+  duration: 30
+  aspect_ratio: "9:16"
+  resolution: "720p"
+  filename: "{topic}_{date}.mp4"
+
+grounding:
+  enabled: true
+  source: douyin_hot
+  category: ""
+  top: 15
+  pick_hint: |
+    选"一件小事"：一个具体的日常动作或小意外（手冲咖啡溢了、出门前找钥匙、
+    骑到半路下雨）。UGC 的真实感来自小事，不来自信息量 —— 需要解释半天的点不选。
+
+cut:
+  enabled: true
+  max_seconds: 3 # 全局上限也是 3；vlog 一镜可以拉满 3 秒，切太碎反而不像随手拍
+  min_seconds: 1.5
+
+shots:
+  count: 6
+  seconds_each: 8
+
+  # 拼进每个镜头 prompt 的画面风格。这里就是"相机缺陷清单"——案例库里 23 条靠这套词表
+  # 拿到手机实拍质感。指名器材（不要笼统写"真实"）：一个具体型号带着整套光学特征。
+  style: >-
+    手持手机竖拍（iPhone 随手拍质感，Handheld Phone Vlog），轻微手抖，对焦偶尔来回找，
+    曝光随光线呼吸，构图略有漂移，偶尔切到半张脸；自然光，环境本来的颜色；
+    不用稳定器、不做电影式运镜、no cinematic emulation、无美颜无磨皮无滤镜；
+    景别最近只到胸口以上，不推大特写
+
+  # 有真人出镜，皮肤真实感走全局档位（media_models.yaml drama.realism_level）
+  realism: auto
+
+  prompt_hint: |
+    每个镜头按这个顺序写清楚：**机器怎么拿**（手持、举着、放在台面上）→ 主体在做什么
+    → 一句跟着动作走的口语台词（可以没有）。
+    - 一镜一个动作，动作要有可见的过程（拧开、倒进去、抬头看），不写情绪形容词。
+    - 台词焊在动作里，不要单独一段"对白"；每句不超过 8 个词，长了抢画面还拖口型。
+    - 身体状态只能单向递进（汗越来越多、头发越来越湿、天越来越暗），给模型一条不可逆的时间线。
+    - **不要**电影级打光、不要 4K 精修、不要稳定器运镜 —— 手持真实感和电影感写在一起，
+      两套光线逻辑打架，结果是塑料感。
+    - 不要数字变焦当转场、不要突然推近；要连着拍就写"一镜到底、无隐形剪辑"。
+    - 不出现文字、logo；不推到脸部填满画面的大特写（会暴露 AI 脸）。
+
+voiceover:
+  enabled: true
+  voice: auto
+  speed: 1.0
+  instruct: 像随手拍时自言自语，不是念稿
+  script_hint: |
+    这是随手拍时顺口说的话，不是口播稿。
+    - 第一人称、口语、短句；一句只说一件事，每句不超过 8 个词。
+    - 台词要能对上某个镜头的动作（"这次水温对了"配倒水那一镜），不要泛泛的开场白。
+    - 可以有停顿和不完整句，念出来像在场，不像在播。
+    总字数不要超过 {chars} 字，宁少勿多 —— vlog 靠画面，不靠说。
+
+subtitle:
+  enabled: true
+  source: asr
+  language: zh
+
+models:
+  video_tier: balanced
+  tts_model: ""
+
+review:
+  after_script: true
+  after_compose: false

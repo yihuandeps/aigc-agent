@@ -1,0 +1,58 @@
+# ============================================================
+# 能力预算 —— Skill Hub (M7) 与 MCP Hub (M20) 共管
+# ============================================================
+#
+# 为什么需要这个文件：
+#   两个 Hub 各自看着都合理，加起来就超了。没有共同上限的话，
+#   3 个 Skill 全文(10K) + 60 个 MCP 工具全 schema(35K) + 内置工具(10K)
+#   = 55K，占 256K 窗口的 21%——"我能做什么"还没干活就吃掉五分之一。
+#
+#   两级披露 + 统一预算后，同样的能力只占 22K。
+# ============================================================
+
+context_window: 256000
+
+# 能力区总上限。两个 Hub 从这一个池子里分配，谁都不能单方面撑爆。
+capability_budget: 30000
+
+# 软目标：整个上下文的实际工作水位。超过才开始触发裁剪。
+# 256K 是护栏不是配额——塞满不等于模型用得好（注意力稀释），且每轮重发很贵。
+soft_target: 80000
+
+
+# ---------- 分配 ----------
+allocation:
+
+  # 常驻部分：一直在上下文里，不随节点切换变化
+  resident:
+    skill_digest:        3000    # ~50 token × skill 数量
+    mcp_tool_digest:     3000    # ~30 token × 工具数量
+    builtin_tool_schema: 10000   # 内置工具的完整 schema
+
+  # 激活部分：按当前节点动态装卸
+  active:
+    skill_body:          15000   # 加载的 Skill 正文
+    expanded_tool_schema: 6000   # 展开的 MCP 工具完整 schema
+
+
+# ---------- 装载上限 ----------
+limits:
+  max_active_skills: 3           # 同时加载的 Skill 正文数
+  max_skill_body_tokens: 5000    # 单个 Skill 正文上限，超了应拆分
+  max_expanded_tools: 8          # 同时展开的完整工具 schema 数
+
+
+# ---------- 超预算时的降级顺序 ----------
+# 从上往下执行，直到回到预算内
+on_over_budget:
+  - drop_lowest_priority_skill   # 先丢 priority 最低的 Skill 正文
+  - collapse_expanded_tools      # 再把展开的工具 schema 收回 digest 级
+  - shrink_skill_digest          # 最后截断 Skill 目录（只保留匹配当前节点的）
+  # 注意：Pin 区和 compliance 类 skill(priority=100) 不参与降级，永不丢弃
+
+
+# ---------- 观测 ----------
+# 每轮记录实际占用，超过 soft_target 时告警（走 M6 Event Bus）
+telemetry:
+  log_actual_usage: true
+  warn_at_ratio: 0.9             # 达到 capability_budget 的 90% 告警

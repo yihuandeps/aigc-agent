@@ -1,0 +1,72 @@
+# ============================================================
+# 平台格式规格 —— 由 M16 Distribution 读取。数据不是代码。
+# ============================================================
+#
+# ⚠️ 这些是**起步值**，以各平台当前发布页的实际限制为准；平台改规则就改这里，
+#    不动 Python。超限的项**不会被静默截断**：标题超长、正文超长会作为问题列在
+#    上传清单里让人改；只有话题标签数量会按上限保留前 N 个并注明。
+#
+# 发布方式（ARCHITECTURE 开放问题 #3 的答案）：**只产「待发布包」**，由人上传。
+# 真正的发布动作是不可逆的 L-external，这版不接平台 API。
+# ============================================================
+
+platforms:
+
+  douyin:
+    name: 抖音
+    kinds: [video, image]
+    title_max: 55          # 作品文案 / 标题建议长度
+    body_max: 1000
+    tags_max: 5
+    tag_prefix: "#"
+    video:
+      aspect_ratio: "9:16"
+      max_seconds: 900
+      min_seconds: 5
+    cover:
+      aspect_ratio: "9:16"
+    aigc_label: 发布页勾选「内容由 AI 生成」，并保留画面显式标识
+
+  xiaohongshu:
+    name: 小红书
+    kinds: [image, video, text]
+    title_max: 20
+    body_max: 1000
+    tags_max: 10
+    tag_prefix: "#"
+    video:
+      aspect_ratio: "9:16"
+      max_seconds: 900
+      min_seconds: 3
+    cover:
+      aspect_ratio: "3:4"
+    aigc_label: 笔记正文注明「AI 生成」，图片/视频画面加角标
+
+  wechat:
+    name: 微信公众号
+    kinds: [text]
+    title_max: 64
+    body_max: 20000
+    tags_max: 0
+    tag_prefix: ""
+    cover:
+      aspect_ratio: "2.35:1"
+    aigc_label: 文末注明「本内容由 AI 生成」
+
+  zhihu:
+    name: 知乎
+    kinds: [text]
+    title_max: 100
+    body_max: 100000
+    tags_max: 5
+    tag_prefix: ""
+    aigc_label: 文首或文末注明「本内容由 AI 生成」
+
+  generic:
+    name: 通用
+    kinds: [text, image, video]
+    title_max: 100
+    body_max: 100000
+    tags_max: 10
+    tag_prefix: "#"
+    aigc_label: 注明「本内容由 AI 生成」

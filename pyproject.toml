@@ -1,0 +1,88 @@
+[project]
+name = "aigc-agent"
+version = "0.1.0"
+description = "AIGC 内容创作 Agent —— Loop + Graph 双执行引擎的半自动内容生产 harness"
+requires-python = ">=3.11"
+
+# P0 依赖：跑通最小 Loop 所需
+dependencies = [
+    "openai>=1.40",             # Kimi 走 OpenAI 兼容协议，AsyncOpenAI
+    "pydantic>=2.7",            # 全部 schema
+    "pydantic-settings>=2.3",   # .env 注入
+    "pyyaml>=6.0",              # 配置与图定义
+    "structlog>=24.1",          # M6 结构化事件
+    "typer>=0.12",              # CLI
+    "rich>=13.7",               # 终端渲染（流式输出、图状态）
+    "prompt_toolkit>=3.0",      # 常驻输入框 + 命令模糊补全（2026-09-22）
+    "pillow>=10.3",             # 海报 / 图文卡片本地叠字（make_poster，2026-09-23 从另一份副本移植）
+]
+
+[project.optional-dependencies]
+
+# P1：持久化 + MCP
+p1 = [
+    "aiosqlite>=0.20",          # Memory Store / GraphState 快照 / 事件流
+    "mcp>=1.0",                 # M20 MCP Hub，官方 SDK
+]
+
+# P2：媒体处理 + Web API
+p2 = [
+    "pillow>=10.3",             # 图像精修 / 抠图 / 封面裁剪
+    "fastapi>=0.111",           # 人审台后端
+    "uvicorn[standard]>=0.30",
+    "sse-starlette>=2.1",       # 事件流推送到前端
+    # ffmpeg 是外部二进制，不走 pip：
+    #   Windows: winget install Gyan.FFmpeg  或  choco install ffmpeg
+    #   验证:    ffmpeg -version
+]
+
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "import-linter>=2.0",       # 强制 L0 不 import L1/L2
+]
+
+[project.scripts]
+agent = "aigc_agent.interfaces.cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aigc_agent"]
+
+
+# ---------- 工具配置 ----------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# vendor/ 是从上游原样拷来的第三方脚本，不改写以便日后同步，也就不按本项目风格检查
+extend-exclude = ["src/aigc_agent/domain/functions/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+
+# ---------- 架构约束：L0 不得 import L1/L2 ----------
+# 这是 ARCHITECTURE.md 里唯一的硬约束，靠自觉守不住，用工具卡。
+# 运行：lint-imports
+
+[tool.importlinter]
+root_package = "aigc_agent"
+
+[[tool.importlinter.contracts]]
+name = "分层依赖严格单向向下"
+type = "layers"
+layers = [
+    "aigc_agent.interfaces",
+    "aigc_agent.domain",
+    "aigc_agent.capabilities",
+    "aigc_agent.harness",
+]

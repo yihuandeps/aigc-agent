@@ -1,0 +1,43 @@
+┌──────────────────────────────── 短视频生产 ─────────────────────────────────┐
+│ 科技                                                                        │
+│ 配方 科技热点短视频 · 4 镜 × 8s = 32s · 9:16 · 档位 fast                    │
+│ 口播 开 · 字幕 开                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1/5 写文案与分镜…
+┌────────────────────────────── 口播（153 字） ───────────────────────────────┐
+│ 你手机里这块芯片，比当年送阿波罗登月的计算机强一百万倍。一颗3纳米芯片，每平 │
+│ 方毫米塞进两亿个晶体管，单个比病毒还小。训练一次大模型的耗电，够一个四口之  │
+│ 家用上二十年。全球算力每十八个月翻一倍，而人脑完成一次类似进化用了上百万年  │
+│ 。所以呢，你刷到这条视频的几秒钟，背后是整个人类文明级的算力，正在为你一个  │
+│ 人服务。                                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+  第1镜 
+微观：一枚芯片的晶圆表面特写，冷蓝色光源斜射，电路纹理泛着金属微光，一滴冷却液
+缓缓滑过表面折射光线，镜头以极慢速度推近，浅景深下只有局部电路清晰，其余虚化。
+  第2镜 
+中观：机房内一排服务器机柜纵向延伸，冷蓝LED指示灯有节奏地明灭，一缕冷雾从机柜底
+部流过，镜头沿机柜通道缓慢平移推进，顶光营造纵深，画面干净无人。
+  第3镜 
+人：昏暗房间里，一个人背对镜头坐在桌前，只拍到肩部以下的剪影，手指悬在发光的键
+盘上方轻轻敲击，屏幕冷蓝光打亮手部轮廓，镜头从侧后方缓慢环绕，背景虚化成光斑。
+  第4镜 
+宏观：夜晚高空俯瞰一座数据中心建筑群，成片冷蓝色屋顶灯光在黑暗中铺展成网格，远
+处城市微光点缀，镜头缓慢拉升后退，云层低垂，整体呈现宏大而安静的电影感。
+
+--dry-run：到此为止，未生成视频
+an error occurred during closing of asynchronous generator <async_generator object PoolByteStream.__aiter__ at 0x0000026BFAE1AB60>
+asyncgen: <async_generator object PoolByteStream.__aiter__ at 0x0000026BFAE1AB60>
+Traceback (most recent call last):
+  File "E:\手搓Agent\.venv\Lib\site-packages\httpcore2\_async\connection_pool.py", line 427, in __aiter__
+    yield chunk
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "E:\手搓Agent\.venv\Lib\site-packages\httpcore2\_async\connection_pool.py", line 425, in __aiter__
+    async with safe_async_iterate(self._stream) as iterator:
+  File "C:\Users\17307\AppData\Local\Programs\Python\Python311\Lib\contextlib.py", line 267, in __aexit__
+    raise RuntimeError("generator didn't stop after athrow()")
+RuntimeError: generator didn't stop after athrow()

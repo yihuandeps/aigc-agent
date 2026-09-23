@@ -1,0 +1,84 @@
+# ============================================================
+# 纯文案生产图 —— P1 的验证对象
+# ============================================================
+#
+# 为什么用它验证：链路最短、成本最低，但会把 Graph Runtime / Asset /
+# 回退边 / HITL 这四个最容易设计错的东西全部压测一遍。
+# 这四个对了，扩到短视频只是加节点和并行边。
+#
+# 图定义是**数据不是代码**：改流程、插人审断点、调一条边，都不用动引擎。
+# ============================================================
+
+id: copy
+name: 纯文案生产
+description: 大纲 → 正文 → 人审 → 定稿。打回可退回大纲或正文重跑。
+
+# Router 的规则匹配依据。写得具体一点，避免误触发。
+triggers: [写文案, 写一篇, 写稿, 出稿, 文案, 公众号, 推文, 长文]
+
+entry: outline
+
+max_total_nodes: 30
+
+nodes:
+
+  - id: outline
+    type: agent
+    stage: 大纲
+    out_slots: [outline]
+    candidates: 3            # 关键节点产多个候选供人选，而不是给一个答案
+    contract:
+      目标: 根据选题产出内容大纲
+      约束:
+        - 结构清晰，3-5 个要点
+        - 每个要点一句话说清
+      验收标准: 人能据此判断这篇要不要写、怎么写
+
+  - id: draft
+    type: agent
+    stage: 正文
+    in_slots: [outline]
+    out_slots: [draft]
+    contract:
+      目标: 按大纲展开正文
+      约束:
+        - 严格遵循已确认的大纲结构，不自行增删要点
+        - 遵守 Memory Brief 的 must_not 区
+      验收标准: 可直接进入人审，不需要再补结构
+
+  - id: review
+    type: human            # ← Checkpoint。挂起，等 M19 人审台回调
+    stage: 人审
+    in_slots: [draft]
+
+  - id: finalize
+    type: tool
+    stage: 打包
+    # 机审 + 格式适配 + 落成待发布包（P4）。人在 review 已经采纳，机审结果随包附上，
+    # 有 block 也打包但记进 manifest 的放行理由 —— 上传前人还会再看一遍上传清单。
+    tool: build_release_package
+    tool_args:
+      content_asset_id: $draft     # $ 开头引用 GraphState 的槽位
+      platform: wechat
+      override_reason: 人审节点 review 已采纳；机审结果随包附上，上传前再核
+    in_slots: [draft]
+    out_slots: [final]
+
+  - id: end
+    type: terminal
+
+edges:
+
+  - {from: outline, to: draft}
+  - {from: draft,   to: review}
+
+  # 采纳 → 继续往下
+  - {from: review, to: finalize, type: conditional, when: adopt}
+
+  # ---- 回退边：半自动定位下最重要的两条 ----
+  # revise：正文不行，退回 draft 重写（大纲保留）
+  - {from: review, to: draft,   type: fallback, when: revise}
+  # reject：方向就错了，退回 outline 重来（大纲也作废）
+  - {from: review, to: outline, type: fallback, when: reject}
+
+  - {from: finalize, to: end}
