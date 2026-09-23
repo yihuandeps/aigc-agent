@@ -69,7 +69,7 @@ from ..drama.identity import (
     parse_identity_verdict,
     reference_block,
 )
-from ..drama.models import as_dict
+from ..drama.models import as_dict, normalize_ref_parens
 from ..drama.voice import (
     ANCHORS_CREATOR,
     Anchor,
@@ -93,6 +93,7 @@ from ..media.naming import (
 from ..media.no_text import no_text_retry, parse_subtitle_verdict, subtitle_check_messages
 from ..realism import (
     REALISM_ROLE,
+    is_minor,
     norm_level,
     parse_realism_report,
     person_image_prompt,
@@ -650,6 +651,20 @@ class DramaFunctions:
         )
         return asset.id
 
+    def _merge_save_anchors(self, new_anchors: dict[str, Anchor], parents: list[str]) -> str:
+        """把这次新定的锚点并进**最新的**锚点表再存。
+
+        渲染这段时间里别的集可能写过锚点表（/auto 两集并行）：之前开渲时读、结束时整表覆盖，
+        后结束的那集把先结束那集新定的锚点冲掉（2026-09-23 审查）。人手动 pin 的不覆盖。
+        """
+        latest = self._load_anchors()
+        for name, a in new_anchors.items():
+            old = latest.get(name)
+            if old is not None and old.pinned:
+                continue
+            latest[name] = a
+        return self._save_anchors(latest, parents)
+
     def _anchor_url(self, anchor: Anchor, vcfg: dict[str, Any]) -> tuple[str, str]:
         """锚点片段现在还能不能当参考：返回 (url, 不能用的原因)。
 
@@ -657,6 +672,35 @@ class DramaFunctions:
         所以到点就当没有 —— 本次用新片段接替，并写回锚点表。
         """
         return self._clip_ref_url(anchor.asset, vcfg)
+
+    async def _rehost_anchors(self, anchors: dict[str, Anchor], vcfg: dict[str, Any]) -> list[str]:
+        """锚点片段的链接过期了、本地还有副本：配了托管就重新上传换新链接（声音一点不变）。
+
+        2026-09-23 审查：之前过期（20 小时）就重定一个新锚点，而新锚点那段生成时不带旧声音 ——
+        同一个角色的声音基准每天断一次。参考图早就走托管刷新了，锚点一直没走。
+        """
+        if self.hosting is None or not getattr(self.hosting, "enabled", False):
+            return []
+        notes: list[str] = []
+        for name, a in anchors.items():
+            url, why = self._anchor_url(a, vcfg)
+            if url or not why or "不存在" in why:
+                continue
+            try:
+                clip = self.store.get(a.asset)
+            except KeyError:
+                continue
+            if local_copy(clip) is None:
+                continue
+            new_url, err = await self.hosting.ensure_asset(
+                self.store, clip, vcfg["ttl_h"], force=True
+            )
+            notes.append(
+                f"音色锚点 {name}：链接过期，已用本地副本重新托管"
+                if new_url and not err
+                else f"⚠ 音色锚点 {name}：重新托管失败（{err}），这次会重新定锚点"
+            )
+        return notes
 
     def _clip_ref_url(self, asset_id: str, vcfg: dict[str, Any]) -> tuple[str, str]:
         """一段视频能不能当参考视频传给模型：返回 (url, 不能用的原因)。
@@ -1149,12 +1193,19 @@ class DramaFunctions:
             reasons.append(f"提到了资产库里的角色/服装：{'、'.join(hit[:4])}")
         if not reasons:
             return ""
-        return (
-            f"已拦截：没有参考图不能直接生成短剧镜头（{'；'.join(reasons)}）—— "
+        how = (
             "无参考生成的人物必然变脸，用户明确禁止。正确做法：失败/缺的段用 "
             "drama_render_shots(shots_id=…, rendered_id=…, reuse=true) 补渲，它会自动带参考图、"
             "锁音色并做一致性校验；要改镜头内容先改分镜提示词资产（重跑 drama_shots 或 "
-            "save_draft 新版本）再渲染。确定是无人物的空镜、不需要参考图，才传 allow_no_refs=true。"
+            "save_draft 新版本）再渲染。"
+        )
+        if hit:
+            # 点了角色名就不是空镜：allow_no_refs 也放不过（⛔ 开头 = 硬拦，见 media.gen_video）。
+            # 2026-09-23 审查：之前一个 allow_no_refs=true 就能绕过整道门，拦截文案还在教模型这么传
+            return f"⛔ 已拦截：提示词里有角色，不能无参考生成（{'；'.join(reasons)}）—— " + how
+        return (
+            f"已拦截：没有参考图不能直接生成短剧镜头（{'；'.join(reasons)}）—— " + how
+            + "只有确定是没有任何人物的空镜，才可以传 allow_no_refs=true。"
         )
 
     def _ref_probe_on(self) -> bool:
@@ -1171,6 +1222,17 @@ class DramaFunctions:
         except Exception:  # noqa: BLE001
             return 0
         return int(getattr(spec, "max_refs", 0) or 0)
+
+    def _max_duration(self) -> int:
+        """锁定的视频模型单段最长几秒（media_models.yaml max_duration）。0 = 不限 / 不知道。"""
+        get = getattr(self.catalog, "get", None)
+        if not callable(get):
+            return 0
+        try:
+            spec = get(MediaKind.VIDEO, self.video_model)
+        except Exception:  # noqa: BLE001
+            return 0
+        return int(getattr(spec, "max_duration", 0) or 0)
 
     async def _probe_urls(self, urls: list[str]) -> dict[str, str]:
         """参考图链接现在还能不能访问：url → 失败原因（"" = 可访问）。
@@ -1521,6 +1583,13 @@ class DramaFunctions:
         prev_id, prev = self._previous_pack(lib_id)
         images = {k: dict(v) for k, v in prev.items()}
         images[name] = {"asset": a.id, "url": url, "kind": kind, "source": "user"}
+        dropped: list[str] = []
+        if kind == "角色":
+            # 换了脸：旧服装图是按旧脸生成的，留着渲出来就是两张脸（2026-09-23 审查：换脸不传播）
+            char = next((c for c in lib.characters if c.name == name), None)
+            for cos in (char.costumes if char else []):
+                if images.pop(cos.name, None) is not None:
+                    dropped.append(cos.name)
         new = self.store.create(
             json.dumps(images, ensure_ascii=False, indent=2),
             type_=AssetType.STORYBOARD,
@@ -1529,11 +1598,18 @@ class DramaFunctions:
             creator="tool:drama_render_assets",
             gen_params={"model": self.image_model, "count": len(images), "user_refs": 1},
         )
+        redo = ""
+        if dropped:
+            redo = (
+                f"\n该角色有 {len(dropped)} 套服装图是按旧脸生成的，已从包里拿掉（渲视频时先退回"
+                f"主形象）：{'、'.join(dropped)}。跑 drama_render_assets(assets_id=\"{lib_id}\", "
+                "only=\"costumes\", reuse=true) 按新脸补生成。"
+            )
         return ToolResult(
             content=(
                 f"已把 {path or asset_id} 作为「{name}」的{kind}参考放进参考图包 {new.id}。"
                 f"之后 drama_render_assets(reuse=true) 沿用它不再生成该项；"
-                f"drama_render_shots 引用 ({name}) 时自动带上并做人物一致性校验。"
+                f"drama_render_shots 引用 ({name}) 时自动带上并做人物一致性校验。{redo}"
             ),
             asset_ref=new.id,
         )
@@ -1744,20 +1820,33 @@ class DramaFunctions:
         tail = "\n\n已清理（移进回收目录，可找回）：\n  " + "\n  ".join(done) if done else ""
         if failed:
             tail += "\n\n没能移动：\n  " + "\n  ".join(failed)
-        new_pack = self._repin_pack(lib_id, pack_id, pack, audits)
+        new_pack, dropped = self._repin_pack(lib_id, pack_id, pack, audits, lib)
         if new_pack:
             tail += f"\n\n参考图包已更新为 {new_pack}（冲突项换成保留的那张）"
+        if dropped:
+            tail += (
+                f"\n主形象换了，按旧脸生成的 {len(dropped)} 套服装图已从包里拿掉："
+                f"{'、'.join(dropped)}。"
+                "跑 drama_render_assets(only=\"costumes\", reuse=true) 补生成"
+            )
         return ToolResult(content=head + body + tail, asset_ref=new_pack or None)
 
     def _repin_pack(
-        self, lib_id: str, pack_id: str, pack: dict[str, dict[str, str]], audits: list[FaceAudit]
-    ) -> str:
-        """参考图包里若指向被弃用的图，换成保留的那张。没有要换的就不建新版。"""
+        self,
+        lib_id: str,
+        pack_id: str,
+        pack: dict[str, dict[str, str]],
+        audits: list[FaceAudit],
+        lib: Any = None,
+    ) -> tuple[str, list[str]]:
+        """参考图包里若指向被弃用的图，换成保留的那张。没有要换的就不建新版。
+        返回 (新包 id, 因为主形象换了而拿掉的服装)。"""
         if not pack:
-            return ""
+            return "", []
         retired = {c.asset_id: a for a in audits if not a.ambiguous for c in a.drift}
         images = {k: dict(v) for k, v in pack.items()}
         changed = False
+        swapped: dict[str, str] = {}  # 换了主形象的角色 → 新主形象资产
         for key, entry in images.items():
             a = retired.get(str(entry.get("asset") or ""))
             if a is None or a.keeper is None:
@@ -1765,9 +1854,19 @@ class DramaFunctions:
             entry["asset"] = a.keeper.asset_id
             entry["url"] = a.keeper.url
             entry["repinned_from"] = key
+            if str(entry.get("kind") or "") == "角色":
+                swapped[key] = a.keeper.asset_id
             changed = True
         if not changed:
-            return ""
+            return "", []
+        # 主形象换了：按旧脸生成的服装图作废（记着 portrait 且就是新脸的留下）
+        owner = {cos.name: c.name for c in lib.characters for cos in c.costumes} if lib else {}
+        dropped: list[str] = []
+        for key in list(images):
+            who = owner.get(key, "")
+            if who in swapped and str(images[key].get("portrait") or "") != swapped[who]:
+                images.pop(key)
+                dropped.append(key)
         asset = self.store.create(
             json.dumps(images, ensure_ascii=False, indent=2),
             type_=AssetType.STORYBOARD,
@@ -1776,7 +1875,7 @@ class DramaFunctions:
             creator="tool:drama_render_assets",
             gen_params={"model": self.image_model, "count": len(images), "face_audit": 1},
         )
-        return asset.id
+        return asset.id, dropped
 
     async def _fn_drama_voice_anchors(
         self, action: str = "list", character: str = "", clip_id: str = ""
@@ -2185,6 +2284,11 @@ class DramaFunctions:
                 if len(problems2) < len(problems):
                     shots, problems = shots2, problems2
 
+        # 全角括号里的资产名换成半角：提示词示例曾写成全角，模型照抄，场景引用和按场景换装
+        # 就全部失效（2026-09-23 审查）
+        known = lib.all_names()
+        for s in shots:
+            s.description = normalize_ref_parens(s.description, known)
         # 服装按场景绑定（确定性，不靠模型自觉）：镜头所在场景有绑定服装就换成它的 ID，
         # 同一场景内穿搭一致、换场景才换装；裸角色名也换成服装 ID 让参考图对得上
         bindings, wardrobe_warns = bind_costumes(shots, lib)
@@ -2251,6 +2355,7 @@ class DramaFunctions:
         person: bool = False,
         local_name: str = "",
         report: list[dict[str, Any]] | None = None,
+        minor: bool | None = None,
     ) -> tuple[str, str, str]:
         """出一张图，返回 (资产 id, 图片 url, 错误)。ref 是参考图 url（可多张）。
 
@@ -2278,14 +2383,16 @@ class DramaFunctions:
             return await self._gen_once(args)
 
         level = self._realism_level()
-        text, notes = person_image_prompt(prompt, level=level)
+        # 未成年角色：儿童安全写法（服装图的描述里没有年龄，由调用方按角色传进来）
+        minor = is_minor(prompt) if minor is None else minor
+        text, notes = person_image_prompt(prompt, level=level, minor=minor)
         aid, url, err = await self._gen_once({**args, "prompt": text})
         if err:
             return aid, url, err
         entry: dict[str, Any] = {"name": summary, "notes": notes, "attempts": 1, "asset": aid}
         if report is not None:
             report.append(entry)
-        aid, url = await self._realism_gate(args, prompt, level, entry, aid, url)
+        aid, url = await self._realism_gate(args, prompt, level, entry, aid, url, minor=minor)
         # 有参考图的人物图（服装）再过一道人物一致性：和主形象是不是同一个人
         if refs:
             aid, url = await self._identity_gate_image(args, text, refs, entry, aid, url)
@@ -2300,6 +2407,7 @@ class DramaFunctions:
         entry: dict[str, Any],
         aid: str,
         url: str,
+        minor: bool = False,
     ) -> tuple[str, str]:
         """真实感门：不合格按方向重生成，都没过留分数最高的。返回最终 (资产, url)。"""
         retries = self._realism_retries()
@@ -2309,7 +2417,9 @@ class DramaFunctions:
         best = (aid, url)
         best_score = -1
         for attempt in range(retries + 1):
-            passed, score, issues, note, direction = await self._check_realism(aid, url, level)
+            passed, score, issues, note, direction = await self._check_realism(
+                aid, url, level, minor=minor
+            )
             entry.update({"checked": True, "pass": passed, "score": score, "issues": issues})
             if note:
                 entry["note"] = note
@@ -2323,7 +2433,9 @@ class DramaFunctions:
             # 光太柔→要层次）。同样的参考图与版式；文件名自动 -v2
             entry["attempts"] = attempt + 2
             entry["retry_direction"] = direction or "smooth"
-            text, _ = person_image_prompt(prompt, retry=direction or "smooth", level=level)
+            text, _ = person_image_prompt(
+                prompt, retry=direction or "smooth", level=level, minor=minor
+            )
             aid2, url2, err2 = await self._gen_once({**args, "prompt": text})
             if err2:
                 entry["note"] = f"重生成失败：{err2}"
@@ -2424,7 +2536,7 @@ class DramaFunctions:
         return norm_level(cfg.get("realism_level"))
 
     async def _check_realism(
-        self, asset_id: str, url: str, level: str = ""
+        self, asset_id: str, url: str, level: str = "", minor: bool = False
     ) -> tuple[bool, int, list[str], str, str]:
         """视觉模型判一张人物图的皮肤质感是否达标。返回 (通过, 分数, 问题, 备注, 不合格方向)。
 
@@ -2436,7 +2548,9 @@ class DramaFunctions:
         if not image:
             return True, -1, [], "没有可校验的图片", ""
         try:
-            resp = await self.gateway.chat(REALISM_ROLE, realism_check_messages(image, level))
+            resp = await self.gateway.chat(
+                REALISM_ROLE, realism_check_messages(image, level, minor=minor)
+            )
         except KeyError:
             return True, -1, [], f"models.yaml 没配 {REALISM_ROLE} 角色，跳过校验", ""
         except Exception as e:  # noqa: BLE001
@@ -2481,15 +2595,19 @@ class DramaFunctions:
         # 增量：上次已经生成过的图直接复用，只补缺的。
         # 实测模型先 only=characters 省钱，之后再补服装/场景 —— 不复用的话主形象
         # 会再花一遍钱，而且新主形象和旧的不是同一张脸。
-        prev_id, prev = self._previous_pack(assets_id) if reuse else ("", {})
+        # 上一个包不管 reuse 与否都读：这次没要求生成的类别要原样带进新包（2026-09-23 审查：
+        # 之前 only=scenes 出的新包里只有场景，下游默认取最新的包，渲视频时人物全没了、被引用门
+        # 拦下；再跑 all 又换脸又重复付费）。reuse 只管要生成的这几类能不能沿用旧图
+        prev_id, prev = self._previous_pack(assets_id)
         images: dict[str, dict[str, str]] = {}
         reused: list[str] = []
         failed: list[str] = []
+        refused: list[str] = []  # 主形象被服务商内容护栏拒掉的角色
         gate_log: list[dict[str, Any]] = []  # 每张人物图的真实感处理与校验记录
         limit = self._max_concurrency("image")
 
         def take(name: str) -> bool:
-            if name in prev and prev[name].get("url"):
+            if reuse and name in prev and prev[name].get("url"):
                 images[name] = dict(prev[name])
                 reused.append(name)
                 return True
@@ -2514,10 +2632,17 @@ class DramaFunctions:
                 if not take(n.name):
                     phase_a.append(("道具", n.name, n.prompt(), "16:9", False))
         planned_costumes: list[Any] = []
+        # 这次要重生成主形象的角色：它的旧服装图是按旧脸生成的，不能再沿用（换脸要传到服装）
+        face_changed: set[str] = set()
         if "costumes" in want:
             for c in lib.characters:
+                if "characters" in want and c.name not in reused:
+                    face_changed.add(c.name)
+                face_id = str((prev.get(c.name) or {}).get("asset") or "")
                 for cos in c.costumes:
-                    if not take(cos.name):
+                    made_from = str((prev.get(cos.name) or {}).get("portrait") or "")
+                    stale = c.name in face_changed or bool(made_from and made_from != face_id)
+                    if stale or not take(cos.name):
                         planned_costumes.append((c, cos))
 
         # 进度窗的总数：第一层 + 计划的服装数（缺主形象被跳过的也算进去，
@@ -2544,6 +2669,8 @@ class DramaFunctions:
         for (label, name, *_), (aid, url, e) in zip(phase_a, res_a, strict=True):
             if e:
                 failed.append(f"{label} {name}：{e[:70]}")
+                if label == "角色" and _refused(e):
+                    refused.append(name)
                 continue
             # kind 写进包里：渲视频时按它排参考图的优先级（人物先于场景道具）
             images[name] = {"asset": aid, "url": url, "kind": label}
@@ -2551,30 +2678,35 @@ class DramaFunctions:
         # 第二层：各场景服装。**没有主形象就不生成** —— 生了也是另一张脸，
         # 那正是整套流程要消灭的问题，不如直接报出来。
         # 参考 = 主形象（脸）；服装图是纯白底单张全身正面照，一套服装一张。
-        # 元素：(服装名, 提示词, 参考图 url 列表)
-        phase_b: list[tuple[str, str, list[str]]] = []
+        # 元素：(服装名, 提示词, 参考图 url 列表, 主形象资产 id, 是否未成年)
+        phase_b: list[tuple[str, str, list[str], str, bool]] = []
         if planned_costumes:
             for c, cos in planned_costumes:
-                portrait = images.get(c.name, {}).get("url", "")
+                face = images.get(c.name) or (prev.get(c.name) if reuse else None) or {}
+                portrait = str(face.get("url") or "")
                 if not portrait:
                     failed.append(f"服装 {cos.name}：缺角色 {c.name} 的主形象，跳过")
                     done += 1  # 跳过也计入进度，总数不缩水
                     await self._progress("渲染参考图", done, total, f"服装·{cos.name}")
                     continue
-                phase_b.append((cos.name, cos.prompt(), [portrait]))
+                phase_b.append((
+                    cos.name, cos.prompt(), [portrait], str(face.get("asset") or ""),
+                    is_minor(c.body),
+                ))
             res_b = await _run_parallel(
                 phase_b,
                 lambda p: gen_tracked(
                     "服装", p[0], p[1], "16:9", f"服装·{p[0]}",
-                    ref=p[2], person=True, local_name=names.get(p[0], ""),
+                    ref=p[2], person=True, local_name=names.get(p[0], ""), minor=p[4],
                 ),
                 limit,
             )
-            for (name, *_), (aid, url, e) in zip(phase_b, res_b, strict=True):
+            for (name, _p, _r, face_id, _m), (aid, url, e) in zip(phase_b, res_b, strict=True):
                 if e:
                     failed.append(f"服装 {name}：{e[:70]}")
                     continue
-                images[name] = {"asset": aid, "url": url, "kind": "服装"}
+                # 记下按哪张脸生成的：主形象换了，这张就作废（下次 render_assets 会重生成）
+                images[name] = {"asset": aid, "url": url, "kind": "服装", "portrait": face_id}
 
         # 输出按资产库原序，不按完成顺序（并发后两者不一样）
         lines: list[str] = []
@@ -2596,9 +2728,25 @@ class DramaFunctions:
         if not images:
             return ToolResult(ok=False, error="一张图都没生成：\n" + "\n".join(failed))
 
+        # 新包 = 上一个包 + 这次生成 / 沿用的。主形象这次换了、服装却没重生成成功的：旧服装图
+        # 是旧脸，不能留 —— 去掉后渲视频时退回主形象（新脸）
+        merged = {k: dict(v) for k, v in prev.items()}
+        for c in lib.characters:
+            if c.name in face_changed and c.name in images:
+                for cos in c.costumes:
+                    if cos.name not in images and merged.pop(cos.name, None) is not None:
+                        failed.append(
+                            f"服装 {cos.name}：主形象换了、新服装图没生成出来，旧的（旧脸）已从包里"
+                            "去掉，渲视频时先退回主形象"
+                        )
+        merged.update(images)
+        kept = [k for k in merged if k not in images]
+        if kept:
+            lines.append(f"  · 其余 {len(kept)} 张沿用上一个参考图包（这次没要求生成这几类）")
+
         # 把真实感校验结果记进包里：哪张图过了、几次才过（按资产 id 对上）
         by_asset = {e["asset"]: e for e in gate_log if e.get("checked") and e.get("asset")}
-        for entry in images.values():
+        for entry in merged.values():
             rec = by_asset.get(entry.get("asset", ""))
             if rec:
                 entry["realism"] = {
@@ -2608,23 +2756,42 @@ class DramaFunctions:
                 }
 
         asset = self.store.create(
-            json.dumps(images, ensure_ascii=False, indent=2),
+            json.dumps(merged, ensure_ascii=False, indent=2),
             type_=AssetType.STORYBOARD,
-            summary=f"资产参考图·{len(images)}张",
+            summary=f"资产参考图·{len(merged)}张",
             parents=[assets_id] + ([prev_id] if prev_id else []),
             creator="tool:drama_render_assets",
             gen_params={
                 "model": self.image_model,
-                "count": len(images),
+                "count": len(merged),
                 "only": only,
                 "reused": len(reused),
+                "kept": len(kept),
                 "realism_checked": len(by_asset),
             },
         )
 
         fresh = len(images) - len(reused)
-        head = f"参考图包共 {len(images)} 张（本次新生成 {fresh}，复用 {len(reused)}）：\n"
+        head = (
+            f"参考图包共 {len(merged)} 张（本次新生成 {fresh}，复用 {len(reused)}"
+            + (f"，沿用上一个包 {len(kept)}" if kept else "")
+            + "）：\n"
+        )
         warn = ("\n\n未生成：\n  " + "\n  ".join(failed)) if failed else ""
+        if refused:
+            # 主形象被内容护栏拒掉：没有降级路径（换脸就不是这个角色了），停下来问人
+            return ToolResult(
+                content=head + "\n".join(lines) + warn + f"\n\n资产 {asset.id}",
+                asset_ref=asset.id,
+                suspend=True,
+                suspend_payload={
+                    "question": _refused_question(refused),
+                    "stage": REFUSED_STAGE,
+                    "target": REFUSED_STAGE,
+                    "assets": [asset.id],
+                    "major": True,
+                },
+            )
         # 面容审查（2026-09-22 用户定：渲完参考图后自动跑）——
         # 这一步是"最早能拦住脸漂移"的位置：再往后就是渲视频，带着错的脸花的是大钱。
         # 有定不了的角色会挂起问人，那时整个渲染结果也一并带出去，不会白渲。
@@ -2637,7 +2804,7 @@ class DramaFunctions:
             face = "\n\n" + (r.content or r.error or "")
         return ToolResult(
             content=head + "\n".join(lines) + warn
-            + "\n\n" + _coverage_note(lib, images)
+            + "\n\n" + _coverage_note(lib, merged)
             + _realism_note(gate_log)
             + face
             + f"\n\n资产 {asset.id}（生视频时要用）",
@@ -2696,7 +2863,16 @@ class DramaFunctions:
         # 参考图链接过期/本地：配了托管就先重新上传（图不变、链接换新），不然模型拿不到参考
         images, host_notes = await self._rehost_pack(pack_id, images)
         pack_notes += host_notes
-        all_refs = list(dict.fromkeys(r for s in shots for r in s.refs()))
+        lib = self._library_for(shots_id, pack_id)
+        # 全角括号里的资产名换成半角（老提示词照抄过全角示例）
+        known = set(images) | (lib.all_names() if lib is not None else set())
+        for s in shots:
+            s.description = normalize_ref_parens(s.description, known)
+        # 「(OS)」「(画外音)」这类标注不是资产引用，不参与匹配、也不算「包里没有」
+        all_refs = [
+            r for r in dict.fromkeys(r for s in shots for r in s.refs())
+            if r in images or _looks_like_asset(r, lib)
+        ]
         resolved = {r: _resolve_ref(r, images) for r in all_refs}
         if images and all_refs and not any(resolved.values()):
             return ToolResult(
@@ -2710,7 +2886,6 @@ class DramaFunctions:
                     "或分镜与资产库不是同一套。"
                 ),
             )
-        lib = self._library_for(shots_id, pack_id)
         # 增量重跑：上次已成功的段直接复用，只生成失败/缺的 —— 引用门只查这次要生成的段
         prev_clips = (
             self._previous_clips(shots_id, episode, pack_id, redo, accept) if reuse else {}
@@ -2786,13 +2961,39 @@ class DramaFunctions:
             if missing:
                 pack_notes.append(f"（复用的段引用了包里没有的 {', '.join(missing[:4])}，未重渲）")
 
+        # ---- 单段时长超过锁定模型的上限：花钱之前拦 ----
+        # 2026-09-23 审查：换了视频模型后时长被媒体层静默截到新模型上限，按 15s 排的镜头时间线
+        # 尾巴被砍、一集总时长只剩约 2/3，全程没有提示
+        cap = self._max_duration()
+        over = [i for i in todo if cap and (shots[i].seconds or FALLBACK_SECONDS) > cap]
+        if over:
+            shown = ", ".join(
+                f"{shots[i].scene_index} {shots[i].video_name}（{shots[i].seconds}s）"
+                for i in over[:4]
+            )
+            return ToolResult(
+                ok=False,
+                meta={"charged": False},
+                error=(
+                    f"当前视频模型 {self.video_model} 单段最长 {cap}s，这次要渲的 {len(over)} 段"
+                    f"超过它（{shown}）—— 渲出来会被截短，段内镜头时间线和一集总时长都对不上，"
+                    "没有发起生成。换回支持这个时长的模型（会先问用户），或重跑 drama_shots 按"
+                    f" ≤{cap}s 一段重新规划提示词"
+                ),
+            )
+
         # ---- 音色锁定（花钱之前算好）：谁在说话、沿用哪些锚点、本次要新定哪些 ----
         # 每段视频各自发声，几十段下来同一角色的声音必然漂。两道锁：说话角色的音色卡
         # 锁进提示词；该角色的锚点片段（第一段独白）当参考视频（@视频N 取音色），跨集沿用。
         lib_scene_names = lib.scene_names() if lib else set()
+        # 服装 → 角色（渲视频时给服装配上角色的脸）；未成年角色（这段用儿童安全的真实感尾巴）
+        owner_of = {cos.name: c.name for c in lib.characters for cos in c.costumes} if lib else {}
+        minors = {c.name for c in lib.characters if is_minor(c.body)} if lib else set()
         speakers_by_shot = [speakers_of(s, lib) if lib else {} for s in shots]
         vcfg = self._voice_cfg()
         anchors = self._load_anchors() if lib else {}
+        if anchors and vcfg["enabled"]:
+            pack_notes += await self._rehost_anchors(anchors, vcfg)
         usable = {n for n, a in anchors.items() if not self._anchor_url(a, vcfg)[1]}
         plan = plan_anchors(speakers_by_shot, lib, anchors, usable) if lib else AnchorPlan()
         if not vcfg["enabled"]:
@@ -2887,6 +3088,7 @@ class DramaFunctions:
                 # 引用到的资产图当参考：人物/服装优先（脸最要紧），再场景道具 ——
                 # 接口若截断参考图数，先丢的是最不影响一致性的
                 people: list[str] = []
+                faces: list[str] = []  # 服装对应角色的主形象（脸）：可选参考，位子够才带
                 others: list[str] = []
                 label_of: dict[str, tuple[str, str]] = {}  # url → (类别, 名字)
                 id_refs: list[tuple[str, str]] = []  # 一致性校验用：(角色名, url)
@@ -2898,13 +3100,27 @@ class DramaFunctions:
                     kind = str((images.get(m.key) or {}).get("kind") or "")
                     if not kind:
                         kind = "角色" if m.person else ("场景" if r in lib_scene_names else "道具")
-                    label_of.setdefault(m.url, (kind, m.key.removesuffix("·三视图")))
+                    key = m.key.removesuffix("·三视图")
+                    label_of.setdefault(m.url, (kind, key))
                     if m.person and kind in ("角色", "服装"):
-                        id_refs.append((m.key.removesuffix("·三视图"), m.url))
+                        id_refs.append((key, m.url))
+                    if m.person and kind == "服装":
+                        # 服装全身图里脸只占一小块：同时带上这个角色的主形象当脸的参考
+                        # （2026-09-23 审查：之前只传服装图，「参考图传了照样漂」的主因之一）
+                        who = owner_of.get(key, "")
+                        fu = str((images.get(who) or {}).get("url") or "") if who else ""
+                        if fu and fu != m.url:
+                            faces.append(fu)
+                            label_of.setdefault(fu, ("角色", who))
                 refs = list(dict.fromkeys(people))
+                face_refs = [u for u in dict.fromkeys(faces) if u not in refs]
+                refs += face_refs
                 refs += [u for u in dict.fromkeys(others) if u not in refs]
                 ref_labels = [label_of[u] for u in refs if u in label_of]
-                id_refs = list(dict.fromkeys(id_refs))[:3]
+                # 一致性校验优先拿脸比（主形象比全身服装图清楚得多）
+                id_refs = list(dict.fromkeys(
+                    [(label_of[u][1], u) for u in face_refs] + id_refs
+                ))[:3]
                 # 参考视频（@视频N 按顺序编号）：🔴 前序片段在前（画面延续），
                 # 再是说话角色的音色锚点（台词多的优先），总数不超过接口上限
                 videos: list[str] = []
@@ -2936,7 +3152,9 @@ class DramaFunctions:
                     people_set = set(people)
                     keep = [u for u in refs if u in people_set]
                     rest = [u for u in refs if u not in people_set]
-                    rest.sort(key=lambda u: 0 if label_of.get(u, ("", ""))[0] == "场景" else 1)
+                    # 位子不够时先保脸（主形象），再场景，最后道具
+                    rank = {"角色": 0, "场景": 1}
+                    rest.sort(key=lambda u: rank.get(label_of.get(u, ("", ""))[0], 2))
                     room = max(0, budget - len(keep))
                     dropped = rest[room:]
                     refs = keep + rest[:room]
@@ -2958,7 +3176,14 @@ class DramaFunctions:
                 )
                 args: dict[str, Any] = {
                     # 真实感：画面描述在前，真实感段与硬约束尾巴在后（视频模型先要听懂发生了什么）
-                    "prompt": person_video_prompt(core, level=self._realism_level()),
+                    "prompt": person_video_prompt(
+                        core,
+                        level=self._realism_level(),
+                        minor=bool(minors & (
+                            _covered_characters(s, resolved, lib)
+                            | set(_mentioned_characters(s.description, lib))
+                        )),
+                    ),
                     "model": self.video_model,
                     "aspect_ratio": "9:16",
                     "resolution": "720p",
@@ -3038,8 +3263,7 @@ class DramaFunctions:
 
         anchors_id = ""
         if new_anchors:
-            anchors.update(new_anchors)
-            anchors_id = self._save_anchors(anchors, [pack_id, shots_id])
+            anchors_id = self._merge_save_anchors(new_anchors, [pack_id, shots_id])
 
         # 拼接按镜头原序 —— 并发后完成顺序是乱的，不能按完成顺序拼
         ordered = [done[i] for i in sorted(done)]
@@ -3076,7 +3300,7 @@ class DramaFunctions:
                     f"{done[i]['asset']}"
                 )
                 continue
-            lost = [r for r in s.refs() if resolved.get(r) is None]
+            lost = [r for r in s.refs() if resolved.get(r) is None and _looks_like_asset(r, lib)]
             n_img, n_vid = n_refs[i]
             note = f"　参考 {n_img} 图" + (f" + {n_vid} 视频" if n_vid else "")
             if lost and images:
@@ -3308,7 +3532,17 @@ def _mentioned_characters(desc: str, lib: Any) -> list[str]:
     if lib is None:
         return []
     body = _strip_dialogue(desc)
-    return [c.name for c in lib.characters if c.name and c.name in body]
+    names = [c.name for c in lib.characters if c.name]
+    # 「朱锦娘」里有「朱锦」：长名字出现时短名字不算（之前按子串，同框只有朱锦娘也判朱锦没带参考）
+    return [n for n in names if matches_character(body, n, names)]
+
+
+def _looks_like_asset(ref: str, lib: Any) -> bool:
+    """括号里的是不是资产引用：服装 ID 形状（-[…]）或含资产库里的名字。
+    「(OS)」「(画外音)」这类标注不是 —— 之前一律当引用，包里找不到就整批拦下（2026-09-23 审查）。"""
+    if "-[" in ref or lib is None:
+        return True
+    return any(n and n in ref for n in lib.all_names())
 
 
 def _covered_characters(shot: Any, resolved: dict[str, Any], lib: Any) -> set[str]:
@@ -3335,7 +3569,7 @@ def preflight_refs(
     for i in todo:
         s = shots[i]
         tag = f"{s.scene_index} {s.video_name}"
-        missing = [r for r in s.refs() if resolved.get(r) is None]
+        missing = [r for r in s.refs() if resolved.get(r) is None and _looks_like_asset(r, lib)]
         if missing:
             problems.append(f"{tag}：引用了参考图包里没有的「{'」「'.join(missing)}」")
         mentioned = _mentioned_characters(s.description, lib)
@@ -3426,6 +3660,32 @@ def _script_problem(text: str) -> str:
             "传剧本资产 id（script_id），或把完整正文传进来"
         )
     return ""
+
+
+REFUSED_STAGE = "参考图·主形象被拒"
+# 服务商内容护栏拒绝的常见说法（APIMart / 各家生图接口的报错原文）
+_REFUSAL_WORDS = (
+    "内容安全", "内容审核", "内容策略", "护栏", "违规", "不合规", "敏感", "未成年",
+    "policy", "safety", "sensitive", "moderation", "refus", "prohibited", "not allowed",
+    "nsfw", "minor",
+)
+
+
+def _refused(err: str) -> bool:
+    low = (err or "").lower()
+    return any(w in low for w in _REFUSAL_WORDS)
+
+
+def _refused_question(names: list[str]) -> str:
+    who = "、".join(names)
+    return (
+        f"这些角色的主形象被生图服务的内容护栏拒了：{who}（儿童角色最常见）。没有主形象，"
+        "它们的服装图也生成不了，渲视频时会被引用门拦下。怎么处理？在 a 后面写你的选择：\n"
+        "① 给一张本地照片当主形象（写上路径，我用 drama_use_local_ref 登记）\n"
+        "② 换一家生图模型再试（写上想换哪家，换之前我会再确认）\n"
+        "③ 改写这个角色的外貌描述（写上怎么改）后重渲主形象\n"
+        "r = 先不管这几个角色，接着做别的"
+    )
 
 
 def _label_hit(key: tuple[str, str], wants: list[str] | None) -> bool:

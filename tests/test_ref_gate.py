@@ -339,9 +339,12 @@ def test_reference_guard_认集号镜号和资产库里的名字():
     store.create(json.dumps(LIB, ensure_ascii=False), summary="资产库", creator="tool:drama_assets")
     fns = DramaFunctions(None, store, registry=None, catalog=None)
     why = fns.reference_guard("陆离走进隧道", "")
-    assert "陆离" in why and "drama_render_shots" in why and "allow_no_refs" in why
+    assert "陆离" in why and "drama_render_shots" in why
+    # 点了角色名的不是空镜：硬拦（⛔），也不再教模型传 allow_no_refs 绕过（2026-09-23 审查）
+    assert why.startswith("⛔") and "allow_no_refs" not in why
     rewritten = fns.reference_guard("a man runs", "第11集镜15-声波驱散器爆亮（改写版）")
-    assert "带集号或镜号" in rewritten
+    assert "带集号或镜号" in rewritten and not rewritten.startswith("⛔")
+    assert "allow_no_refs" in rewritten, "只有集号镜号的，确认是空镜才可以放行"
     assert "带集号或镜号" in fns.reference_guard("镜 3 的画面", "")
     assert fns.reference_guard("海边日落，无人", "") == ""
     assert fns.reference_guard("Cinematic close-up", "B-roll 3") == ""

@@ -346,6 +346,20 @@ def check_shots(shots: list[ShotPrompt], fmt: EpisodeFormat) -> list[str]:
             problems.append(
                 f"{label}：{len(mismatch)} 段的 cuts 加起来不等于 video_duration：{shown}"
             )
+        # 用了 [切镜] 标记、个数却和 cuts 对不上：渲染时按 cuts 排的时间线和描述里的镜头各说各的
+        # （首个镜头可以不写 [切镜]，所以 cuts 数或 cuts 数 - 1 都算对；一个标记都没写的不在这里管）
+        off = [
+            s for s in items
+            if s.cuts
+            and s.description.count("[切镜")
+            and s.description.count("[切镜") not in (len(s.cuts), len(s.cuts) - 1)
+        ]
+        if off:
+            shown = ", ".join(
+                f"{s.video_name}({s.description.count('[切镜')} 个[切镜]/{len(s.cuts)} 个 cuts)"
+                for s in off[:5]
+            )
+            problems.append(f"{label}：{len(off)} 段描述里的 [切镜] 数和 cuts 对不上：{shown}")
         few = [
             s for s in no_cuts
             if s.shot_count and s.shot_count < fmt.cuts_per_segment(s.seconds)

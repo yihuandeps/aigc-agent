@@ -224,6 +224,52 @@ _RETRY = {
 RETRY_BOOST = _RETRY["smooth"][DEFAULT_LEVEL]
 
 
+# ---------------------------------------------------------------- 未成年角色（2026-09-23）
+
+# 上面那套（attractive / RAW / 毛孔 / 雀斑 / 硬光）是给成年人设计的。套到儿童角色上，既不该这么
+# 描写孩子，也正好撞上生图服务的儿童护栏 —— 8 岁女主的主形象被拒，她的服装图全部连带跳过
+# （2026-09-23 审查，因果属推测，但这套写法本来就不该用在孩子身上）。
+_MINOR_WORDS = (
+    "萌宝", "小孩", "孩子", "儿童", "幼童", "女童", "男童", "小女孩", "小男孩", "女孩", "男孩",
+    "婴儿", "宝宝", "小学生", "初中生", "未成年", "少年", "少女",
+    "child", "kid", "toddler", "baby", "teen", "schoolgirl", "schoolboy",
+)
+_AGE = re.compile(r"(\d{1,3})\s*(?:岁|周岁|years?[\s-]*old)", re.I)
+
+_CHILD_HEAD = (
+    "【硬约束，优先级高于下文所有描述】自然、健康、符合年龄的儿童真实照片：日常着装、神态自然，"
+    "皮肤按真实儿童的样子干净自然（不刻意描写毛孔、雀斑、皱纹这类瑕疵），柔和的日常自然光；"
+    "不要成人化的妆容、发型、服装或姿态，不要美颜滤镜与塑料感。"
+    " Natural, wholesome, age-appropriate candid photo of a child: everyday clothes, natural "
+    "expression, clean natural skin (no emphasis on pores, freckles or wrinkles), soft everyday "
+    "daylight; no makeup, no mature styling, clothing or poses; no beauty filter, no plastic look."
+)
+_CHILD_RETRY = (
+    "【第二次生成】上一版不像真实照片（塑料感、过度修饰或光线不自然），这次更像日常随手拍的真实"
+    "儿童照片，自然光、神态自然。 SECOND ATTEMPT — make it look like a natural, everyday candid "
+    "photo of a child; natural light and expression."
+)
+_CHILD_SUFFIX = "日常自然光，画面带极细微的感光颗粒，像真实照片而不是渲染图。"
+_CHILD_TAIL_VIDEO = (
+    "Style: natural, wholesome, age-appropriate footage of the child; everyday clothes; natural "
+    "daylight; no makeup or mature styling; no beauty filter; subtle film grain."
+)
+_CHILD_TARGET = (
+    "目标是「自然、符合年龄的儿童真实照片」：干净自然、不像塑料、没有成人化的妆容和打扮。"
+)
+
+
+def is_minor(text: str) -> bool:
+    """人物描述里的这个人是不是未成年。按**外表**算：「外表 8 岁（实际元神 1400 年）」按孩子画。
+    写了年龄就以第一个年龄为准，没写再看「萌宝 / 孩子 / 少年」这类词。"""
+    t = text or ""
+    m = _AGE.search(t)
+    if m:
+        return int(m.group(1)) < 18
+    low = t.lower()
+    return any(w in low for w in _MINOR_WORDS)
+
+
 def image_suffix(level: str = "") -> str:
     """生图时追加的真实感段落（人物图用）。"""
     lv = norm_level(level)
@@ -396,14 +442,22 @@ def _prepare_body(core: str, level: str) -> tuple[str, list[str]]:
 
 
 def person_image_prompt(
-    core: str, retry: bool | str = False, level: str = ""
+    core: str, retry: bool | str = False, level: str = "", minor: bool | None = None
 ) -> tuple[str, list[str]]:
     """人物生图的完整提示词：硬约束在前、描述居中、真实感段在后。
 
     retry：False/"" 首次；True 或 "smooth" = 上一版磨皮了；"heavy" = 做旧过头；"light" = 光太柔。
+    minor：未成年角色（None = 按描述自动判）→ 儿童安全写法：不写皮肤瑕疵、不成人化。
     返回 (提示词, 处理记录)：清洗替换了哪些词、压轻了哪些瑕疵、有没有补锚点。
     """
     lv = norm_level(level)
+    if minor is None:
+        minor = is_minor(core)
+    if minor:
+        body, _ = sanitize_beauty(core)
+        head = (_CHILD_RETRY + " " if retry else "") + _CHILD_HEAD
+        note = "未成年角色：儿童安全写法（不写皮肤瑕疵、不成人化）"
+        return f"{head}\n{body}\n{_CHILD_SUFFIX}", [note]
     body, notes = _prepare_body(core, lv)
     body, injected = ensure_imperfections(body, lv)
     if injected:
@@ -414,10 +468,13 @@ def person_image_prompt(
     return f"{head}\n{body}\n{image_suffix(lv)}", notes
 
 
-def person_video_prompt(core: str, level: str = "") -> str:
-    """人物视频提示词：画面描述在前，真实感段与硬约束尾巴在后。"""
+def person_video_prompt(core: str, level: str = "", minor: bool = False) -> str:
+    """人物视频提示词：画面描述在前，真实感段与硬约束尾巴在后。
+    minor：这段里有未成年角色 → 儿童安全的尾巴（不强调皮肤瑕疵与硬光）。"""
     lv = norm_level(level)
     body, _ = _prepare_body(core, lv)
+    if minor:
+        return f"{body} {_CHILD_TAIL_VIDEO}"
     return f"{body} {video_suffix(lv)} {_HARD_TAIL_VIDEO[lv]}"
 
 
@@ -446,9 +503,12 @@ _CHECK_PROMPT = (
 )
 
 
-def realism_check_messages(image_url: str, level: str = "") -> list[dict[str, Any]]:
+def realism_check_messages(
+    image_url: str, level: str = "", minor: bool = False
+) -> list[dict[str, Any]]:
     """给视觉模型的校验消息。image_url 可以是 data URL（本地文件）或 https 链接。"""
-    text = _CHECK_PROMPT.format(target=_TARGET[norm_level(level)])
+    target = _CHILD_TARGET if minor else _TARGET[norm_level(level)]
+    text = _CHECK_PROMPT.format(target=target)
     return [
         {
             "role": "user",
@@ -512,13 +572,29 @@ def parse_realism_verdict(text: str) -> tuple[bool, int, list[str]]:
 
 # 和真实感预设冲突的老规则 —— 开预设时用右边替换左边。
 # 留在这里而不是直接删，是为了让"为什么改了你的提示词"这件事可追溯。
-CONFLICTS: list[tuple[str, str]] = [
-    (
-        '禁止项：严禁出现"皱纹 (wrinkles)"、"青筋 (veins)"、"血丝 (bloodshot)"、'
-        '"痣 (moles/freckles)"以及"深陷的眼窝 (deep-set eyes)"。',
-        "皮肤真实度：**必须**保留毛孔、细微纹理、少量雀斑 (freckles) 与颗粒感。"
-        "严禁磨皮、瓷化、塑料感。眼窝按人物年龄自然呈现，不刻意填平。",
+_SKIN_RULE = {
+    # 2026-09-23 审查：之前三档都写「必须保留少量雀斑」，和 subtle 档「雀斑至多零星几点」打架
+    "subtle": (
+        "皮肤真实度：保留细看可见的毛孔与细微纹理，雀斑至多零星几点极淡，年轻角色不写皱纹。"
+        "严禁磨皮、瓷化、塑料感。眼窝按人物年龄自然呈现，不刻意填平。未成年角色不写皮肤瑕疵。"
     ),
+    "natural": (
+        "皮肤真实度：**必须**保留毛孔、细微纹理、少量雀斑 (freckles) 与颗粒感。"
+        "严禁磨皮、瓷化、塑料感。眼窝按人物年龄自然呈现，不刻意填平。未成年角色不写皮肤瑕疵。"
+    ),
+    "strong": (
+        "皮肤真实度：**必须**保留清晰的毛孔、细纹、较多雀斑 (freckles) 与颗粒感。"
+        "严禁磨皮、瓷化、塑料感。眼窝按人物年龄自然呈现。未成年角色不写皮肤瑕疵。"
+    ),
+}
+
+_FLAWLESS_RULE = (
+    '禁止项：严禁出现"皱纹 (wrinkles)"、"青筋 (veins)"、"血丝 (bloodshot)"、'
+    '"痣 (moles/freckles)"以及"深陷的眼窝 (deep-set eyes)"。'
+)
+
+CONFLICTS: list[tuple[str, str]] = [
+    (_FLAWLESS_RULE, _SKIN_RULE["natural"]),
     (
         '面部光影：强制使用"柔和的蝴蝶光 (Butterfly Lighting)"或"影棚级三点光 '
         '(Studio 3-point lighting)"，以消除面部多余的阴影坑洞。',
@@ -535,14 +611,16 @@ CONFLICTS: list[tuple[str, str]] = [
 ]
 
 
-def apply_conflicts(template: str) -> str:
-    """把和真实感预设冲突的老规则换掉。
+def apply_conflicts(template: str, level: str = "") -> str:
+    """把和真实感预设冲突的老规则换掉（皮肤那条按档位换）。
 
     逐条替换而不是整段重写：原提示词里其他约束（族裔锁定、微表情注入、
     骨骼结构干预）都还要留着，那些和真实感不冲突。
     """
     out = template
     for old, new in CONFLICTS:
+        if old == _FLAWLESS_RULE:
+            new = _SKIN_RULE[norm_level(level)]
         if old in out:
             out = out.replace(old, new)
     return out

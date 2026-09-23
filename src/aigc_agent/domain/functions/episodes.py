@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 from ...capabilities.subagents import SubAgentDef, SubAgentRunner
@@ -173,10 +174,15 @@ def build_contract(
     note: str,
     mode: str,
     rules: str = "",
+    constraints: str = "",
 ) -> str:
     parts = [f"## 本集任务\n写第 {n} 集" + (f"（共 {total} 集）" if total else "") + "。"]
     if rules:
         parts.append("## 一集的规格（硬性）\n" + rules)
+    if constraints:
+        # 用户定过的要求和打回理由（Memory Brief）：主循环每轮 pin 着，子代理之前看不到 ——
+        # 打回理由对逐集写出来的剧本不生效（2026-09-23 审查）
+        parts.append("## 用户定过的要求（打回理由 / 偏好，必须遵守）\n" + constraints)
     if entry:
         parts.append("分集目录里这一集的条目：\n" + entry)
     else:
@@ -215,6 +221,8 @@ class EpisodeFunctions:
         self.assets = assets
         self.bus = bus
         self.fmt = fmt or DEFAULT_FORMAT  # 一集 4 分钟 / 开场 15 秒高潮点（config/drama.yaml）
+        # Memory Brief 的来源（装配层接 MemoryAgent.brief）：topic → 要遵守的约束文本
+        self.brief_source: Callable[[str], str] | None = None
         common = {
             "outline_id": {
                 "type": "string",
@@ -344,6 +352,12 @@ class EpisodeFunctions:
     ) -> tuple[Asset | None, str]:
         entry, prev_entry, next_entry = outline_entry(self.assets.content(outline.id), n)
         prev = self.assets.episode_assets(n - 1).get("剧本") if n > 1 else None
+        constraints = ""
+        if self.brief_source is not None:
+            try:
+                constraints = self.brief_source(f"第{n}集 剧本 {entry}")[:3000]
+            except Exception:  # noqa: BLE001 — 记忆出问题不能挡住写剧本
+                constraints = ""
 
         def contract_with(extra: str) -> str:
             return build_contract(
@@ -358,6 +372,7 @@ class EpisodeFunctions:
                 note=(note + "\n" + extra).strip() if extra else note,
                 mode=mode,
                 rules=writing_rules(self.fmt),
+                constraints=constraints,
             )
 
         r = await self.runner.run(WRITER_DEF, task=contract_with(""))
@@ -384,7 +399,10 @@ class EpisodeFunctions:
             text,
             type_=AssetType.SCRIPT,
             summary=f"第{n}集·{title}" if title else f"第{n}集",
-            parents=[outline.id] + ([prev.id] if prev else []),
+            # 用了哪份目录、上一集、角色档案、创作方案都记下：复盘时能回答「按哪版设定写的」
+            parents=[outline.id]
+            + ([prev.id] if prev else [])
+            + [a.id for a in (characters, plan) if a is not None],
             creator="tool:drama_write_episode",
             gen_params={
                 "episode": n,

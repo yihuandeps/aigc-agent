@@ -344,12 +344,15 @@ class Agent:
         subagents = SubAgentRunner(gateway, registry, bus, guard=guard)
         registry.register(FanOutFunctions(subagents, assets))
         # 逐集写剧本的子代理：写作从主循环搬出来，主 Agent 只收 id 和结尾钩子
-        registry.register(EpisodeFunctions(subagents, assets, bus, fmt=episode_fmt))
+        episode_fns = EpisodeFunctions(subagents, assets, bus, fmt=episode_fmt)
+        registry.register(episode_fns)
         # M8.2 记忆代理：淘汰的轮次 → 关键词提取 → 长期记忆。
         # 独立上下文 + 异步执行，主循环只入队不等它。
         # 记忆按项目键归档（缺口 A）：之前按会话名，而 CLI 不带 --session 时会话名是空串 ——
         # 库里 48 条记忆全是全局的，蜘蛛精剧那句「控制在十二集」对所有剧都生效
         mem_agent = MemoryAgent(gateway, memories, project_id=project, runner=subagents)
+        # 逐集写作的子代理也要守 Memory Brief（打回理由之前对它写的剧本不生效）
+        episode_fns.brief_source = lambda topic: mem_agent.brief(topic=topic).pin_text()
         # 打回理由自动落库（M8），同样按项目
         recorder = RejectionRecorder(memories, project_id=project)
         recorder.attach(bus)

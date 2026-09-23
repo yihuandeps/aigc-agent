@@ -263,6 +263,27 @@ class AssetLibrary:
 _REF = re.compile(r"\(([^()]{2,80}?)\)")
 # 🔴 视频引入：{第1集-1场}
 _CARRY = re.compile(r"\{([^{}]{2,40}?)\}")
+# 全角括号里的资产名（提示词示例曾写成全角「（奢华酒店顶层客厅）」，模型照抄 ——
+# 场景参考图和按场景换装就全部失效，2026-09-23 审查）
+_FULL_REF = re.compile(r"（([^（）]{2,80}?)）")
+# 括号里的这些是台词 / 镜头标注，不是资产引用：之前「(OS)」被当成引用，包里找不到就整批拦下
+_NOT_REF = (
+    "切镜", "L-Cut", "VO", "V.O", "OS", "O.S", "Front", "Profile", "Back",
+    "画外音", "旁白", "内心", "独白", "心声", "字幕", "音效", "SFX", "BGM",
+)
+
+
+def normalize_ref_parens(text: str, known: set[str]) -> str:
+    """全角括号里是资产库 / 参考图包里的名字 → 换成半角 (名字)。
+    不是资产名的全角括号（「陆离（低声）」）不动。"""
+    if not text or not known:
+        return text
+
+    def sub(m: re.Match[str]) -> str:
+        inner = m.group(1).strip()
+        return f"({inner})" if inner in known else m.group(0)
+
+    return _FULL_REF.sub(sub, text)
 
 
 @dataclass
@@ -297,7 +318,7 @@ class ShotPrompt:
         for r in _REF.findall(self.description):
             t = r.strip()
             # 切镜标记不是资产引用：(L-Cut Voice-over)、(VO) 之类
-            if t and not t.startswith(("切镜", "L-Cut", "VO", "Front", "Profile", "Back")):
+            if t and not t.startswith(_NOT_REF):
                 out.append(t)
         return list(dict.fromkeys(out))
 

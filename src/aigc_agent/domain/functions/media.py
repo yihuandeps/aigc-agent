@@ -208,8 +208,11 @@ class MediaFunctions:
                     },
                     "allow_no_refs": {
                         "type": "boolean",
-                        "description": "没有参考图也允许生成（默认 false：短剧镜头/提到角色的提示词"
-                        "不带参考图会被拦下）。只有确定是无人物的空镜才传 true",
+                        "description": (
+                            "没有参考图也允许生成（默认 false：短剧镜头不带参考图会被拦下）。"
+                            "只对没有任何人物的空镜有效 —— 提示词里出现资产库里的角色/服装时"
+                            "传了也会被拦"
+                        ),
                     },
                     "video_urls": {
                         "type": "array",
@@ -279,8 +282,10 @@ class MediaFunctions:
                     "allow_text": {"type": "boolean"},
                     "allow_no_refs": {
                         "type": "boolean",
-                        "description": "没有参考图也允许生成"
-                        "（默认 false，短剧镜头不带参考图会被拦）",
+                        "description": (
+                            "没有参考图也允许生成（默认 false，短剧镜头不带参考图会被拦）；"
+                            "只对没有人物的空镜有效，点了角色名的照样拦"
+                        ),
                     },
                 },
                 "required": ["jobs"],
@@ -731,9 +736,10 @@ class MediaFunctions:
             return ToolResult(ok=False, error=_local_ref_error(bad), meta={"charged": False})
         # 参考图门（2026-09-20 用户定的规则）：短剧镜头没带参考图不许生成，在提交前拦，
         # 不能生成完再说"没引用成功"。拦截规则由 DramaFunctions.reference_guard 提供。
-        if not pics and not allow_no_refs and self.ref_guard is not None:
+        if not pics and self.ref_guard is not None:
             why = self.ref_guard(prompt, summary)
-            if why:
+            # ⛔ 开头 = 提示词里点了角色名，不是空镜：allow_no_refs 也不放（2026-09-23 审查）
+            if why and (not allow_no_refs or why.startswith("⛔")):
                 return ToolResult(ok=False, error=why, meta={"charged": False})
         # 画面里不许有字幕/文字（用户 2026-09-18 定的最高优先级约束）：
         # 所有视频统一在这里包一层，短剧/配方/手动调用都逃不掉；allow_text 才放开

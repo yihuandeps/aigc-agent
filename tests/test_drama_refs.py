@@ -286,5 +286,10 @@ async def test_补跑后渲视频服装精确命中():
     r = await fns._fn_drama_render_assets(lib_id)
     rs = await fns._fn_drama_render_shots(shots_id, rendered_id=r.asset_ref)
     assert rs.ok, rs.error
-    assert "参考 2 图" in rs.content and "退回" not in rs.content and "缺" not in rs.content
+    # 服装 + 这个角色的主形象（脸）+ 场景/道具：服装全身图里脸太小，脸要单独给（2026-09-23）
+    assert "参考 3 图" in rs.content and "退回" not in rs.content and "缺" not in rs.content
     assert "参考图匹配：4 个精确" in rs.content
+    pack = json.loads(store.content(r.asset_ref))
+    first = fake.videos()[0]
+    assert first["image"][:2] == [pack["小满-旧连帽衫-[前10集]"]["url"], pack["小满"]["url"]]
+    assert "角色「小满」本人" in first["prompt"], "脸那张要在提示词里点名"

@@ -316,7 +316,8 @@ async def test_写一集_落资产并回传钩子():
     assert r.ok, r.error
     a = store.get(r.asset_ref)
     assert a.type is AssetType.SCRIPT and a.gen_params["episode"] == 1
-    assert a.summary == "第1集·自动标题" and a.parent_ids == [outline.id]
+    assert a.summary == "第1集·自动标题" and a.parent_ids[0] == outline.id
+    assert set(a.parent_ids[1:]) == {chars.id, plan.id}, "用了哪份角色档案 / 创作方案要记下"
     assert a.gen_cost == 0.01
     assert "钩子" in r.content and "正文正文正文" not in r.content, "只收 id 和钩子，不收全文"
     task = runner.tasks[0]
