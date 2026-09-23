@@ -58,11 +58,22 @@ server = MCPServer(
 # ---------------------------------------------------------------- 路径
 
 
+def _workspace() -> Path:
+    """和主进程同一个 workspace（AIGC_WORKSPACE），没设就用项目下的 workspace/。
+
+    之前用 Path.cwd()/workspace —— 换个目录启动就在那里凭空建一个 workspace。
+    """
+    raw = os.environ.get("AIGC_WORKSPACE", "").strip()
+    if raw:
+        return Path(raw)
+    return Path(__file__).resolve().parents[4] / "workspace"
+
+
 def root() -> Path:
     raw = os.environ.get("MATERIAL_LIB_ROOT", "")
     if not raw and len(sys.argv) > 1:
         raw = sys.argv[1]
-    r = Path(raw) if raw else Path.cwd() / "workspace" / "materials"
+    r = Path(raw) if raw else _workspace() / "materials"
     r.mkdir(parents=True, exist_ok=True)
     return r.resolve()
 

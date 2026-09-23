@@ -17,12 +17,12 @@ from rich.table import Table
 
 from ...capabilities.memory.brief import build_brief
 from ...capabilities.memory.store import Layer, MemoryStore
-from ...envdetect import PROJECT_ROOT
+from ...envdetect import PROJECT_ROOT, workspace_root  # noqa: F401
 
 console = Console()
 app = typer.Typer(help="记忆库：列表 / 简报 / 晋升 / 作废", no_args_is_help=True)
 
-MEM_DIR = PROJECT_ROOT / "workspace" / "memory"
+MEM_DIR = workspace_root() / "memory"
 
 
 def _store() -> MemoryStore:

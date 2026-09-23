@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from ...envdetect import PROJECT_ROOT
+from ...envdetect import PROJECT_ROOT, workspace_root  # noqa: F401
 from ...harness.events.bus import Event, EventType
 from ...harness.events.log import EventLog, find_session, list_sessions
 from ...harness.events.stats import render_stats, session_stats
@@ -26,7 +26,7 @@ from ...harness.execution.trace import ExecutionTrace
 console = Console()
 app = typer.Typer(help="会话回放 / 成本看板 / 痕迹重建", no_args_is_help=True)
 
-LOG_DIR = PROJECT_ROOT / "workspace" / "logs" / "sessions"
+LOG_DIR = workspace_root() / "logs" / "sessions"
 
 _QUIET = {
     EventType.ITERATION_START,

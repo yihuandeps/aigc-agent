@@ -15,13 +15,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from ...capabilities.skill_hub import SkillHub, parse_skill, skill_files
-from ...envdetect import PROJECT_ROOT
+from ...envdetect import PROJECT_ROOT, workspace_root
 
 console = Console()
 app = typer.Typer(help="方法论 skill：列表 / 查看 / 版本 / 回滚 / 体检", no_args_is_help=True)
 
 SKILLS_DIR = PROJECT_ROOT / "skills"
-HISTORY_DIR = PROJECT_ROOT / "workspace" / "skills_history"
+HISTORY_DIR = workspace_root() / "skills_history"
 
 
 def _hub() -> SkillHub:

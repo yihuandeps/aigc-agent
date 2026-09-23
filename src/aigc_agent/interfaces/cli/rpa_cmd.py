@@ -18,7 +18,7 @@ from ...domain.rpa.browser import (
     is_logged_in,
     system_browser,
 )
-from ...envdetect import PROJECT_ROOT, detect
+from ...envdetect import PROJECT_ROOT, detect, workspace_root  # noqa: F401
 
 console = Console()
 app = typer.Typer(help="浏览器采集（小红书/抖音）", no_args_is_help=True)
@@ -48,7 +48,7 @@ async def _login(site: str, wait: int) -> None:
 
     name, url = SITES[site]
     browser, _ = system_browser()
-    profile = PROJECT_ROOT / "workspace" / "rpa" / "profile"
+    profile = workspace_root() / "rpa" / "profile"
 
     console.print(
         Panel(
@@ -127,7 +127,7 @@ async def _collect(site: str, keyword: str, limit: int, pace: str) -> None:
 def status() -> None:
     """看登录态和浏览器就绪情况。"""
     detect()
-    profile = PROJECT_ROOT / "workspace" / "rpa" / "profile"
+    profile = workspace_root() / "rpa" / "profile"
     browser, path = system_browser()
     console.print(f"playwright: {'✓' if have_playwright() else '✗ 未安装'}")
     console.print(f"浏览器:     {browser or '（无系统浏览器，用自带 Chromium）'}")

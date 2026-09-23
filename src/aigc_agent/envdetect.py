@@ -13,10 +13,34 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# 运行时产物目录（资产库、台账、记忆、会话日志、回收站…）的唯一出处。
+# 环境变量 AIGC_WORKSPACE 可以把它挪走 —— 测试就靠它指到临时目录。
+WORKSPACE_ENV = "AIGC_WORKSPACE"
+
+
+def workspace_root() -> Path:
+    """当前进程该用的 workspace。
+
+    2026-09-23 审查：之前 workspace 写死成 PROJECT_ROOT/workspace，测试一跑就往真实
+    资产库、台账、会话日志里写东西 —— 108 份测试桩成了「最新的角色档案/创作方案」，
+    项目卡每轮把它们当权威 pin 给模型。所以测试进程里**必须**显式指定别的目录，
+    没指定就直接报错，而不是悄悄写进真实数据。
+    """
+    raw = os.environ.get(WORKSPACE_ENV, "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    if "pytest" in sys.modules:
+        raise RuntimeError(
+            f"测试进程不许写真实 workspace（{PROJECT_ROOT / 'workspace'}）："
+            f"设 {WORKSPACE_ENV} 指到临时目录（tests/conftest.py 已经这么做）"
+        )
+    return PROJECT_ROOT / "workspace"
 
 # 按优先级找代理：项目 .env > 进程环境 > Claude Code 设置
 _CLAUDE_SETTINGS = [

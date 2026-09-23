@@ -16,11 +16,11 @@ from rich.table import Table
 from ...capabilities.memory.session import SessionSnapshot
 from ...domain.assets.store import AssetStore
 from ...domain.media.naming import apply_renames, plan_renames, write_manifest
-from ...envdetect import PROJECT_ROOT
+from ...envdetect import PROJECT_ROOT, workspace_root  # noqa: F401
 
 console = Console()
 app = typer.Typer(help="产物文件：改成带序号的可读文件名 / 产物清单", no_args_is_help=True)
-WORKSPACE = PROJECT_ROOT / "workspace"
+WORKSPACE = workspace_root()
 
 
 def _root(session: str, out: str) -> Path:

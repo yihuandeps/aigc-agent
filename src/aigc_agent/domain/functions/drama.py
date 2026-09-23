@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx2 as httpx
 
+from ...envdetect import workspace_root
 from ...harness.events.bus import EventBus, EventType
 from ...harness.model.media import MediaKind, default_proxy
 from ...harness.tools.provider import (
@@ -1486,7 +1487,7 @@ class DramaFunctions:
     def _trash_root(self) -> Path:
         """回收目录跟 FileFunctions 用同一个（workspace/trash），没接文件工具就退到 workspace。"""
         t = getattr(self.files, "trash", None)
-        return Path(t) if t else Path("workspace") / "trash"
+        return Path(t) if t else workspace_root() / "trash"
 
     async def _fn_drama_audit_faces(
         self, assets_id: str = "", character: str = "", apply: bool = True, deep: bool = False

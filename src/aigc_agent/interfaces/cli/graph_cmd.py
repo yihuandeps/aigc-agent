@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from ...app import PROJECT_ROOT, Agent
+from ...envdetect import workspace_root
 from ...capabilities.memory.brief import build_brief
 from ...capabilities.memory.recorder import RejectionRecorder
 from ...capabilities.memory.store import Layer, MemoryStore
@@ -28,7 +29,7 @@ from ...harness.execution.graph.runtime import GraphRuntime, make_state_summary
 console = Console()
 app = typer.Typer(help="图执行与人审", no_args_is_help=True)
 
-WORKSPACE = PROJECT_ROOT / "workspace"
+WORKSPACE = workspace_root()
 RUNS_DIR = WORKSPACE / "runs"
 MEM_DIR = WORKSPACE / "memory"
 

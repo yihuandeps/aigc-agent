@@ -53,7 +53,7 @@ from .domain.local_materials import LOCAL_PIN, LocalMaterials
 from .domain.media.hosting import Hosting, HostingConfig
 from .domain.output import OutputPrefs, default_root
 from .domain.pipeline.episode_pipeline import EpisodePipeline
-from .envdetect import PROJECT_ROOT, detect
+from .envdetect import PROJECT_ROOT, detect, workspace_root
 from .harness.context.assembler import ContextAssembler
 from .harness.context.window import ShortTermMemory, WindowPolicy
 from .harness.events.bus import EventBus, EventType
@@ -145,6 +145,8 @@ class Agent:
         self.media_fns: Any = None  # 媒体工具（视频模型锁在它身上；create() 里装）
         self.pipeline: Any = None  # 按集流水管线（create() 里装，/auto on 打开）
         self.content_line: str = ""  # 用户选的产线标签（/type；create() 里从会话快照恢复）
+        self.workspace: Path | None = None  # 运行时产物目录（create() 里定）
+        self.config_dir: Path = PROJECT_ROOT / "config"
         self.mcp = None  # type: ignore[assignment]  # setup() 里按需装配
 
     @classmethod
@@ -155,8 +157,12 @@ class Agent:
         session_id: str = "",
         role: str = "main_agent",
         auto_approve: bool = False,
+        workspace: Path | None = None,
     ) -> Agent:
         """auto_approve=True 时自动放行 L-external。
+
+        workspace：运行时产物目录（资产库/台账/记忆/日志）。不传就用 envdetect.workspace_root()
+        —— 环境变量 AIGC_WORKSPACE 或项目下的 workspace/；测试进程必须指到临时目录。
 
         **只给脚本/批处理用**，交互场景永远传 asker 让人确认。
         没有 asker 又不自动放行时，L-external 会被拒绝 —— 这是对的
@@ -168,7 +174,7 @@ class Agent:
         config = ModelsConfig.load(config_dir / "models.yaml")
 
         bus = EventBus(session_id=session_id)
-        workspace = PROJECT_ROOT / "workspace"
+        workspace = Path(workspace) if workspace else workspace_root()
         # M6：事件流按会话落盘 —— 会话回放、成本看板、痕迹重建都从这份文件来
         EventLog(workspace / "logs" / "sessions", bus.session_id).attach(bus)
         # 执行痕迹：订阅事件总线自动建 DAG，不侵入 Loop
@@ -393,6 +399,8 @@ class Agent:
         agent.local_materials = local
         agent.media_fns = media_fns
         agent.pipeline = pipeline
+        agent.workspace = workspace
+        agent.config_dir = config_dir
         return agent
 
     async def setup(self, mcp: bool = True) -> None:
@@ -403,7 +411,7 @@ class Agent:
         if mcp:
             from .capabilities.mcp_hub.hub import McpHub
 
-            path = PROJECT_ROOT / "config" / "mcp_servers.yaml"
+            path = self.config_dir / "mcp_servers.yaml"
             if path.exists():
                 self.mcp = McpHub.from_file(path, self.bus)
                 await self.mcp.connect_all()
