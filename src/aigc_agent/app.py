@@ -48,12 +48,13 @@ from .domain.functions.storyboard import StoryboardFunctions
 from .domain.functions.video_edit import VideoEditFunctions
 from .domain.functions.vision import VisionFunctions
 from .domain.generators.catalog import MediaCatalog
-from .domain.lines import LINE_PIN, get_line, line_block
+from .domain.lines import LINE_PIN, get_line, line_block, line_providers
 from .domain.local_materials import LOCAL_PIN, LocalMaterials
 from .domain.media.hosting import Hosting, HostingConfig
 from .domain.output import OutputPrefs, default_root
 from .domain.pipeline.episode_pipeline import EpisodePipeline
 from .domain.project import normalize_root, project_key, project_title
+from .domain.system_prompt import MAJOR_STAGES, MINOR_STAGE, SYSTEM_PROMPT
 from .envdetect import PROJECT_ROOT, detect, workspace_root
 from .harness.context.assembler import ContextAssembler
 from .harness.context.window import ShortTermMemory, WindowPolicy
@@ -387,7 +388,9 @@ class Agent:
         # （Kimi 对「JSON 里的中文」低估四成），之后每次调用按真实 usage 自动修正。
         provider, _ = config.text.resolve(role)
         token_budget = max(0, provider.context_window - provider.max_output_tokens - 8_192)
-        assembler = ContextAssembler(bus, token_budget=token_budget, calibration=1.4)
+        assembler = ContextAssembler(
+            bus, system_prompt=SYSTEM_PROMPT, token_budget=token_budget, calibration=1.4
+        )
         loop = LoopRuntime(
             gateway=gateway,
             registry=registry,
@@ -397,6 +400,8 @@ class Agent:
             bus=bus,
             role=role,
             guard=guard,
+            major_stages=MAJOR_STAGES,
+            minor_stage=MINOR_STAGE,
             budget_hint=(
                 "要继续：/budget allow 50 临时追加 50 元（数字可改）；"
                 "/budget set 金额 300 视频秒 900 改本次开工的额度；/budget 看各级用量。"
@@ -497,6 +502,13 @@ class Agent:
         if self.pipeline is not None:
             try:
                 await self.pipeline.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        # 记忆队列跑完再关网关：对话结尾往往正是用户给明确要求的地方（「下次别这么写」），
+        # 之前退出时不等，最后几轮的记忆直接丢（2026-09-23 审查）
+        if self.mem_agent is not None:
+            try:
+                await asyncio.wait_for(self.mem_agent.close(), timeout=60)
             except Exception:  # noqa: BLE001
                 pass
         for gw in (
@@ -611,6 +623,10 @@ class Agent:
         """选定 / 清除产线。三件事：skill 预筛的 content_type、路由指引 pin、会话快照。"""
         line = get_line(key)
         self.content_line = line.key if line else ""
+        # 工具也按产线收窄：别的产线的工具只上目录、要用时 load_tool_schema 展开
+        registry = getattr(self, "registry", None)
+        if registry is not None and hasattr(registry, "set_focus"):
+            registry.set_focus(line_providers(line) if line else None)
         if self.allocator is not None:
             # 直接改字段而不是 refresh(content_type=...)：refresh 对空串不覆盖，清不掉
             self.allocator.content_type = line.content_type if line else ""

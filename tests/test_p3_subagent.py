@@ -21,7 +21,7 @@ from aigc_agent.domain.assets.store import AssetStore
 from aigc_agent.domain.functions.content import ContentFunctions
 from aigc_agent.harness.events.bus import EventBus, EventType
 from aigc_agent.harness.model.gateway import ModelResponse, ToolCall, Usage
-from aigc_agent.harness.tools.builtin import builtin
+from aigc_agent.harness.tools.builtin import builtin, demo
 from aigc_agent.harness.tools.provider import PermissionLevel
 from aigc_agent.harness.tools.registry import ToolRegistry
 
@@ -56,6 +56,7 @@ async def _registry(store: AssetStore | None = None):
     bus = EventBus()
     reg = ToolRegistry(bus)
     reg.register(builtin)
+    reg.register(demo)
     # AssetStore 定义了 __len__，空库是假值 —— 不能写 `store or AssetStore()`
     reg.register(ContentFunctions(store if store is not None else AssetStore()))
     await reg.refresh()

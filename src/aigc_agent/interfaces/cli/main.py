@@ -519,7 +519,10 @@ async def _run_tail(
             break
         # 网络断了：在**同一轮**里等着接着跑 —— 本轮做过的活（已写的集、已生成的图）不重来。
         # /stop 随时叫停；等的时候进度窗关着，能看清倒计时。
-        if result.resumable and retried < _NET_RETRIES:
+        # 断网多等几次；超时只再试一次 —— 超时多半是上下文太大，Loop 已经压缩后重试过，
+        # 再原样重发只会整包再超一次（2026-09-23 审查：最坏整包重发 24 次）
+        tries = _NET_RETRIES if result.error_kind == "connection" else 1
+        if result.resumable and retried < tries:
             retried += 1
             wait = _NET_WAIT * retried
             why = "连不上模型服务" if result.error_kind == "connection" else "模型响应超时"

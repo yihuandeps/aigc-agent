@@ -101,6 +101,26 @@ LINES: tuple[ContentLine, ...] = (
 )
 
 _BY_KEY = {ln.key: ln for ln in LINES}
+
+# 各产线全披露的工具 provider（其余只上目录、按需展开）。每条都带的：通用的存取、文件、检索、看图、
+# 合规、方法论、元工具
+_COMMON_PROVIDERS = (
+    "builtin", "meta", "skill", "content", "files", "retrieval", "vision", "compliance",
+)
+_LINE_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "drama": ("drama", "episodes", "media", "hosting", "edit", "audio", "distribution",
+              "fanout"),
+    "douyin": ("short_video", "hotspot", "rpa", "douyin", "materials", "media", "hosting",
+               "edit", "audio", "distribution", "analytics"),
+    "ad": ("short_video", "materials", "media", "hosting", "edit", "audio", "poster",
+           "distribution"),
+    "design": ("media", "poster", "hosting", "distribution"),
+}
+
+
+def line_providers(line: ContentLine) -> set[str]:
+    """这条产线全披露哪些工具 provider。"""
+    return set(_COMMON_PROVIDERS) | set(_LINE_PROVIDERS.get(line.key, ()))
 _ALIASES = {
     "1": "drama",
     "2": "douyin",

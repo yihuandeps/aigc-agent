@@ -35,6 +35,20 @@ class ToolRegistry:
         self._digest_only: set[str] = set()  # 最终名
         self._expanded: set[str] = set()  # 已展开全 schema 的
         self.max_expanded = 8
+        # 按产线收窄：不在这里的 provider 的工具也只上目录、按需展开。None = 不收窄。
+        # 2026-09-23 审查：两级披露对内置工具没生效 —— 89 份 schema 每次请求全量发送
+        self._focus: set[str] | None = None
+
+    def set_focus(self, providers: Iterable[str] | None) -> None:
+        """按产线收窄全披露范围（/type 选了产线时由装配层调）。"""
+        self._focus = set(providers) if providers is not None else None
+
+    def _is_digest(self, name: str) -> bool:
+        if name in self._digest_only:
+            return True
+        if self._focus is None:
+            return False
+        return self._origin.get(name, ("", ""))[0] not in self._focus
 
     def register(self, provider: ToolProvider) -> None:
         if provider.name in self._providers:
@@ -83,8 +97,9 @@ class ToolRegistry:
 
     expand_tool_name = "load_tool_schema"
 
-    def catalog_digest(self, names: Iterable[str] | None = None) -> str:
+    def catalog_digest(self, names: Iterable[str] | None = None, compact: bool = False) -> str:
         """渲染成给模型看的紧凑目录。约 30 token/工具，常驻上下文。
+        compact=True：只列要展开的（随请求发的系统区用），全披露的只报个数。
 
         names 给了就只渲染这个子集（子代理的裁剪视图用）。
 
@@ -95,13 +110,18 @@ class ToolRegistry:
         allow = set(names) if names is not None else None
         lines: list[str] = []
         needs_expand = False
+        full = 0
         for m in self._catalog.values():
             if allow is not None and m.name not in allow:
                 continue
             star = ""
-            if m.name in self._digest_only and m.name not in self._expanded:
+            if self._is_digest(m.name) and m.name not in self._expanded:
                 star = "*"
                 needs_expand = True
+            elif compact:
+                # 紧凑版（随请求发的系统区）：完整定义已在 tools 参数里的不再列一遍
+                full += 1
+                continue
             lines.append(f"- {m.name}{star}（{m.permission.value}）：{m.summary}")
 
         if needs_expand:
@@ -109,6 +129,8 @@ class ToolRegistry:
                 0,
                 f"标 * 的工具需先调 {self.expand_tool_name}(names=[...]) 载入参数定义才能使用。",
             )
+        if compact and full:
+            lines.insert(0, f"另有 {full} 个工具的完整定义已随请求提供，直接调用。")
         return "\n".join(lines)
 
     def expand(self, name: str) -> tuple[bool, str]:
@@ -139,7 +161,7 @@ class ToolRegistry:
         picked = [
             n
             for n in self._catalog
-            if (allow is None or n in allow) and (n not in self._digest_only or n in self._expanded)
+            if (allow is None or n in allow) and (not self._is_digest(n) or n in self._expanded)
         ]
         return await self.schemas(picked)
 
@@ -156,16 +178,16 @@ class ToolRegistry:
 
     @property
     def digest_only(self) -> list[str]:
-        return sorted(self._digest_only)
+        return sorted(n for n in self._catalog if self._is_digest(n))
 
     @property
     def full_names(self) -> list[str]:
         """全披露的工具（schema 常驻请求体）。"""
-        return [n for n in self._catalog if n not in self._digest_only]
+        return [n for n in self._catalog if not self._is_digest(n)]
 
     @property
     def pending_expansion(self) -> list[str]:
-        return sorted(self._digest_only - self._expanded)
+        return sorted(n for n in self._catalog if self._is_digest(n) and n not in self._expanded)
 
     def scoped(self, names: Iterable[str]) -> ScopedRegistry:
         """裁剪出一个子集视图给子代理（M10）。"""
@@ -313,9 +335,9 @@ class ScopedRegistry:
     def catalog(self) -> list[ToolMeta]:
         return [m for m in self.parent.catalog() if m.name in self.names]
 
-    def catalog_digest(self, names: Iterable[str] | None = None) -> str:
+    def catalog_digest(self, names: Iterable[str] | None = None, compact: bool = False) -> str:
         allow = self.names if names is None else (self.names & set(names))
-        return self.parent.catalog_digest(allow)
+        return self.parent.catalog_digest(allow, compact=compact)
 
     async def schemas_for_context(
         self, names: Iterable[str] | None = None

@@ -19,7 +19,7 @@ from rich.console import Console
 from aigc_agent.harness.events.bus import Event, EventBus, EventType
 from aigc_agent.harness.model.gateway import ToolCall
 from aigc_agent.harness.permission.gate import PermissionGate
-from aigc_agent.harness.tools.builtin import builtin
+from aigc_agent.harness.tools.builtin import builtin, demo
 from aigc_agent.harness.tools.dispatcher import ToolDispatcher
 from aigc_agent.harness.tools.registry import ToolRegistry
 from aigc_agent.interfaces.cli import sessions_cmd
@@ -112,6 +112,7 @@ async def test_调度前被拒_和人点头放行_都发事件():
     bus = EventBus()
     reg = ToolRegistry(bus)
     reg.register(builtin)
+    reg.register(demo)
     await reg.refresh()
 
     async def yes(meta: object, args: object) -> bool:

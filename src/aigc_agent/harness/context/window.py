@@ -24,7 +24,14 @@ class Turn(BaseModel):
 
     index: int
     messages: list[dict[str, Any]] = Field(default_factory=list)
-    tokens: int = 0
+    tokens: int = 0  # 原文大小（校准后）
+    # 作为历史轮时实际发出去的大小（折叠后、校准后）。驱逐按它算 —— 大轮在历史里是折叠的，
+    # 按原文算会把 12 万的兜底提前触发（2026-09-23 审查）
+    view_tokens: int = 0
+
+    @property
+    def weight(self) -> int:
+        return self.view_tokens or self.tokens
 
     @property
     def transcript(self) -> str:
@@ -73,11 +80,14 @@ class WindowPolicy:
     # 2026-09-17 从 180K 降到 120K：ARCHITECTURE 的软目标是 60–80K，
     # 之前的 180K 又叠上估算低估四成，实际要到 25 万才触发，直接撞模型上限。
     max_tokens: int = 120_000
+    # 回差：token 兜底一旦触发，一次剔到这个水位以下，而不是刚好压到 max_tokens 下面 ——
+    # 之前每轮都剔掉最老一轮，缓存每轮被打穿，外加每轮一次记忆提取
+    low_tokens: int = 70_000
 
     def should_evict(self, turns: list[Turn]) -> bool:
         if len(turns) >= self.evict_at:
             return True
-        return sum(t.tokens for t in turns) > self.max_tokens
+        return sum(t.weight for t in turns) > self.max_tokens
 
     def split(self, turns: list[Turn]) -> tuple[list[Turn], list[Turn]]:
         """返回 (保留, 驱逐)。驱逐的那批打包交给 Memory Agent 提关键词。"""
@@ -87,9 +97,15 @@ class WindowPolicy:
         keep = turns[-self.window_turns :] if self.window_turns > 0 else []
         evicted = turns[: len(turns) - len(keep)]
 
-        # token 兜底触发时继续从最老的剔，直到回到上限内
-        while keep and sum(t.tokens for t in keep) > self.max_tokens and len(keep) > 1:
-            evicted.append(keep.pop(0))
+        # token 兜底触发时继续从最老的剔，一次剔到低水位（低水位必须低于上限，否则按六成算）
+        if sum(t.weight for t in turns) > self.max_tokens:
+            low = (
+                self.low_tokens
+                if 0 < self.low_tokens < self.max_tokens
+                else int(self.max_tokens * 0.6)
+            )
+            while keep and sum(t.weight for t in keep) > low and len(keep) > 1:
+                evicted.append(keep.pop(0))
 
         return keep, evicted
 

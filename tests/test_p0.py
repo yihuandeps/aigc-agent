@@ -21,7 +21,7 @@ from aigc_agent.harness.events.bus import EventBus, EventType
 from aigc_agent.harness.execution.loop import LoopRuntime, StopReason
 from aigc_agent.harness.model.gateway import ModelResponse, ToolCall, Usage
 from aigc_agent.harness.permission.gate import PermissionGate
-from aigc_agent.harness.tools.builtin import builtin
+from aigc_agent.harness.tools.builtin import builtin, demo
 from aigc_agent.harness.tools.dispatcher import ToolDispatcher
 from aigc_agent.harness.tools.provider import (
     PermissionLevel,
@@ -52,6 +52,7 @@ async def _build(script: list[ModelResponse], asker=None, policy=None):
     bus = EventBus(session_id="test")
     registry = ToolRegistry(bus)
     registry.register(builtin)
+    registry.register(demo)
     await registry.refresh()
 
     gate = PermissionGate(bus, policy=policy, asker=asker)
@@ -127,6 +128,7 @@ async def test_registry_两级披露():
     bus = EventBus()
     registry = ToolRegistry(bus)
     registry.register(builtin)
+    registry.register(demo)
     await registry.refresh()
 
     catalog = registry.catalog()
@@ -154,6 +156,7 @@ async def test_registry_未知工具不抛异常():
     bus = EventBus()
     registry = ToolRegistry(bus)
     registry.register(builtin)
+    registry.register(demo)
     await registry.refresh()
     r = await registry.invoke("不存在的工具", {})
     assert not r.ok and "未知工具" in r.error
@@ -331,6 +334,7 @@ async def test_registry公开入口必须过权限闸门():
     bus = EventBus()
     registry = ToolRegistry(bus)
     registry.register(builtin)
+    registry.register(demo)
     await registry.refresh()
     registry.gate = PermissionGate(bus, asker=None)  # 无人可问
 
@@ -346,6 +350,7 @@ async def test_ungated入口仅供dispatcher自用():
     bus = EventBus()
     registry = ToolRegistry(bus)
     registry.register(builtin)
+    registry.register(demo)
     await registry.refresh()
     registry.gate = PermissionGate(bus, asker=None)
 

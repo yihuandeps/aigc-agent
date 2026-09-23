@@ -30,7 +30,10 @@ class ToolDispatcher:
         registry: ToolRegistry,
         gate: PermissionGate,
         bus: EventBus,
-        timeout: float = 120.0,
+        # 默认工具超时要长于一次模型调用（gemini 300s）：之前 120s，没声明超时的
+        # drama_write / reference_to_shots 这类工具被本地判超时，远端照跑照扣费，
+        # 模型还误诊成「服务端故障」（日志里 19 次，2026-09-23 审查）
+        timeout: float = 360.0,
         max_parallel: int = 16,
     ) -> None:
         self.registry = registry

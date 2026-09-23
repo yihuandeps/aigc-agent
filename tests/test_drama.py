@@ -398,7 +398,7 @@ def test_系统提示词要求先分清产线():
     """两条产线流程、配方、成本完全不同，走错等于白跑，
     而且要到出片才看得出来 —— 所以入口处必须先分清。
     """
-    from aigc_agent.harness.context.assembler import DEFAULT_SYSTEM_PROMPT as P
+    from aigc_agent.domain.system_prompt import SYSTEM_PROMPT as P
 
     assert "短视频" in P and "短剧" in P
     assert "先问" in P, "没要求模糊需求时主动问"
@@ -408,7 +408,7 @@ def test_系统提示词要求先分清产线():
 def test_四条产线的差别写清楚了():
     """只列名字模型分不出该走哪条，得说清楚各自是什么。
     2026-09-23 从两条扩到四条（加了广告、设计），并且用户 /type 选过就不再问。"""
-    from aigc_agent.harness.context.assembler import DEFAULT_SYSTEM_PROMPT as P
+    from aigc_agent.domain.system_prompt import SYSTEM_PROMPT as P
 
     assert "热榜" in P and "口播" in P  # 抖音短视频的特征
     assert "角色" in P and "一致性" in P  # 短剧的特征

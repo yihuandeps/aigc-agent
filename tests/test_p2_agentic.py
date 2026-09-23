@@ -426,6 +426,10 @@ async def _run_auto_with_stage(stage: str):
 
     loop.dispatcher.run = spy  # type: ignore[method-assign]
     loop.auto_review = True
+    # 大 / 小节点的划分是领域知识，由装配层注入（见 domain/system_prompt.py）
+    from aigc_agent.domain.system_prompt import MAJOR_STAGES, MINOR_STAGE
+
+    loop.major_stages, loop.minor_stage = MAJOR_STAGES, MINOR_STAGE
     return loop, await loop.run_turn("干活")
 
 

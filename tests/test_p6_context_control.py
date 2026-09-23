@@ -583,6 +583,8 @@ async def test_auto模式显式major优先(stage, major, suspended):
             ModelResponse(text="继续", usage=Usage(1, 1)),
         ]
     )
+    from aigc_agent.domain.system_prompt import MAJOR_STAGES, MINOR_STAGE
+
     loop = LoopRuntime(
         gateway=gw,  # type: ignore[arg-type]
         registry=registry,
@@ -590,6 +592,9 @@ async def test_auto模式显式major优先(stage, major, suspended):
         assembler=ContextAssembler(bus),
         memory=ShortTermMemory(),
         bus=bus,
+        # 大 / 小节点的划分是领域知识，由装配层注入
+        major_stages=MAJOR_STAGES,
+        minor_stage=MINOR_STAGE,
     )
     loop.auto_review = True
     r = await loop.run_turn("干活")

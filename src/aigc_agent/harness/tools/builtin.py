@@ -107,7 +107,13 @@ async def _calc(expression: str) -> str:
     return str(eval(expression, {"__builtins__": {}}, {}))  # noqa: S307 — 已做字符白名单
 
 
-@builtin.tool(
+# 演示工具（验证并发和 L-external 确认闸门用）：单独一个 provider，**只在测试里注册** ——
+# 之前混在 builtin 里进了生产工具目录，模型真的会去调「模拟发布」（2026-09-23 审查）
+demo = BuiltinProvider()
+demo.name = "demo"
+
+
+@demo.tool(
     ToolSpec(
         name="sleep_demo",
         summary="等待指定秒数，用于验证工具并发执行",
@@ -132,7 +138,7 @@ async def _sleep_demo(seconds: float, label: str = "task") -> str:
     return f"{label} 完成，耗时 {seconds}s"
 
 
-@builtin.tool(
+@demo.tool(
     ToolSpec(
         name="publish_demo",
         summary="模拟发布内容到外部平台（不可逆动作，需人工确认）",

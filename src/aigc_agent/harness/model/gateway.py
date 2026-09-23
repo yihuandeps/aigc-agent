@@ -277,7 +277,14 @@ class ModelGateway:
                 if use_stream:
                     return await self._call_stream(provider, kwargs)
                 return await self._call_once(provider, kwargs)
-            except (APITimeoutError, APIConnectionError, RateLimitError) as e:
+            except APITimeoutError as e:
+                # 超时不是网络抖动：请求多半送到了、服务端在算（上下文太大或拥堵），原样重发
+                # 还是超时，而且每次整包重发。SDK 里它是 APIConnectionError 的子类，之前按连接
+                # 错误给了 6 次，CLI 再续 3 次，最坏整包重发 24 次（2026-09-23 审查）
+                last = e
+                retryable = True
+                budget = min(cfg.max_attempts, 2)
+            except (APIConnectionError, RateLimitError) as e:
                 last = e
                 retryable = True
                 # 纯网络问题：服务端没收到请求，重发无副作用 —— 值得多等一会儿

@@ -94,7 +94,8 @@ class LoopRuntime:
         max_iterations: int = 50,
         max_cost: float | None = None,
         guard: CostGuard | None = None,
-        major_stages: tuple[str, ...] = ("剧本", "视频生成", "图片生成"),
+        major_stages: tuple[str, ...] = (),
+        minor_stage: re.Pattern[str] | None = None,
         budget_asker: BudgetAsker | None = None,
         budget_hint: str = "",
     ) -> None:
@@ -116,7 +117,11 @@ class LoopRuntime:
         # 人随时能 Ctrl+C 打断。只影响人审 —— L-external 与预算超限照样问人。
         self.auto_review = False
         # 大节点环节关键词：/auto 下这些环节的人审不自动采纳，挂起等决策。
+        # 人审节点策略由装配层注入（领域知识不住 L0，见 domain/system_prompt.py）
         self.major_stages = major_stages
+        self.minor_stage = minor_stage
+        # 本轮召回的记忆：continue_turn 续跑时沿用（之前续跑就丢了）
+        self._recalled = ""
         # 最近一次停机若是 error，是哪一类（connection / timeout / quota / …）。
         # 网络类的可以 continue_turn 原地续跑，不用人重发、不丢本轮进度。
         self.last_error_kind = ""
@@ -218,11 +223,16 @@ class LoopRuntime:
                 resp = await self.gateway.chat(self.role, messages, tools=tools)
             except Exception as e:  # noqa: BLE001
                 kind, hint = classify_model_error(e)
-                if kind == "context_overflow" and attempt == 1:
+                if kind in ("context_overflow", "timeout") and attempt == 1:
+                    # 超时多半是上下文太大：先压缩再发，原样重发只会再超一次
                     self.assembler.shrink = True
                     await self.bus.emit(
                         EventType.WARNING,
-                        message="请求超过模型上下文上限，已压缩当前轮后重试",
+                        message=(
+                            "请求超过模型上下文上限，已压缩当前轮后重试"
+                            if kind == "context_overflow"
+                            else "模型响应超时，已压缩当前轮后重试一次"
+                        ),
                     )
                     continue
                 self.last_error_kind = kind
@@ -250,14 +260,28 @@ class LoopRuntime:
         run_turn（新轮）和 _continue（人审结案/撞线续跑）共用这一段，
         人审前后仍算同一问一答。
         """
-        tools = await self.registry.schemas_for_context()
-        catalog = self.registry.catalog_digest()
         cost = 0.0
         i = 0
         self.last_error_kind = ""
+        tools: list[dict[str, Any]] = []
+        catalog = ""
+        shown: tuple[str, ...] | None = None
 
         for i in range(1, self.max_iterations + 1):
             await self.bus.emit(EventType.ITERATION_START, turn=turn.index, iteration=i)
+            # 每次迭代核一下展开集：load_tool_schema 展开的工具**当轮**就能用
+            # （之前整轮只取一次 schema，展开要到下一轮才生效，模型调它就是「未知工具」）
+            now = tuple(getattr(self.registry, "expanded", []) or [])
+            if now != shown:
+                shown = now
+                tools = await self.registry.schemas_for_context()
+                try:
+                    catalog = self.registry.catalog_digest(compact=True)
+                except TypeError:
+                    catalog = self.registry.catalog_digest()
+                set_tools = getattr(self.assembler, "set_tools", None)
+                if callable(set_tools):
+                    set_tools(tools)
 
             resp, err = await self._call_model(turn, tools, catalog, recalled)
             if resp is None:
@@ -408,13 +432,14 @@ class LoopRuntime:
         turn.messages.append({"role": "user", "content": user_input})
         self.assembler.shrink = False  # 应急压缩只管一轮
         self._failures = []
+        self._recalled = recalled
 
         await self.bus.emit(
             EventType.LOOP_START, turn=turn.index, role=self.role, input_preview=user_input[:200]
         )
 
         final_text, stop, turn_cost, i = await self._iterate(turn, recalled)
-        turn.tokens = self.assembler.calibrated(estimate_tokens(turn.messages))
+        self._size(turn)
 
         # 挂起时这一轮还没走完，不做驱逐 —— 否则人审完回来上下文已经被剔了
         if stop is StopReason.AWAITING_REVIEW:
@@ -426,20 +451,7 @@ class LoopRuntime:
                 tool_failures=list(self._failures),
             )
 
-        # ---- 批量驱逐（涨到 evict_at 才一次性剔回 window_turns）----
-        evicted = self.memory.maybe_evict()
-        if evicted:
-            await self.bus.emit(
-                EventType.WINDOW_EVICT,
-                evicted_turns=[t.index for t in evicted],
-                count=len(evicted),
-                remaining=len(self.memory.turns),
-            )
-            # P1：这里把 evicted 丢进 asyncio.Queue 交给 Memory Agent 提关键词。
-            # 必须异步 —— 触发驱逐的那一轮恰好也是缓存击穿的那一轮，
-            # 两个开销叠在同一轮上，用户会明显感觉卡顿。
-            if self.memory.on_evict is not None:
-                self.memory.on_evict(evicted)
+        await self._evict()
 
         await self.bus.emit(
             EventType.LOOP_END,
@@ -459,6 +471,28 @@ class LoopRuntime:
             tool_failures=list(self._failures),
         )
 
+    def _size(self, turn: Turn) -> None:
+        """记下这一轮的大小：原文（校准后）和作为历史轮时的折叠视图。"""
+        turn.tokens = self.assembler.calibrated(estimate_tokens(turn.messages))
+        view = getattr(self.assembler, "view_tokens", None)
+        turn.view_tokens = view(turn) if callable(view) else turn.tokens
+
+    async def _evict(self) -> None:
+        """批量驱逐（涨到 evict_at 才一次性剔回 window_turns；token 兜底一次剔到低水位）。"""
+        evicted = self.memory.maybe_evict()
+        if not evicted:
+            return
+        await self.bus.emit(
+            EventType.WINDOW_EVICT,
+            evicted_turns=[t.index for t in evicted],
+            count=len(evicted),
+            remaining=len(self.memory.turns),
+        )
+        # 交给 Memory Agent 提关键词。必须异步 —— 触发驱逐的那一轮恰好也是缓存击穿的
+        # 那一轮，两个开销叠在同一轮上，用户会明显感觉卡顿。
+        if self.memory.on_evict is not None:
+            self.memory.on_evict(evicted)
+
     def _over_budget(self, turn_cost: float) -> tuple[str, bool]:
         """超了返回 (原因, 是否金额口径)，没超返回 ("", False)。"""
         if self.max_cost is not None and turn_cost >= self.max_cost:
@@ -468,9 +502,6 @@ class LoopRuntime:
             if not verdict:
                 return verdict.reason, verdict.money
         return "", False
-
-    # 小节点（剧本中的某一集）的 stage 形如「第3集」「12集」「单集」——/auto 下不问人
-    _MINOR_STAGE = re.compile(r"第?\d+\s*集|单集")
 
     def _is_major_review(self, payload: dict[str, Any]) -> bool:
         """这次人审是不是大节点：/auto 下大节点仍挂起问人一次，小节点自动采纳。
@@ -483,7 +514,7 @@ class LoopRuntime:
         if isinstance(major, bool):
             return major
         stage = str(payload.get("stage") or "")
-        if self._MINOR_STAGE.search(stage):
+        if self.minor_stage is not None and self.minor_stage.search(stage):
             return False
         return any(k in stage for k in self.major_stages)
 
@@ -564,20 +595,35 @@ class LoopRuntime:
                 EventType.WARNING,
                 message=f"上一轮被中断：已补 {repaired} 条没有执行结果的调用",
             )
-        return await self._continue(turn)
+        return await self._continue(turn, recalled=self._recalled)
 
     async def continue_turn(self, turn: Turn) -> LoopResult:
-        """max_iterations 撞线后在**同一轮**里接着跑（auto 模式自动续跑用）。
+        """max_iterations 撞线 / 断网 / 超预算后在**同一轮**里接着跑。
 
         max_iterations 是单段护栏不是任务终点：人审前后算同一问一答的约定
         在这里同样成立 —— 续跑不新开轮次，滑窗计数不变。
-        """
-        return await self._continue(turn)
 
-    async def _continue(self, turn: Turn) -> LoopResult:
+        2026-09-23 审查补的四件事：先修补悬空的工具调用（被 /stop 打断的那批）；只许续跑
+        最新一轮（续一个旧轮会把消息插到历史中间）；沿用本轮召回的记忆；跑完照常驱逐。
+        """
+        if self.pending_review is not None:
+            raise RuntimeError("有挂起的人审未结案：先 resume_turn()")
+        if not self.memory.turns or self.memory.turns[-1].index != turn.index:
+            raise RuntimeError("只能续跑最新的一轮 —— 这一轮之后已经开过新轮了")
+        repaired = self._repair_interrupted_calls()
+        if repaired:
+            await self.bus.emit(
+                EventType.WARNING,
+                message=f"上一段被中断：已补 {repaired} 条没有执行结果的调用",
+            )
+        return await self._continue(turn, recalled=self._recalled)
+
+    async def _continue(self, turn: Turn, recalled: str = "") -> LoopResult:
         """从已有的 turn 继续跑，不新建轮次 —— 人审前后仍算同一问一答。"""
-        final_text, stop, cost, i = await self._iterate(turn)
-        turn.tokens = self.assembler.calibrated(estimate_tokens(turn.messages))
+        final_text, stop, cost, i = await self._iterate(turn, recalled)
+        self._size(turn)
+        if stop is not StopReason.AWAITING_REVIEW:
+            await self._evict()
         await self.bus.emit(
             EventType.LOOP_END, turn=turn.index, iterations=i, stop_reason=stop.value
         )
