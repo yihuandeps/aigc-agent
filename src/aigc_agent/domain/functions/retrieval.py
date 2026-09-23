@@ -44,7 +44,7 @@ class AssetSource:
         if kind == "memory":
             return []
         hits: list[Hit] = []
-        for a in self.store.all():
+        for a in self.store.find(newest_first=False):  # 当前项目、active（缺口 A）
             k = _KIND.get(a.type, "text")
             if kind != "all" and kind != k:
                 continue

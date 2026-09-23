@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -38,6 +42,23 @@ class AssetType(StrEnum):
     SUBTITLE = "subtitle"  # srt / vtt
     REPORT = "report"  # 机审报告 / 复盘
     PACKAGE = "package"  # 待发布包（目录）
+
+
+class AssetStatus(StrEnum):
+    """资产状态（2026-09-23 审查缺口 A）：查询默认只取 active。
+
+    之前没有状态字段：/rollback 作废的、质检门换掉的、面容审查弃用的版本，照样被当成
+    「最新」取到 —— 只能靠一次性的 pin 提醒模型别用。
+    """
+
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"  # 有替代它的版本了（面容审查弃用的脸）
+    REJECTED = "rejected"  # 质检门没过、被换掉的那一版
+    VOID = "void"  # /rollback 作废的下游产物
+
+
+# 迁移时追溯不到产物目录的旧资产。不属于任何项目，按项目查询时看不见（按 id 仍取得到）
+LEGACY_PROJECT = "legacy"
 
 
 # 集号识别（2026-09-20）：模型自己 save_draft 存的整集剧本、合规修订版都是 outline / text 类型、
@@ -68,10 +89,16 @@ class Asset(BaseModel):
     creator: str = ""  # model:kimi_k3 | human:xxx | tool:xxx
 
     created_at: float = Field(default_factory=time.time)
-    # 单调递增序号，由 store 分配。
+    # 单调递增序号，由 store 分配（跨进程也唯一，见 AssetStore._next_seq）。
     # 不能只靠 created_at 排序 —— Windows 上 time.time() 分辨率约 15ms，
     # 同一毫秒内产出的多个资产会撞在一起，"哪个是最新版"变成不确定的。
     seq: int = 0
+
+    # 属于哪个项目（一部剧 / 一个选题），= 产物目录派生的项目键（domain/project.py）。
+    # 空 = 没开项目维度的库（测试、一次性脚本）；legacy = 迁移时追溯不到出处的旧资产
+    project: str = ""
+    status: AssetStatus = AssetStatus.ACTIVE
+    status_note: str = ""  # 为什么不是 active 了（被谁替代 / 哪道门没过 / 回退到哪）
 
     def brief(self) -> str:
         """进上下文的形态：引用 + 摘要，不放内容。"""
@@ -85,6 +112,18 @@ class AssetStore:
         self.root = root
         self._items: dict[str, Asset] = {}
         self._seq = 0
+        # 当前项目键（装配层按产物目录设，/out 换目录时跟着换）。设了之后新资产打上它，
+        # find / latest / episodes_done / script_of 默认只看它 —— 之前一律「全库最新」：
+        # 新剧显示「已有 79 集」、/auto 拿旧剧的资产库渲新剧（2026-09-23 审查缺口 A）。
+        # 空串 = 不分项目（测试、一次性脚本）
+        self.project = ""
+        # 读不出来的资产文件（坏 JSON / 旧版本写一半崩了）。之前静默跳过，资产凭空消失没人知道
+        self.load_errors: list[str] = []
+        # 多进程：两个终端同时开 Agent，对方新写 / 改过的资产要看得见 —— 按文件 mtime 增量重读，
+        # 查询时最多每 refresh_interval 秒扫一次目录（Windows 上 scandir 自带 mtime，千份约 2ms）
+        self._mtimes: dict[str, int] = {}
+        self._scanned_at = 0.0
+        self.refresh_interval = 1.0
         # 事件总线（装配层挂上才有）。挂上后每次落库发 ASSET_CREATED ——
         # 按集流水管线（EpisodePipeline）靠它实时知道「哪集就绪了」。
         self.bus: Any = None
@@ -101,27 +140,86 @@ class AssetStore:
 
         不做这个的话，资产只在单个进程内存活 —— 上一次生成的视频，
         下次启动就找不到了，跨会话的「拿上次那批素材来合成」直接失效。
-        单条坏数据跳过，不让它拖垮整个库。
+        单条坏数据跳过，不让它拖垮整个库，但记进 load_errors（启动时告警）。
         """
-        if not self.root:
+        self._scan()
+
+    def _scan(self) -> None:
+        """把磁盘上新增的、被别的进程改过的资产读进来；被挪走 / 删掉的移出去。"""
+        root = self.root
+        if root is None:
             return
-        for f in self.root.glob("as_*.json"):
+        self._scanned_at = time.monotonic()
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            return
+        present: set[str] = set()
+        for e in entries:
+            name = e.name
+            if not (name.startswith("as_") and name.endswith(".json")):
+                continue
+            aid = name[:-5]
+            present.add(aid)
             try:
-                a = Asset.model_validate_json(f.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
+                mtime = e.stat().st_mtime_ns
+            except OSError:
+                continue
+            if self._mtimes.get(aid) == mtime:
+                continue
+            try:
+                a = Asset.model_validate_json(Path(e.path).read_text(encoding="utf-8"))
+            except Exception as ex:  # noqa: BLE001
+                msg = f"{name}：{type(ex).__name__}"
+                if msg not in self.load_errors:
+                    self.load_errors.append(msg)
                 continue
             self._items[a.id] = a
+            self._mtimes[aid] = mtime
             self._seq = max(self._seq, a.seq)
+        # 别的进程挪走的（迁移时移进回收站的测试桩）
+        for aid in [k for k in self._mtimes if k not in present]:
+            self._mtimes.pop(aid, None)
+            self._items.pop(aid, None)
+
+    def _maybe_refresh(self) -> None:
+        if self.root is not None and time.monotonic() - self._scanned_at >= self.refresh_interval:
+            self._scan()
+
+    def _next_seq(self) -> int:
+        """全局单调序号。多进程共用一个计数文件，加锁读改写 —— 之前各进程各算各的，
+        测试进程和真实会话同时写，库里撞出 61 个重复 seq，「哪个是最新版」就不确定了。"""
+        if self.root is None:
+            self._seq += 1
+            return self._seq
+        counter = self.root / ".seq"
+        with _file_lock(self.root / ".seq.lock"):
+            try:
+                disk = int(counter.read_text(encoding="utf-8").strip() or 0)
+            except (OSError, ValueError):
+                disk = 0
+            n = max(disk, self._seq) + 1
+            try:
+                _atomic_write(counter, str(n))
+            except OSError:
+                pass
+        self._seq = n
+        return n
 
     def put(self, asset: Asset) -> Asset:
+        if not asset.project and self.project:
+            asset.project = self.project
         if not asset.seq:
-            self._seq += 1
-            asset.seq = self._seq
+            asset.seq = self._next_seq()
         self._items[asset.id] = asset
         if self.root:
-            (self.root / f"{asset.id}.json").write_text(
-                asset.model_dump_json(indent=2), encoding="utf-8"
-            )
+            path = self.root / f"{asset.id}.json"
+            # 先写临时文件再替换：写到一半崩溃不会留下半截 JSON
+            _atomic_write(path, asset.model_dump_json(indent=2))
+            try:
+                self._mtimes[asset.id] = path.stat().st_mtime_ns
+            except OSError:
+                pass
         self._mirror_text(asset)
         self._emit_created(asset)
         return asset
@@ -149,6 +247,8 @@ class AssetStore:
                 gen_params=dict(asset.gen_params),
                 parent_ids=list(asset.parent_ids),
                 seq=asset.seq,
+                project=asset.project,
+                status=asset.status.value,
             )
         )
 
@@ -259,10 +359,42 @@ class AssetStore:
                 creator=creator,
                 # 集号等标签跟着新版本走。之前不带：第 6 集改一稿就从 find_episode 里消失了
                 gen_params=dict(base.gen_params),
+                # 在当前项目里改的就归当前项目；没开项目维度时跟着原稿
+                project=self.project or base.project,
             )
         )
 
+    def set_status(self, asset_id: str, status: AssetStatus | str, note: str = "") -> Asset:
+        """改状态（作废 / 被替代 / 质检没过）。不删任何东西，按 id 仍取得到。"""
+        a = self.get(asset_id)
+        a.status = AssetStatus(status)
+        if note:
+            a.status_note = note[:200]
+        return self.put(a)
+
+    def has(self, asset_id: str) -> bool:
+        if asset_id in self._items:
+            return True
+        self._refresh_on_miss()
+        return asset_id in self._items
+
+    def _refresh_on_miss(self) -> None:
+        """按 id 找不到时先重读一次目录：可能是另一个进程刚写的。限频，免得一串找不到的 id
+        每个都扫一遍目录。"""
+        if self.root is not None and time.monotonic() - self._scanned_at > 0.2:
+            self._scan()
+
+    def projects(self) -> dict[str, int]:
+        """各项目的资产数（含 legacy 和没分项目的空串）。"""
+        self._maybe_refresh()
+        out: dict[str, int] = {}
+        for a in self._items.values():
+            out[a.project] = out.get(a.project, 0) + 1
+        return out
+
     def get(self, asset_id: str) -> Asset:
+        if asset_id not in self._items:
+            self._refresh_on_miss()
         if asset_id not in self._items:
             near = self.nearest(asset_id)
             hint = ""
@@ -301,10 +433,25 @@ class AssetStore:
         creator: str = "",
         contains: str = "",
         newest_first: bool = True,
+        project: str | None = None,
+        include_inactive: bool = False,
     ) -> list[Asset]:
-        """按条件过滤。creator 按前缀匹配（"tool:" 能匹配所有工具产物）。"""
+        """按条件过滤。creator 按前缀匹配（"tool:" 能匹配所有工具产物）。
+
+        默认只看**当前项目**的 **active** 资产（缺口 A）；project="*" 看全库，
+        include_inactive=True 连作废 / 被替代 / 质检没过的一起看。
+        """
+        self._maybe_refresh()
+        scope = self.project if project is None else project
         out = []
-        for a in self._items.values():
+        # 先拷一份再遍历：fs_import 在线程里建资产，边遍历边插入会抛 RuntimeError
+        for a in list(self._items.values()):
+            # 没分项目的旧资产（迁移前的存量）哪个项目都看得见 —— 等于迁移前的老行为，
+            # 不会一升级就「东西全没了」；agent assets migrate 分完就没有这种了
+            if scope not in ("", "*") and a.project not in (scope, ""):
+                continue
+            if not include_inactive and a.status is not AssetStatus.ACTIVE:
+                continue
             if type_ is not None and a.type is not type_:
                 continue
             if episode and self.episode_of(a) != episode:
@@ -314,7 +461,8 @@ class AssetStore:
             if contains and contains not in (a.summary or ""):
                 continue
             out.append(a)
-        out.sort(key=lambda a: a.seq, reverse=newest_first)
+        # seq 相同（旧版本多进程撞号留下的）再按创建时间分先后
+        out.sort(key=lambda a: (a.seq, a.created_at), reverse=newest_first)
         return out
 
     # 短剧一集的产物分类：按创建者认，同一集多个版本取 seq 最大的
@@ -372,6 +520,25 @@ class AssetStore:
         # 全都偏短：退回最长的那份，总比装作没有强（也可能真是一集很短的剧本）
         return max(typed, key=lambda a: len(a.inline or "")) if typed else None
 
+    def best_doc(self, type_: AssetType, contains: str, min_chars: int = 300) -> Asset | None:
+        """某类文档（创作方案 / 角色档案 / 分集目录）当前项目里最新的**真**版本：
+        有创建者、不是占位符；够长的优先，都偏短就退到最长的那份。
+
+        2026-09-23 审查：资产库里「最新」的这三类全是测试桩（12–59 字、creator 为空），
+        项目卡每轮 pin 着、写剧本默认也取它 —— 真实的写第 3 集任务里出现过「陆离：守门人，沉默」。
+        """
+        cands = [
+            a
+            for a in self.find(type_=type_, contains=contains)
+            if a.creator and not is_only_fold_mark(a.inline)
+        ]
+        if not cands:
+            return None
+        real = [a for a in cands if len(a.inline or "") >= min_chars]
+        if real:
+            return real[0]
+        return max(cands, key=lambda a: (len(a.inline or ""), a.seq))
+
     def episode_assets(self, episode: int) -> dict[str, Asset]:
         """某一集的各类产物，各取最新版。剧本见 script_of，其余按创建者。"""
         found: dict[str, Asset] = {}
@@ -386,11 +553,12 @@ class AssetStore:
                 found[label] = items[0]
         return found
 
-    def episodes_done(self) -> list[int]:
+    def episodes_done(self, project: str | None = None) -> list[int]:
         """已有剧本的集号，升序去重：type=script 的，
-        加上摘要标着「第N集」的整集文本（见 script_of）。"""
+        加上摘要标着「第N集」的整集文本（见 script_of）。只看当前项目（缺口 A：
+        之前全库算，混了 4 部剧，新剧开写就说「全剧已有剧本 79 集」）。"""
         eps: set[int] = set()
-        for a in self._items.values():
+        for a in self.find(project=project):
             n = self.episode_of(a)
             if n <= 0:
                 continue
@@ -406,13 +574,15 @@ class AssetStore:
             return Path(a.uri).read_text(encoding="utf-8")
         return ""
 
-    def latest(self, type_: AssetType | None = None) -> Asset | None:
-        """最近产出的资产。按 seq 排，稳定可靠。"""
-        items = [a for a in self._items.values() if type_ is None or a.type is type_]
-        return max(items, key=lambda a: a.seq) if items else None
+    def latest(self, type_: AssetType | None = None, project: str | None = None) -> Asset | None:
+        """当前项目里最近产出的 active 资产。按 seq 排，稳定可靠。"""
+        items = self.find(type_=type_, project=project)
+        return items[0] if items else None
 
     def all(self) -> list[Asset]:
-        return sorted(self._items.values(), key=lambda a: a.seq)
+        """**全库**（跨项目、含已作废的），按 seq。按当前项目取用 find()。"""
+        self._maybe_refresh()
+        return sorted(self._items.values(), key=lambda a: (a.seq, a.created_at))
 
     def lineage(self, asset_id: str) -> list[Asset]:
         """回溯血缘链，从最早的祖先到自己。"""
@@ -431,6 +601,56 @@ class AssetStore:
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """先写临时文件再 os.replace：写到一半崩溃不会留下半截文件（之前那种 JSON 读的时候被
+    静默跳过，资产凭空消失）。Windows 上目标文件正被别的进程读时 replace 会短暂失败，重试。"""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    for k in range(15):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.02 * (k + 1))
+    try:
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def _file_lock(path: Path, timeout: float = 5.0, stale: float = 30.0) -> Iterator[None]:
+    """跨进程互斥：O_CREAT|O_EXCL 建锁文件。拿不到就等；锁文件放了超过 stale 秒视为崩溃残留。
+    等到 timeout 还拿不到就不等了 —— 宁可冒一次撞号，也不能把生成链卡死。"""
+    deadline = time.monotonic() + timeout
+    fd: int | None = None
+    while True:
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except (FileExistsError, PermissionError):
+            try:
+                if time.time() - path.stat().st_mtime > stale:
+                    path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.01)
+        except OSError:
+            break
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def local_copy(asset: Asset) -> Path | None:
@@ -485,6 +705,8 @@ def dump_index(store: AssetStore, path: Path) -> None:
             "parents": a.parent_ids,
             "creator": a.creator,
             "cost": a.gen_cost,
+            "project": a.project,
+            "status": a.status.value,
         }
         for a in store.all()
     ]

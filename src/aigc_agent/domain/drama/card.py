@@ -49,9 +49,10 @@ def read_state(root: Path | None) -> dict[str, Any]:
 def build_project_card(assets: AssetStore, output_root: Path | None = None) -> str:
     """没有短剧痕迹（状态文件、方案/目录资产、分集剧本都没有）就返回空串，不 pin。"""
     state = read_state(output_root)
-    plan = assets.find(type_=AssetType.OUTLINE, contains="创作方案")
-    chars = assets.find(type_=AssetType.OUTLINE, contains="角色档案")
-    outline = assets.find(type_=AssetType.OUTLINE, contains="分集目录")
+    # 真版本（有创建者、不是占位符、够长优先），不是「最新的一份」—— 之前最新的三份全是测试桩
+    plan = assets.best_doc(AssetType.OUTLINE, "创作方案")
+    chars = assets.best_doc(AssetType.OUTLINE, "角色档案")
+    outline = assets.best_doc(AssetType.OUTLINE, "分集目录")
     done = assets.episodes_done()
     if not (state or plan or outline or done):
         return ""
@@ -78,11 +79,11 @@ def build_project_card(assets: AssetStore, output_root: Path | None = None) -> s
 
     refs: list[str] = []
     if plan:
-        refs.append(f"创作方案 {plan[0].id}")
+        refs.append(f"创作方案 {plan.id}")
     if chars:
-        refs.append(f"角色档案 {chars[0].id}")
+        refs.append(f"角色档案 {chars.id}")
     if outline:
-        refs.append(f"分集目录 {outline[0].id}")
+        refs.append(f"分集目录 {outline.id}")
     if refs:
         lines.append(" · ".join(refs))
 

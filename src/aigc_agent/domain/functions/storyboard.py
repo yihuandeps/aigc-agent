@@ -186,7 +186,7 @@ class StoryboardFunctions:
     def _roster(self) -> list[Character]:
         """护照存成 TEXT 资产。同名保留最新的那张。"""
         out: dict[str, Character] = {}
-        for a in self.store.all():
+        for a in self.store.find(newest_first=False):  # 当前项目（缺口 A）
             if a.creator != _CREATOR:
                 continue
             try:

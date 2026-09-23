@@ -263,10 +263,13 @@ OUTLINE = """第1集：隧道里的呼吸声 —— 主角发现异象 🔥
 
 
 def _seed(store: AssetStore) -> tuple[Any, Any, Any]:
-    plan = store.create("三幕结构，7 个付费卡点", type_=AssetType.OUTLINE, summary="创作方案")
+    # 模拟模型存的真文档：要有创建者（没有创建者的短文档按测试桩处理，见 best_doc）
+    plan = store.create("三幕结构，7 个付费卡点", type_=AssetType.OUTLINE, summary="创作方案",
+                        creator="model")
     chars = store.create("陆离：守门人，沉默。苏晏：记者。", type_=AssetType.OUTLINE,
-                         summary="角色档案")
-    outline = store.create(OUTLINE, type_=AssetType.OUTLINE, summary="分集目录")
+                         summary="角色档案", creator="model")
+    outline = store.create(OUTLINE, type_=AssetType.OUTLINE, summary="分集目录",
+                           creator="model")
     return plan, chars, outline
 
 

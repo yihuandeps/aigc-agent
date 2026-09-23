@@ -184,12 +184,17 @@ class ContentFunctions:
                     "limit": {"type": "integer", "description": "最多几条，默认 30，最多 200"},
                     "offset": {"type": "integer", "description": "翻页：跳过前几条"},
                     "oldest_first": {"type": "boolean", "description": "默认最新在前"},
+                    "all_projects": {
+                        "type": "boolean",
+                        "description": "连别的项目（别的产物目录）的也列，默认只列当前项目",
+                    },
                 },
             },
             description=(
                 "找资产用这个，**不要用 search_library 找自己刚存的东西**。"
-                "默认只给最新 30 条；资产多了要加 type / episode / contains 过滤或翻页，"
-                "没列出来不代表不存在。找某一集的剧本直接用 find_episode。"
+                "默认只列**当前项目**（当前产物目录）的、最新 30 条；资产多了要加 type / episode / "
+                "contains 过滤或翻页，没列出来不代表不存在。找某一集的剧本直接用 find_episode。"
+                "用户要拿别的项目（别的剧）的东西时才传 all_projects=true。"
             ),
             max_result_chars=12_000,
         )
@@ -347,6 +352,7 @@ class ContentFunctions:
         limit: int = DEFAULT_LIST_LIMIT,
         offset: int = 0,
         oldest_first: bool = False,
+        all_projects: bool = False,
     ) -> ToolResult:
         type_ = None
         if type:
@@ -363,17 +369,21 @@ class ContentFunctions:
             creator=creator,
             contains=contains,
             newest_first=not oldest_first,
+            project="*" if all_projects else None,
         )
         total = len(items)
+        scope = "全部项目" if all_projects or not self.store.project else "当前项目"
         if not total:
             if not (type or episode or creator or contains):
-                return ToolResult(content="还没有任何资产")
-            return ToolResult(content="没有匹配的资产（库里共 "
-                              f"{len(self.store)} 份，换个过滤条件试试）")
+                return ToolResult(content=f"{scope}还没有任何资产")
+            return ToolResult(
+                content=f"{scope}没有匹配的资产（整个资产库共 {len(self.store)} 份，"
+                "换个过滤条件，或 all_projects=true 看别的项目）"
+            )
         limit = max(1, min(int(limit or DEFAULT_LIST_LIMIT), 200))
         offset = max(0, int(offset or 0))
         page = items[offset : offset + limit]
-        head = f"匹配 {total} 份，显示第 {offset + 1}–{offset + len(page)} 条"
+        head = f"{scope}匹配 {total} 份，显示第 {offset + 1}–{offset + len(page)} 条"
         if offset + len(page) < total:
             head += f"（还有 {total - offset - len(page)} 条，offset={offset + len(page)} 翻页）"
         lines = [head]
@@ -431,7 +441,7 @@ class ContentFunctions:
         stage: str = "",
         major: bool | None = None,
     ) -> ToolResult:
-        missing = [i for i in asset_ids if i not in self.store._items]  # noqa: SLF001
+        missing = [i for i in asset_ids if not self.store.has(i)]
         if missing:
             return ToolResult(
                 ok=False,

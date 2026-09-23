@@ -21,7 +21,7 @@ from .capabilities.skill_hub import SkillHub
 from .capabilities.skill_hub.functions import SkillFunctions
 from .capabilities.subagents import SubAgentRunner
 from .domain.analytics import Feedback, MetricsStore, Reviewer
-from .domain.assets.store import AssetStore
+from .domain.assets.store import AssetStatus, AssetStore
 from .domain.compliance import ComplianceChecker, ComplianceRules
 from .domain.distribution import Packager, PlatformCatalog
 from .domain.drama.card import CARD_PIN, build_project_card
@@ -53,6 +53,7 @@ from .domain.local_materials import LOCAL_PIN, LocalMaterials
 from .domain.media.hosting import Hosting, HostingConfig
 from .domain.output import OutputPrefs, default_root
 from .domain.pipeline.episode_pipeline import EpisodePipeline
+from .domain.project import normalize_root, project_key, project_title
 from .envdetect import PROJECT_ROOT, detect, workspace_root
 from .harness.context.assembler import ContextAssembler
 from .harness.context.window import ShortTermMemory, WindowPolicy
@@ -149,6 +150,10 @@ class Agent:
         self.workspace: Path | None = None  # 运行时产物目录（create() 里定）
         self.config_dir: Path = PROJECT_ROOT / "config"
         self.mcp = None  # type: ignore[assignment]  # setup() 里按需装配
+        # 当前项目键（产物目录派生，见 domain/project.py）。资产库查询、台账、记忆共用它
+        self.project: str = ""
+        self.recorder: Any = None  # 打回理由落库（项目维度跟着换）
+        self.memory_source: Any = None  # 统一检索里的记忆来源（项目维度跟着换）
 
     @classmethod
     def create(
@@ -174,8 +179,17 @@ class Agent:
         config_dir = config_dir or PROJECT_ROOT / "config"
         config = ModelsConfig.load(config_dir / "models.yaml")
 
-        bus = EventBus(session_id=session_id)
         workspace = Path(workspace) if workspace else workspace_root()
+        # 产物目录 = 项目（2026-09-23 审查缺口 A）。2026-09-22 用户定：默认就是**他打开 Agent
+        # 的那个文件夹**；会话记住的（/out 改过的）由 CLI 开工时核对。在项目目录里启动时
+        # 回落到 workspace/output/<session>。
+        out_root = default_root(workspace, session_id or "", PROJECT_ROOT)
+        if not session_id:
+            # 没指定会话名：一个文件夹一个会话。之前一律 default —— 换任何文件夹启动都装回
+            # default 的轮次、模型锁和产物目录（当时是 E:\西游记）
+            session_id = _session_for(out_root, workspace)
+        project = project_key(out_root)
+        bus = EventBus(session_id=session_id)
         # M6：事件流按会话落盘 —— 会话回放、成本看板、痕迹重建都从这份文件来
         EventLog(workspace / "logs" / "sessions", bus.session_id).attach(bus)
         # 执行痕迹：订阅事件总线自动建 DAG，不侵入 Loop
@@ -186,22 +200,22 @@ class Agent:
         # Cost Guard：文本花费从 COST 事件记，媒体调用在权限闸门处计次。
         # 不接这两根线，budget.py 就只是个文件 —— P2 收尾前它正是这个状态。
         # 台账让项目级 / 日级预算跨会话累计（P5）。
+        # 单项目上限按**项目键**累计（之前是会话名 default —— 一个永不清零的终身上限）
         ledger = CostLedger(workspace / "costs" / "ledger.jsonl")
         guard = CostGuard.from_config(
             config.cost_guard,
             ledger=ledger,
-            project_id=session_id or "default",
+            project_id=project,
             session_id=bus.session_id,
         )
         guard.attach(bus)
 
         assets = AssetStore(workspace / "assets")
+        assets.project = project  # 新资产打上项目键；查询默认只看本项目
         memories = MemoryStore(workspace / "memory")
 
-        # 产物目录：生成内容（文本/图片/视频）落盘的用户文件夹。
-        # 2026-09-22 用户定：默认就是**他打开 Agent 的那个文件夹**，不再问一遍；
-        # 会话记住的优先，/out 随时改。在项目目录里启动时回落到 workspace/output/<session>。
-        output_prefs = OutputPrefs(default_root(workspace, session_id or "", PROJECT_ROOT))
+        # 产物目录：生成内容（文本/图片/视频）落盘的用户文件夹，/out 随时改（= 换项目）
+        output_prefs = OutputPrefs(out_root)
         assets.mirror = output_prefs  # 文本类资产自动镜像一份可读 .md
 
         # M7：方法论。history_dir 记版本，运营改坏了能一键回滚
@@ -290,10 +304,11 @@ class Agent:
         pipeline.attach()
         # M9：一个入口查历史内容 / 记忆 / 素材库。素材库来源走注册表里的 MCP 工具，
         # server 没连上就当没有这个来源
+        memory_source = MemorySource(memories, project_id=project)
         retrieval = RetrievalHub(
             [
                 AssetSource(assets),
-                MemorySource(memories, project_id=session_id),
+                memory_source,
                 ToolSource(registry, MATERIAL_SEARCH_TOOL, name="material_lib"),
             ]
         )
@@ -332,10 +347,12 @@ class Agent:
         registry.register(EpisodeFunctions(subagents, assets, bus, fmt=episode_fmt))
         # M8.2 记忆代理：淘汰的轮次 → 关键词提取 → 长期记忆。
         # 独立上下文 + 异步执行，主循环只入队不等它。
-        mem_agent = MemoryAgent(gateway, memories, project_id=session_id, runner=subagents)
-        # 打回理由自动落库（M8）。project_id 必须传：之前漏了，所有会话的打回理由
-        # 都落在 ""，每个项目都会把别的项目的避雷 pin 进来
-        RejectionRecorder(memories, project_id=session_id).attach(bus)
+        # 记忆按项目键归档（缺口 A）：之前按会话名，而 CLI 不带 --session 时会话名是空串 ——
+        # 库里 48 条记忆全是全局的，蜘蛛精剧那句「控制在十二集」对所有剧都生效
+        mem_agent = MemoryAgent(gateway, memories, project_id=project, runner=subagents)
+        # 打回理由自动落库（M8），同样按项目
+        recorder = RejectionRecorder(memories, project_id=project)
+        recorder.attach(bus)
 
         # 滑窗淘汰的轮次转成长期记忆。不挂这个钩子的话，
         # 超出 10 轮的对话就是**直接丢弃** —— 长期记忆永远写不进去。
@@ -408,7 +425,43 @@ class Agent:
         agent.pipeline = pipeline
         agent.workspace = workspace
         agent.config_dir = config_dir
+        agent.project = project
+        agent.recorder = recorder
+        agent.memory_source = memory_source
         return agent
+
+    # ---------- 项目（缺口 A：产物目录 = 项目） ----------
+
+    @property
+    def project_title(self) -> str:
+        """给人看的项目名：剧名（.drama-state.json）优先，否则文件夹名。"""
+        return project_title(getattr(self.output_prefs, "root", None))
+
+    def switch_project(self, root: Path | str) -> str:
+        """换产物目录 = 换项目：资产库查询范围、台账的单项目累计、记忆一起换。返回新项目键。
+
+        流水线还有活在跑时不换 —— 它们产出的资产会被打上新项目的键（抛 RuntimeError，
+        CLI 报给人：等跑完或 /auto off 之后再换）。
+        """
+        root = Path(root)
+        busy = getattr(self.pipeline, "busy", False)
+        if busy and normalize_root(root) != normalize_root(self.output_prefs.root):
+            raise RuntimeError("流水线还有任务在跑：等它们跑完（或 /auto off）再换产物目录")
+        key = project_key(root)
+        if self.output_prefs is not None:
+            self.output_prefs.root = root
+        self.project = key
+        self.assets.project = key
+        if self.guard is not None:
+            self.guard.project_id = key
+        for holder in (self.mem_agent, self.recorder, self.memory_source):
+            if holder is not None:
+                holder.project_id = key
+        if self.pipeline is not None:
+            self.pipeline.reset()
+        if self.session_store is not None:
+            self.session_store.set_output_dir(str(root))
+        return key
 
     async def setup(self, mcp: bool = True) -> None:
         """连 MCP server 并注册进同一个工具注册表，然后重建目录。
@@ -621,6 +674,12 @@ async def rollback_to(
     except KeyError:
         head = asset_id
     lost = list(plan.get("lost_assets") or [])
+    # 作废的产物打状态（缺口 A）：之前只 pin 一轮提醒，下一轮起按「最新」取资产照样取到它们
+    for aid in lost:
+        try:
+            assets.set_status(aid, AssetStatus.VOID, note=f"/rollback 回到 {asset_id}")
+        except KeyError:
+            pass
     note = f"已回退到 {head}，以它为新的出发点继续。"
     if lost:
         note += f"以下资产已作废，不要再引用：{', '.join(lost)}。"
@@ -635,6 +694,14 @@ async def rollback_to(
         lost_assets=lost,
     )
     return {**plan, "note": note}
+
+
+def _session_for(out_root: Path, workspace: Path) -> str:
+    """没指定会话名时的会话名：产物目录的项目键（一个文件夹一个会话）；
+    回落目录（在 Agent 项目里启动）仍叫 default。"""
+    if normalize_root(out_root) == normalize_root(workspace / "output" / "default"):
+        return "default"
+    return project_key(out_root)
 
 
 def _media_gateways(

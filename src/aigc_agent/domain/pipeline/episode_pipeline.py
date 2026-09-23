@@ -97,6 +97,18 @@ class EpisodePipeline:
                 await self._worker
             self._worker = None
 
+    @property
+    def busy(self) -> bool:
+        """还有派出去没跑完的活。"""
+        return bool(self._inflight)
+
+    def reset(self) -> None:
+        """换项目时清掉按集号记的状态：失败标记、预算刹车、状态文件提示 ——
+        不清的话上一部剧第 3 集的失败标记会挡住新剧的第 3 集（缺口 A）。"""
+        self._failed.clear()
+        self._render_paused = False
+        self._state_warned = False
+
     def on_enable(self) -> None:
         """/auto on：踢一次 reconcile，扫存量资产补派（on 之前写的剧本不漏）。"""
         self.kick()
@@ -248,7 +260,9 @@ class EpisodePipeline:
         rendered: dict[int, tuple[int, str]] = {}
         assets_lib = (0, "")
         refs = (0, "")
-        for a in self.assets.all():
+        # 只看当前项目的 active 资产（缺口 A：之前全库，库里有任何一部剧的资产库，
+        # 新剧就不再生成自己的，拿旧剧的脸渲新剧）
+        for a in self.assets.find(newest_first=False):
             ep = a.gen_params.get("episode")
             if a.type is AssetType.SCRIPT and ep:
                 _keep_latest(scripts, int(ep), a)

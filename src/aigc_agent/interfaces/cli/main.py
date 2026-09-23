@@ -30,6 +30,7 @@ from ...app import PROJECT_ROOT, Agent, load_dotenv  # noqa: E402
 from ...domain.lines import get_line, is_off, parse_line  # noqa: E402
 from ...domain.lines import menu as lines_menu  # noqa: E402
 from ...domain.media.naming import apply_renames, plan_renames, write_manifest  # noqa: E402
+from ...domain.project import normalize_root  # noqa: E402
 from ...harness.events.bus import Event, EventType  # noqa: E402
 from ...harness.execution.loop import LoopResult, StopReason  # noqa: E402
 from ...harness.model.config import ModelsConfig  # noqa: E402
@@ -186,6 +187,63 @@ def _brief(value: Any, limit: int = 90) -> str:
 def _line_label(agent: Any) -> str:
     line = get_line(getattr(agent, "content_line", ""))
     return line.label if line else "不限定"
+
+
+async def _settle_output_dir(agent: Agent, hub: InputHub, explicit_session: bool) -> None:
+    """开工时定产物目录（= 项目）。
+
+    不带 --session 时会话按文件夹分，以**当前文件夹**为准；这个文件夹上次用 /out 改到了
+    别处，就问一次用哪个（2026-09-23 审查：之前只要快照里记着目录就悄悄覆盖当前文件夹 ——
+    default 快照里是 E:\\西游记，换任何文件夹启动产物都落进西游记，面板却写「当前文件夹」）。
+    带 --session 时会话带着它记住的产物目录走。
+    """
+    store = agent.session_store
+    if store is None or agent.output_prefs is None:
+        return
+    here = agent.output_prefs.root
+    saved = store.output_dir
+    if not saved:
+        store.set_output_dir(str(here))
+        return
+    if normalize_root(saved) == normalize_root(here):
+        return
+    if explicit_session:
+        agent.switch_project(Path(saved))
+        return
+    console.print(
+        Panel(
+            Text(
+                f"这个文件夹上次用 /out 把产物目录改到了：{saved}\n"
+                f"这次用哪个？回车 = 当前文件夹 {here}；2 = {saved}"
+            ),
+            title="产物目录",
+            border_style="cyan",
+        )
+    )
+    try:
+        pick = (await hub.ask("> ")).strip()
+    except EOFError:
+        pick = ""
+    if pick == "2":
+        agent.switch_project(Path(saved))
+    else:
+        store.set_output_dir(str(here))
+
+
+def _warn_store(agent: Agent) -> None:
+    """资产库自检：读不出来的文件、还没分项目的旧资产 —— 开工时说一声，别让人以为东西没了。"""
+    errs = list(getattr(agent.assets, "load_errors", []) or [])
+    if errs:
+        shown = "、".join(errs[:3]) + (f" 等 {len(errs)} 个" if len(errs) > 3 else "")
+        console.print(f"[yellow]⚠ 资产库有文件读不出来（{escape(shown)}），这些资产暂时看不到[/]")
+    unassigned = agent.assets.projects().get("", 0)
+    if unassigned:
+        console.print(
+            f"[yellow]⚠ 资产库里还有 {unassigned} 份旧资产没分项目，会出现在每个项目里"
+            "（新剧可能看到旧剧的剧本和资产库）。[/]\n"
+            "[dim]  关掉其它 Agent 窗口后运行 agent assets migrate 先看分配计划，"
+            "确认后 agent assets migrate --apply（可撤销）[/]"
+        )
 
 
 def _ensure_dir(text: str) -> Path:
@@ -670,7 +728,10 @@ async def _models(role: str) -> None:
 def chat(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示模型请求与上下文装配细节"),
     role: str = typer.Option("main_agent", help="使用的角色"),
-    session: str = typer.Option("", "--session", help="项目/会话 id：记忆与项目级预算按它归档"),
+    session: str = typer.Option(
+        "", "--session",
+        help="会话名。不填 = 按当前文件夹（一个文件夹一个项目 / 会话，记忆和项目预算都跟着它）",
+    ),
 ) -> None:
     """交互式对话。输入 /exit 退出，/stat 看窗口与成本。"""
     asyncio.run(_chat(verbose, role, session))
@@ -724,14 +785,10 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
     restored = await agent.restore_session()
 
     # 产物目录（2026-09-22 用户定）：**默认就是他打开 Agent 的这个文件夹**，不再问一次 ——
-    # 内容都在本地跑，生成的东西该落在他眼前的目录里。老 session 沿用记住的，/out 随时改。
+    # 内容都在本地跑，生成的东西该落在他眼前的目录里。产物目录 = 项目（缺口 A）。
     # 开工前先把这个文件夹清点一遍报给他：有什么、没什么。
-    if agent.session_store is not None and agent.output_prefs is not None:
-        saved_out = agent.session_store.output_dir
-        if saved_out:
-            agent.output_prefs.root = Path(saved_out)
-        else:
-            agent.session_store.set_output_dir(str(agent.output_prefs.root))
+    await _settle_output_dir(agent, hub, explicit_session=bool(session))
+    _warn_store(agent)
     if getattr(agent, "local_materials", None) is not None:
         try:
             note = await asyncio.to_thread(lambda: agent.local_materials.index().inventory())
@@ -768,6 +825,8 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
             f"产线 [bold]{_line_label(agent)}[/]（短剧 / 抖音短视频 / 广告 / 设计，/type 可改）\n"
             f"产物目录 [bold]{agent.output_prefs.root}[/]"
             "（当前文件夹；生成的东西默认都落这里，/out 可改）\n"
+            f"项目 [bold]{escape(agent.project_title)}[/] [dim]{agent.project}[/]"
+            "（资产、记忆、单项目预算都按它分开；一个文件夹一个项目）\n"
             f"视频模型 [bold]{getattr(agent.media_fns, 'video_lock', '') or '未锁定'}[/] · "
             f"生图模型 [bold]{getattr(agent.media_fns, 'image_lock', '') or '未锁定'}[/]"
             "（换模型会先问你：对话里说要换哪个，确认 a 才生效）\n"
@@ -791,8 +850,8 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
     )
     if restored:
         console.print(
-            f"[green]↺ 已恢复上次会话的 {restored} 轮对话[/]"
-            "[dim]（换个 --session 名就是全新会话）[/]"
+            f"[green]↺ 已恢复这个文件夹上次的 {restored} 轮对话[/]"
+            "[dim]（会话按文件夹分：在别的文件夹启动就是另一个项目）[/]"
         )
     if agent.loop.pending_review is not None:
         # 上次退出前有一条人审没结案 —— 之前重启后被悄悄补成「已中断」，这里接着问
@@ -1036,10 +1095,15 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
                 except OSError as e:
                     console.print(f"[red]目录不可用：{e}[/]")
                     continue
-                agent.output_prefs.root = p
-                if agent.session_store is not None:
-                    agent.session_store.set_output_dir(str(p))
-                console.print(f"[green]产物目录已改为 {p}[/] [dim]（本会话记住，重启沿用）[/]")
+                try:
+                    key = agent.switch_project(p)
+                except RuntimeError as e:
+                    console.print(f"[yellow]{e}[/]")
+                    continue
+                console.print(
+                    f"[green]产物目录已改为 {p}[/]，项目 [bold]{escape(agent.project_title)}[/] "
+                    f"[dim]{key}（资产 / 记忆 / 单项目预算都换成这个项目的；本会话记住）[/]"
+                )
                 continue
             if text == "/rollback" or text.startswith("/rollback "):
                 target = text[len("/rollback"):].strip()
@@ -1119,6 +1183,11 @@ def _print_stat(agent: Agent) -> None:
         f"折叠 {asm.last_folded} 处{'（应急档）' if asm.shrink else ''}[/]"
     )
     console.print(f"[dim]产线：{_line_label(agent)}（/type 可改）[/]")
+    counts = agent.assets.projects()
+    console.print(
+        f"[dim]项目：{escape(agent.project_title)}（{agent.project}）· "
+        f"本项目资产 {counts.get(agent.project, 0)} 份 · 产物目录 {agent.output_prefs.root}[/]"
+    )
     if agent.guard is not None:
         console.print(f"[dim]预算：{agent.guard.brief()}[/]")
     if agent.loop.auto_review:

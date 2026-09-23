@@ -297,8 +297,8 @@ class Packager:
 
     def packages(self) -> list[tuple[Asset, Manifest]]:
         out = []
-        for a in self.assets.all():
-            if a.type is AssetType.PACKAGE and a.gen_params.get("manifest"):
+        for a in self.assets.find(type_=AssetType.PACKAGE, newest_first=False):
+            if a.gen_params.get("manifest"):
                 out.append((a, self.manifest_of(a)))
         return out
 

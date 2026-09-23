@@ -32,7 +32,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
-from ..assets.store import AssetStore, AssetType, local_copy
+from ..assets.store import AssetStatus, AssetStore, AssetType, local_copy
 from ..drama import (
     ask_script_next,
     ask_text,
@@ -1033,6 +1033,8 @@ class DramaFunctions:
         tags["accepted"] = False
         tags["rejected"] = reason[:120]
         a.gen_params["tags"] = tags
+        a.status = AssetStatus.REJECTED
+        a.status_note = f"质检门：{reason[:120]}"
         local = str(a.gen_params.get("local") or "")
         if local and Path(local).exists():
             p = Path(local)
@@ -1583,10 +1585,15 @@ class DramaFunctions:
         # 散落在资产库里的同名图。不 deep 时要把服装图也挡在外面 —— 它们不在上面的
         # 包循环里被收，却会从"摘要含角色名"这条路溜进来，deep 开关就白设了
         costumes = {cos.name for c in lib.characters for cos in c.costumes}
-        for a in self.store.all():
-            if a.type is not AssetType.IMAGE or a.id in seen:
+        # 场景 / 道具图不是人物图：「场景·陆离的公寓」摘要里也有角色名，之前被当成候选，
+        # 判不一致后场景条目的 url 被换成了人像（2026-09-23 审查）
+        places = set(lib.scene_names()) | {p.name for p in lib.props}
+        for a in self.store.find(type_=AssetType.IMAGE, newest_first=False):
+            if a.id in seen:
                 continue
             s = a.summary or ""
+            if s.startswith(("场景·", "道具·")) or any(n and n in s for n in places):
+                continue
             if not deep and (s.startswith("服装·") or any(n and n in s for n in costumes)):
                 continue
             who = next((n for n in names if matches_character(s, n, names)), "")
@@ -1654,6 +1661,10 @@ class DramaFunctions:
                     continue
                 asset.gen_params["superseded_by"] = a.keeper.asset_id
                 asset.gen_params["retired_at"] = stamp
+                # 打状态：之后按项目查图（面容审查、找参考）都不会再取到它（之前 superseded_by
+                # 写了没有任何读取点）
+                asset.status = AssetStatus.SUPERSEDED
+                asset.status_note = f"面容审查：{a.character} 以 {a.keeper.asset_id} 为准"
                 self.store.put(asset)
                 if not c.local:
                     done.append(f"{a.character} {c.asset_id}（只标记，没有本地文件）")

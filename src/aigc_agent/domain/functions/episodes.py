@@ -306,8 +306,8 @@ class EpisodeFunctions:
     # ---------- 素材定位 ----------
 
     def _latest_outline(self, keyword: str) -> Asset | None:
-        items = self.assets.find(type_=AssetType.OUTLINE, contains=keyword)
-        return items[0] if items else None
+        """当前项目里这类文档的真版本（见 AssetStore.best_doc：不取测试桩和占位符）。"""
+        return self.assets.best_doc(AssetType.OUTLINE, keyword)
 
     def _resolve(self, asset_id: str, keyword: str, required: bool) -> tuple[Asset | None, str]:
         if asset_id:
