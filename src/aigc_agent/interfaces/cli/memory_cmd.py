@@ -1,9 +1,11 @@
 """`agent memory` —— 记忆库的运维面。
 
-三件只有人能做的事：
+只有人能做的事：
   brief    看现在的 Memory Brief 长什么样（规则版，不调模型）
   promote  把一条记忆晋升到账号层 —— 推测不得自动晋升，只有人能点这个
   forget   作废一条错记忆 —— 记忆会被反复注入上下文，错一条影响后面每一轮
+  claim    认领一条没有项目键的旧记忆（2026-09-26：它们在有项目的会话里被隔离，
+           不召回、不 pin，认领到哪个项目就只在那个项目里生效）
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import datetime as _dt
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -33,17 +36,21 @@ def _store() -> MemoryStore:
 def list_cmd(
     layer: str = typer.Option("", "--layer", help="account / project / session"),
     project: str = typer.Option("", "--project", help="只看某个项目/会话"),
+    unclaimed: bool = typer.Option(
+        False, "--unclaimed", help="只看没有项目键、被隔离等认领的旧记忆"
+    ),
     limit: int = typer.Option(30, "--limit"),
 ) -> None:
-    """列出记忆：层、来源、极性、内容、命中次数。"""
+    """列出记忆：层、项目、来源、极性、内容、命中次数。"""
     store = _store()
     lay = Layer(layer) if layer else None
-    items = store.all(layer=lay, project_id=project)[-limit:]
+    items = store.unclaimed() if unclaimed else store.all(layer=lay, project_id=project)
+    items = items[-limit:]
     if not items:
         console.print("[dim]没有记忆[/]")
         return
     t = Table(show_header=True, header_style="bold")
-    for col in ("id", "时间", "层", "来源", "极性", "内容", "命中"):
+    for col in ("id", "时间", "层", "项目", "来源", "极性", "内容", "命中"):
         t.add_column(col)
     for m in items:
         pol = {k.polarity.value for k in m.keywords}
@@ -51,13 +58,23 @@ def list_cmd(
             m.id,
             _dt.datetime.fromtimestamp(m.created_at).strftime("%m-%d %H:%M"),
             m.layer.value,
+            escape(m.project_id or ("全局" if m.layer is Layer.ACCOUNT else "待认领")),
             m.source.value,
             "/".join(sorted(pol)) or "—",
-            m.content[:60],
+            escape(m.content[:60]),
             str(m.hit_count),
         )
     console.print(t)
-    console.print(f"[dim]共 {len(store)} 条，存于 {MEM_DIR}[/]")
+    waiting = len(store.unclaimed())
+    console.print(
+        f"[dim]共 {len(store)} 条，存于 {MEM_DIR}"
+        + (
+            f"；{waiting} 条没有项目键，在有项目的会话里不召回、不 pin —— "
+            "要用就 agent memory claim <id> --project <项目键>"
+            if waiting else ""
+        )
+        + "[/]"
+    )
 
 
 @app.command("brief")
@@ -103,4 +120,21 @@ def forget_cmd(memory_id: str = typer.Argument(..., help="记忆 id")) -> None:
     except KeyError as e:
         console.print(f"[red]{e}[/]")
         raise typer.Exit(1) from e
-    console.print(f"[green]✓[/] 已作废 {m.id}：{m.content}")
+    console.print(f"[green]✓[/] 已作废 {m.id}：{escape(m.content)}")
+
+
+@app.command("claim")
+def claim_cmd(
+    memory_id: str = typer.Argument(..., help="记忆 id，见 list --unclaimed"),
+    project: str = typer.Option(
+        ..., "--project", help="认领到哪个项目（项目键，见 list 的「项目」列）"
+    ),
+) -> None:
+    """认领一条没有项目键的旧记忆：挂到这个项目上，从此只在这个项目里召回、pin。"""
+    store = _store()
+    try:
+        m = store.claim(memory_id, project)
+    except (KeyError, ValueError) as e:
+        console.print(f"[red]{escape(str(e))}[/]")
+        raise typer.Exit(1) from e
+    console.print(f"[green]✓[/] {m.id} 已认领到项目 {escape(project)}：{escape(m.content)}")

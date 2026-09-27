@@ -12,6 +12,7 @@ Checkpoint 一旦存在就会产生打回理由，而这类数据是**补不回�
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -76,6 +77,8 @@ class Memory(BaseModel):
     superseded_by: str | None = None
 
     project_id: str = ""
+    # 打回发生在哪个环节（内容类打回挂在环节上，2026-09-26）；其余记忆留空
+    stage: str = ""
     created_at: float = Field(default_factory=time.time)
     last_hit_at: float | None = None
     hit_count: int = 0
@@ -85,6 +88,27 @@ class Memory(BaseModel):
         if self.superseded_by:
             return False
         return self.valid_until is None or self.valid_until > time.time()
+
+
+# 内容类打回理由的有效期（天）。2026-09-26：之前打回理由一律永久有效、每轮 pin ——
+# 蜘蛛精剧的「控制在十二集」到《不渡》里还每轮 pin 着。人要长期生效就 /remember 或晋升账号层
+REJECTION_TTL_DAYS = 30.0
+
+
+def in_scope(m: Memory, project_id: str) -> bool:
+    """这条记忆在这个项目里算不算数（召回、简报、pin 都按它，2026-09-26）：
+      · 账号层：全局，哪个项目都算
+      · 有项目上下文：只认本项目的 —— **没有项目键的旧记忆隔离**（不召回、不 pin），等人认领
+        （`agent memory claim`，或对话里 /remember 记忆id）。之前它们对所有剧都生效
+      · 没有项目上下文（脚本、测试）：只看没有项目键的
+    """
+    if m.layer is Layer.ACCOUNT:
+        return True
+    return m.project_id == project_id
+
+
+_NEGATIVE_WORDS = ("不要", "别", "不许", "不准", "禁止", "不能", "不得", "严禁", "避免", "不用")
+_TERM_SPLIT = re.compile(r"[\s，。！？、；：,.!?;:\n\"'“”（）()【】\[\]「」]+")
 
 
 class MemoryStore:
@@ -123,6 +147,7 @@ class MemoryStore:
         project_id: str = "",
         decision: str = "revise",
         candidates: list[str] | None = None,
+        ttl_days: float | None = REJECTION_TTL_DAYS,
     ) -> Memory:
         """打回理由落库 —— P1 的核心动作。
 
@@ -132,6 +157,9 @@ class MemoryStore:
 
         P1 不做关键词提取（需要模型，是 M8.2 的活，P3 建）。这里把**原文存下来**，
         `keywords` 的语义字段等 P3 回填 —— 原文不存就永远补不回来，词晚点提没关系。
+
+        2026-09-26：挂到项目和环节上、默认 30 天后过期（ttl_days=None 永久）——
+        一句打回理由是对那一版内容的意见，不是这个号永远的规矩。
         """
         target = target_node or node_id
         terms = {target, node_id}
@@ -153,8 +181,71 @@ class MemoryStore:
                 confidence=1.0,
                 weight=2.0,  # 打回理由权重高于一般记忆
                 project_id=project_id,
+                stage=target,
+                valid_until=(time.time() + ttl_days * 86400) if ttl_days else None,
             )
         )
+
+    def remember(self, text: str, project_id: str = "", everywhere: bool = False) -> Memory:
+        """人在对话里亲口定的规则（/remember）：来源 human、硬约束、不过期，每轮 pin。
+
+        默认只对这个项目生效；everywhere=True 记到账号层（所有项目都算）。
+        含「不要 / 别 / 禁止…」的记成禁止（进避雷），其余记成要求（进必须遵守）。
+        """
+        body = " ".join((text or "").split())
+        if not body:
+            raise ValueError("要记的话是空的")
+        neg = any(w in body for w in _NEGATIVE_WORDS)
+        terms = [p for p in _TERM_SPLIT.split(body) if 2 <= len(p) <= 12][:6] or [body[:12]]
+        return self.put(
+            Memory(
+                layer=Layer.ACCOUNT if everywhere else Layer.PROJECT,
+                content=body,
+                keywords=[
+                    Keyword(
+                        term=t,
+                        polarity=Polarity.NEGATIVE if neg else Polarity.POSITIVE,
+                        category=Category.CONSTRAINT,
+                        origin_quote=body[:60],
+                    )
+                    for t in dict.fromkeys(terms)
+                ],
+                origin_ref="human:/remember",
+                source=Source.HUMAN,
+                confidence=1.0,
+                weight=2.0,
+                project_id="" if everywhere else project_id,
+            )
+        )
+
+    def claim(self, memory_id: str, project_id: str) -> Memory:
+        """认领一条没有项目键的旧记忆：挂到 project_id 上，从此只在这个项目里生效。"""
+        if not project_id:
+            raise ValueError("认领要给项目键")
+        m = self.get(memory_id)
+        if m.layer is Layer.ACCOUNT:
+            raise ValueError(f"{memory_id} 是账号层记忆，本来就对所有项目生效，不用认领")
+        m.project_id = project_id
+        return self.put(m)
+
+    def unclaimed(self) -> list[Memory]:
+        """没有项目键、又不是账号层的有效记忆 —— 有项目的会话里被隔离、等人认领的那些。"""
+        return [m for m in self.all() if m.layer is not Layer.ACCOUNT and not m.project_id]
+
+    def find(self, query: str, project_id: str = "") -> list[Memory]:
+        """/forget 用：按记忆 id 或内容里的关键词找这个项目看得到的记忆（含账号层、
+        和等人认领的旧记忆 —— 人要作废的多半就是它们）。"""
+        q = (query or "").strip()
+        if not q:
+            return []
+        if q in self._items and self._items[q].alive:
+            return [self._items[q]]
+        key = "".join(q.split()).lower()
+        return [
+            m for m in self.all()
+            if (in_scope(m, project_id) or not m.project_id)
+            and key in "".join(m.content.split()).lower()
+        ]
 
     def promote(self, memory_id: str, layer: Layer = Layer.ACCOUNT, by: str = "human") -> Memory:
         """晋升到账号层：从"这个项目这么要求"变成"这个号一直这么要求"。
@@ -215,8 +306,11 @@ class MemoryStore:
         grams = {q[i : i + n] for n in (2, 3, 4) for i in range(len(q) - n + 1)}
         return [t for t in self._index if any(g in t for g in grams)]
 
-    def recall(self, terms: list[str], limit: int = 5, project_id: str = "") -> list[Memory]:
-        """关键词召回。按 权重 × 命中数 × 时间新近 排序。"""
+    def recall(
+        self, terms: list[str], limit: int = 5, project_id: str = "", touch: bool = True
+    ) -> list[Memory]:
+        """关键词召回。按 权重 × 命中数 × 时间新近 排序。touch=False：只查，不计命中
+        （简报的主题预筛每轮拉 50 条，不是真正注入上下文的，之前也算命中、每轮落盘 50 次）。"""
         hits: dict[str, int] = defaultdict(int)
         for t in terms:
             for mid in self._index.get(t, ()):
@@ -226,13 +320,17 @@ class MemoryStore:
         now = time.time()
         for mid, n in hits.items():
             m = self._items[mid]
-            if not m.alive or (project_id and m.project_id and m.project_id != project_id):
+            # 有项目上下文：只召回本项目 + 账号层，没有项目键的旧记忆隔离（2026-09-26：之前
+            # 放行，蜘蛛精剧的规则在《不渡》里照样召回）
+            if not m.alive or (project_id and not in_scope(m, project_id)):
                 continue
             recency = 1.0 / (1.0 + (now - m.created_at) / 86400)
             scored.append((m.weight * n * (0.5 + 0.5 * recency), m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         picked = [m for _, m in scored[:limit]]
+        if not touch:
+            return picked
         for m in picked:
             m.hit_count += 1
             m.last_hit_at = now
@@ -241,10 +339,18 @@ class MemoryStore:
         return picked
 
     def render_brief(self, memories: list[Memory]) -> str:
-        """极简版 Memory Brief。P3 由 Memory Agent 产出完整四区结构。"""
+        """极简版 Memory Brief。P3 由 Memory Agent 产出完整四区结构。
+
+        避雷只放人说的 / 数据验证过的「不要」。模型推测出来的「不要」放参考、标「推测」——
+        之前一律标成「本项目已被打回过」（2026-09-26）：「需逐镜 gen_video 传 image_urls」
+        这种推测被当成人打回过的规矩召回，和系统提示词正面冲突。"""
         if not memories:
             return ""
-        must_not = [m for m in memories if any(k.polarity is Polarity.NEGATIVE for k in m.keywords)]
+
+        def negative(m: Memory) -> bool:
+            return any(k.polarity is Polarity.NEGATIVE for k in m.keywords)
+
+        must_not = [m for m in memories if negative(m) and m.source in (Source.HUMAN, Source.DATA)]
         other = [m for m in memories if m not in must_not]
 
         parts = []
@@ -254,7 +360,14 @@ class MemoryStore:
                 + "\n".join(f"- {m.content}" for m in must_not)
             )
         if other:
-            parts.append("### 参考\n" + "\n".join(f"- {m.content}" for m in other))
+            parts.append(
+                "### 参考\n"
+                + "\n".join(
+                    f"- {'避免：' if negative(m) else ''}{m.content}"
+                    + ("（推测）" if m.source is Source.INFERRED else "")
+                    for m in other
+                )
+            )
         return "\n\n".join(parts)
 
     # ---------- 持久化 ----------

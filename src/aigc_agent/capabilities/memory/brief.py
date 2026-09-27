@@ -25,12 +25,19 @@ from difflib import SequenceMatcher
 
 from pydantic import BaseModel, Field
 
-from .store import Category, Layer, Memory, MemoryStore, Polarity, Source
+from .store import Category, Memory, MemoryStore, Polarity, Source, in_scope
 
 _ASSET_RE = re.compile(r"\bas_[0-9a-f]{10}\b")
 INFERRED_TAG = "（推测）"
 # 一次性的事实：报错码、余额、限流 —— 过两天就不成立了（「seedance 402 余额不足」之前永久生效）
-_ERROR_FACT = re.compile(r"(?<!\d)(40[0-9]|42[0-9]|5\d\d)(?!\d)|余额不足|额度用尽|限流|宕机|超时")
+# 数字只有和「报错 / 状态码 / HTTP」这类词连着才算错误码：「预算上限 400 元」「每集 500 字」
+# 是用户约束，之前也被当成两天就作废的一次性事实（2026-09-24 审查）；裸「超时」同理不算
+_ERROR_FACT = re.compile(
+    r"(?:HTTP|http|状态码|报错?|错误码?|返回|code|status|error)\s*[:：]?\s*(?:40\d|42\d|5\d\d)"
+    r"(?!\d)(?!\s*[字元秒段张个集条次分%％])"
+    r"|(?<!\d)(?:40\d|42\d|5\d\d)\s*(?:错误|报错|error|Error)"
+    r"|余额不足|额度用尽|限流|宕机|请求超时|接口超时|调用超时"
+)
 ERROR_TTL = 2 * 86400
 ASSET_TTL = 14 * 86400  # 指着具体资产 id 的推测：资产会被替代，两周后多半过期
 
@@ -144,15 +151,13 @@ def build_brief(
 ) -> MemoryBrief:
     """规则版 Brief。不调模型。
 
-    取哪些记忆：账号层全部 + 本项目（含未标项目的）全部；有 topic/stage 时按关键词
-    过滤 should/refs，但 **must / must_not 不做相关性过滤** —— 避雷漏掉一条就是重犯一次。
+    取哪些记忆：账号层全部 + 本项目全部（store.in_scope：有项目时没有项目键的旧记忆隔离、
+    等人认领 —— 2026-09-26 之前它们对所有剧都 pin）；过期的（打回理由默认 30 天）不取。
+    有 topic/stage 时按关键词过滤 should/refs，但 **must / must_not 不做相关性过滤** ——
+    避雷漏掉一条就是重犯一次。
     """
     now = time.time()
-    pool = [
-        m
-        for m in store.all()
-        if (m.layer is Layer.ACCOUNT or m.project_id in ("", project_id)) and not _stale(m, now)
-    ]
+    pool = [m for m in store.all() if in_scope(m, project_id) and not _stale(m, now)]
     if not pool:
         return MemoryBrief()
 
@@ -162,7 +167,10 @@ def build_brief(
         terms = store.match_terms(query)
         relevant = set()
         if terms:
-            relevant = {m.id for m in store.recall(terms, limit=50, project_id=project_id)}
+            relevant = {
+                m.id
+                for m in store.recall(terms, limit=50, project_id=project_id, touch=False)
+            }
         # 直接包含的也算相关（match_terms 只看索引词）
         for m in pool:
             if any(t and t in m.content for t in query.split()):

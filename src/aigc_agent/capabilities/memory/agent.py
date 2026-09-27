@@ -36,7 +36,7 @@ from typing import Any
 
 from ..subagents import SubAgentDef, SubAgentRunner
 from .brief import MemoryBrief, _similar, build_brief, transient_ttl
-from .store import Category, Keyword, Layer, Memory, MemoryStore, Polarity, Source
+from .store import Category, Keyword, Layer, Memory, MemoryStore, Polarity, Source, in_scope
 
 EXTRACT_ROLE = "memory_extract"
 RECALL_ROLE = "memory_recall"
@@ -206,7 +206,9 @@ class MemoryAgent:
         self.store = store
         self.project_id = project_id
         self.runner = runner  # M10 运行器；没有就只用规则版 Brief
-        self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=queue_size)
+        # 队列里带着入队时的项目键：/out 换了项目之后，排着没提取完的旧项目对话不能记到
+        # 新项目名下（2026-09-26）
+        self._queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue(maxsize=queue_size)
         self._task: asyncio.Task[None] | None = None
         self.extracted = 0  # 统计用，也方便测试断言
 
@@ -233,12 +235,15 @@ class MemoryAgent:
 
     # ---------- 写：淘汰的轮次 → 长期记忆 ----------
 
-    def submit(self, transcript: str, origin_ref: str = "") -> bool:
+    def submit(self, transcript: str, origin_ref: str = "", project_id: str | None = None) -> bool:
         """非阻塞入队。队列满了就丢弃并返回 False —— 记忆提取是
         锦上添花，不值得为它把主循环卡住。
+
+        project_id 不给就按入队这一刻的项目键记（提取是异步的，处理时项目可能已经换了）。
         """
+        project = self.project_id if project_id is None else project_id
         try:
-            self._queue.put_nowait((transcript, origin_ref))
+            self._queue.put_nowait((transcript, origin_ref, project))
         except asyncio.QueueFull:
             return False
         self.start()
@@ -246,26 +251,29 @@ class MemoryAgent:
 
     async def _worker(self) -> None:
         while True:
-            transcript, origin_ref = await self._queue.get()
+            transcript, origin_ref, project = await self._queue.get()
             try:
-                await self._extract_one(transcript, origin_ref)
+                await self._extract_one(transcript, origin_ref, project)
             except Exception:  # noqa: BLE001
                 # 记忆提取失败不该让用户那一轮跟着失败，吞掉
                 pass
             finally:
                 self._queue.task_done()
 
-    async def _extract_one(self, transcript: str, origin_ref: str) -> int:
+    async def _extract_one(
+        self, transcript: str, origin_ref: str, project_id: str | None = None
+    ) -> int:
         if not transcript.strip():
             return 0
+        project = self.project_id if project_id is None else project_id
         resp = await self.gateway.chat(
             EXTRACT_ROLE, [{"role": "user", "content": extract_prompt(transcript)}]
         )
-        mems = parse_memories(resp.text, origin_ref, self.project_id)
+        mems = parse_memories(resp.text, origin_ref, project)
         kept = 0
-        existing = [
-            m for m in self.store.all() if m.project_id in ("", self.project_id)
-        ]
+        # 只和这个项目看得到的比（本项目 + 账号层）：之前也和没有项目键的旧记忆去重 ——
+        # 用户在新剧里又说了一遍，结果只给那条被隔离的旧记忆加了分量，新剧里还是没有
+        existing = [m for m in self.store.all() if in_scope(m, project)]
         for m in mems:
             # 写入去重：同一件事之前记过（措辞略有出入）就不再存一条，给旧的加点分量 ——
             # 之前每批提取都新存，同一句「开头别写硬广」在简报里出现两三遍

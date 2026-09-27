@@ -16,6 +16,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from ...harness.context.window import ShortTermMemory, Turn
 from ...harness.model.gateway import estimate_tokens
 
@@ -42,6 +44,15 @@ class SessionSnapshot:
         self.image_model: str = ""
         # 用户选的产线标签（2026-09-23：短剧 / 抖音短视频 / 广告 / 设计；空 = 不限定）
         self.content_line: str = ""
+        # 这个项目一集几分钟（/length 设；0 = 用 config/drama.yaml 的默认）。2026-09-25：《不渡》
+        # 的剧本每集约 5600 字、光台词就四到六分钟，塞不进默认的 4 分钟
+        self.episode_minutes: float = 0.0
+        # 集长跟剧本走（/length auto，2026-09-26）：不按集长凑总时长
+        self.episode_auto: bool = False
+        # 这个项目的视频画幅（/ratio 设，如 16:9；空 = 默认：短剧竖屏 9:16、短视频按配方）
+        self.aspect_ratio: str = ""
+        # 镜头超 3 秒拦不拦成片（/cut，2026-09-27）：False = 只标 ⚠
+        self.cut_block: bool = False
         # 上次开工确认的额度（金额 / 视频段数 / 视频秒数 / 图片张数），下次开工拿来当默认
         self.budget: dict[str, Any] = {}
         # 挂起中的人审（重启前没结案的）。之前只在内存里，重启后被悄悄补成「已中断」
@@ -55,6 +66,13 @@ class SessionSnapshot:
                 self.video_model = str(data.get("video_model") or "")
                 self.image_model = str(data.get("image_model") or "")
                 self.content_line = str(data.get("content_line") or "")
+                self.aspect_ratio = str(data.get("aspect_ratio") or "")
+                try:
+                    self.episode_minutes = float(data.get("episode_minutes") or 0.0)
+                except (TypeError, ValueError):
+                    self.episode_minutes = 0.0
+                self.episode_auto = bool(data.get("episode_auto"))
+                self.cut_block = bool(data.get("cut_block"))
                 b = data.get("budget")
                 self.budget = dict(b) if isinstance(b, dict) else {}
                 pr = data.get("pending_review")
@@ -84,10 +102,43 @@ class SessionSnapshot:
         self.content_line = key
         self._patch({"content_line": key})
 
+    def set_episode_minutes(self, minutes: float, auto: bool = False) -> None:
+        """记住这个项目一集几分钟（/length）。0 = 恢复默认；auto = 跟剧本走（/length auto）。"""
+        self.episode_minutes = 0.0 if auto else float(minutes or 0.0)
+        self.episode_auto = bool(auto)
+        self._patch({"episode_minutes": self.episode_minutes, "episode_auto": self.episode_auto})
+
+    def set_aspect_ratio(self, ratio: str) -> None:
+        """记住这个项目的视频画幅（/ratio）。空串 = 恢复默认。"""
+        self.aspect_ratio = ratio or ""
+        self._patch({"aspect_ratio": self.aspect_ratio})
+
+    def set_cut_block(self, on: bool) -> None:
+        """记住这个项目镜头超 3 秒拦不拦成片（/cut）。"""
+        self.cut_block = bool(on)
+        self._patch({"cut_block": self.cut_block})
+
     def set_budget(self, limits: dict[str, Any]) -> None:
         """记住这次开工确认的额度，下次开工当默认值拿出来问。"""
         self.budget = {k: v for k, v in limits.items() if v is not None}
         self._patch({"budget": self.budget})
+
+    def inherit_settings(self, other: SessionSnapshot) -> None:
+        """第二个窗口另起的会话：项目设置从主会话抄一份（对话、挂起的人审不抄）。"""
+        fields: dict[str, Any] = {
+            "output_dir": other.output_dir,
+            "video_model": other.video_model,
+            "image_model": other.image_model,
+            "content_line": other.content_line,
+            "episode_minutes": other.episode_minutes,
+            "episode_auto": other.episode_auto,
+            "aspect_ratio": other.aspect_ratio,
+            "cut_block": other.cut_block,
+            "budget": dict(other.budget),
+        }
+        for k, v in fields.items():
+            setattr(self, k, v)
+        self._patch(fields)
 
     def _patch(self, fields: dict[str, Any]) -> None:
         try:
@@ -106,8 +157,14 @@ class SessionSnapshot:
             tmp = self.path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, self.path)
-        except OSError:
-            pass  # 记不住不挡聊天
+            self.last_error = ""
+        except OSError as e:
+            # 记不住不挡聊天，但要留痕：同一文件夹两个终端同名快照互相撞上时会丢这一轮
+            # （含 pending_review、模型锁），之前完全静默（2026-09-24 审查）
+            self.last_error = f"{type(e).__name__}: {e}"
+            structlog.get_logger(__name__).warning(
+                "session.snapshot_write_failed", path=str(self.path), error=self.last_error
+            )
 
     def load_into(self, memory: ShortTermMemory, max_tokens: int = 30_000) -> int:
         """装回上次保存的轮次，返回装了几轮。没有快照或文件坏了就当全新会话。
@@ -184,6 +241,10 @@ class SessionSnapshot:
             "video_model": self.video_model,
             "image_model": self.image_model,
             "content_line": self.content_line,
+            "episode_minutes": self.episode_minutes,
+            "episode_auto": self.episode_auto,
+            "aspect_ratio": self.aspect_ratio,
+            "cut_block": self.cut_block,
             "budget": self.budget,
             "pending_review": self.pending_review,
             "active_skills": self.active_skills,
@@ -193,3 +254,83 @@ class SessionSnapshot:
             ],
         }
         self._write(payload)
+
+
+# ---------------------------------------------------------- 一份快照只给一个窗口（2026-09-26）
+# 同一个文件夹开两个窗口：快照是整份覆盖写，后存的把先存的挂起人审、模型锁冲掉；两个 /auto 还会
+# 重复派发渲染。第二个窗口另起一个会话（「名字~2」），项目设置从主会话抄一份，/auto 只在主窗口开。
+
+
+class SessionLock:
+    """操作系统级的文件锁：进程没了锁自动释放，不会留下崩溃残留，也不怕 PID 被复用。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fh: Any = None
+
+    @property
+    def held(self) -> bool:
+        return self._fh is not None
+
+    def acquire(self) -> bool:
+        """占住。别的窗口占着返回 False；锁文件建不了（只读盘之类）当作占到了 —— 锁是保护，
+        不是开工条件。"""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fh = self.path.open("a+b")
+        except OSError:
+            return True
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self._fh = fh
+        return True
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            fh.close()
+
+
+def open_session(root: Path, name: str) -> tuple[SessionSnapshot, SessionLock, bool]:
+    """打开会话快照并占住它，返回 (快照, 锁, 是不是第二个窗口)。
+
+    别的窗口占着这份会话：另起「name~2」（~3 …）这样的会话，项目设置从主会话抄一份。"""
+    lock = SessionLock(root / f"{_safe(name)}.lock")
+    if lock.acquire():
+        return SessionSnapshot(root, name), lock, False
+    main = SessionSnapshot(root, name)
+    for i in range(2, 20):
+        alt = f"{name}~{i}"
+        lock = SessionLock(root / f"{_safe(alt)}.lock")
+        if lock.acquire():
+            snap = SessionSnapshot(root, alt)
+            snap.inherit_settings(main)
+            return snap, lock, True
+    snap = SessionSnapshot(root, f"{name}~{os.getpid()}")
+    snap.inherit_settings(main)
+    return snap, SessionLock(root / f"{_safe(snap.name)}.lock"), True
