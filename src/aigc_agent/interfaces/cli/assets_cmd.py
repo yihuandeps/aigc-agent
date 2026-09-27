@@ -19,8 +19,11 @@ from ...capabilities.memory.session import SessionSnapshot
 from ...domain.assets.migrate import (
     agents_running,
     apply_migration,
+    latest_plan_table,
+    plan_from_table,
     plan_migration,
     restore_migration,
+    write_plan_table,
 )
 from ...domain.assets.store import AssetStore
 from ...domain.assets.trash import purge_trash, trash_folders
@@ -143,23 +146,47 @@ def trash_cmd(
 
 @app.command("migrate")
 def migrate_cmd(
-    apply: bool = typer.Option(False, "--apply", help="按计划执行（默认只看计划）"),
+    apply: bool = typer.Option(
+        False, "--apply", help="按映射表执行（默认只出计划和映射表，什么都不改）"
+    ),
     force: bool = typer.Option(False, "--force", help="检测到疑似有 Agent 在跑时也执行"),
     restore: str = typer.Option("", "--restore", help="撤销某次迁移：传它的 manifest.json 路径"),
+    table: str = typer.Option(
+        "", "--table",
+        help="映射表：不带 --apply 时写到这里（默认 workspace/migrate-plan-时间.csv）；"
+        "带 --apply 时按它执行（默认用 workspace 下最新的一张）",
+    ),
 ) -> None:
-    """把加项目维度之前的存量资产分到各自的项目；测试桩移进回收站。全部可撤销。"""
+    """把加项目维度之前的存量资产分到各自的项目；测试桩移进回收站。全部可撤销。
+
+    两步走（2026-09-26 用户定的）：先出一张映射表，你看过、改好，再 --apply 按表执行。"""
     if restore:
         done = restore_migration(Path(restore))
         console.print(f"[green]已撤销[/] {done}")
         return
-    plan = plan_migration(WORKSPACE)
-    console.print(escape(plan.render()))
     if not apply:
+        plan = plan_migration(WORKSPACE)
+        console.print(escape(plan.render()))
+        path = write_plan_table(plan, WORKSPACE, Path(table) if table else None)
         console.print(
-            "\n[dim]只是计划，没有改任何东西。确认后：agent assets migrate --apply"
-            "（先关掉所有 Agent 窗口）[/]"
+            f"\n[green]映射表：[/]{escape(str(path))}\n"
+            "[dim]一份资产一行，用 Excel / WPS 打开。要改归属就改「项目（改这一列）」："
+            "填产物目录路径（如 E:\\西游记）、剧名，或 legacy（不属于任何项目）/ "
+            "测试桩（移进回收站）。「待你定」那几行是证据指向不止一个项目的，不改就不动它们。\n"
+            "改好保存后：agent assets migrate --apply"
+            "（默认用最新的这张表；先关掉所有 Agent 窗口）。这一步没有改任何东西。[/]"
         )
         return
+    path = Path(table) if table else latest_plan_table(WORKSPACE)
+    if path is None or not path.exists():
+        console.print(
+            "[red]没有映射表。[/]先跑 agent assets migrate 出一张表，看过、改好再 --apply"
+            + (f"（找不到 {escape(table)}）" if table else "")
+        )
+        raise typer.Exit(1)
+    plan = plan_from_table(WORKSPACE, path)
+    console.print(f"[dim]按映射表执行：{escape(str(path))}[/]")
+    console.print(escape(plan.render()))
     busy = agents_running(WORKSPACE)
     if busy and not force:
         console.print(
@@ -170,5 +197,11 @@ def migrate_cmd(
         raise typer.Exit(1)
     manifest = apply_migration(plan, WORKSPACE)
     console.print(
-        f"[green]迁移完成[/]。撤销：agent assets migrate --restore \"{manifest}\""
+        f"[green]迁移完成[/]。撤销：agent assets migrate --restore \"{escape(str(manifest))}\""
     )
+    if plan.pending:
+        shown = "、".join(sorted(plan.pending)[:8]) + (" 等" if len(plan.pending) > 8 else "")
+        console.print(
+            f"[yellow]{len(plan.pending)} 份没动（表里是「待你定」或填得认不出）：[/]{shown}\n"
+            "[dim]它们还没有项目键；再跑 agent assets migrate 会重新进表，定好了再 --apply。[/]"
+        )

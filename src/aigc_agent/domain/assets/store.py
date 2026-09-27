@@ -187,7 +187,8 @@ class AssetStore:
             self._mtimes[aid] = mtime
             self._seq = max(self._seq, a.seq)
         # 别的进程挪走的（迁移时移进回收站的测试桩）
-        for aid in [k for k in self._mtimes if k not in present]:
+        # fs_import 在线程里 create→put 会改这两个字典：遍历前先拷贝（2026-09-24 审查）
+        for aid in [k for k in list(self._mtimes) if k not in present]:
             self._mtimes.pop(aid, None)
             self._items.pop(aid, None)
 
@@ -413,7 +414,7 @@ class AssetStore:
         """各项目的资产数（含 legacy 和没分项目的空串）。"""
         self._maybe_refresh()
         out: dict[str, int] = {}
-        for a in self._items.values():
+        for a in list(self._items.values()):
             out[a.project] = out.get(a.project, 0) + 1
         return out
 
@@ -446,7 +447,7 @@ class AssetStore:
                 k += 1
             return k
 
-        scored = [(common(key, a.id), a.seq, a.id) for a in self._items.values()]
+        scored = [(common(key, a.id), a.seq, a.id) for a in list(self._items.values())]
         scored = [s for s in scored if s[0] >= 6]  # 至少 "as_" 后再对 3 位
         scored.sort(reverse=True)
         return [aid for _, _, aid in scored[:n]]
