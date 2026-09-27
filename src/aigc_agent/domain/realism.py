@@ -230,9 +230,20 @@ RETRY_BOOST = _RETRY["smooth"][DEFAULT_LEVEL]
 # 描写孩子，也正好撞上生图服务的儿童护栏 —— 8 岁女主的主形象被拒，她的服装图全部连带跳过
 # （2026-09-23 审查，因果属推测，但这套写法本来就不该用在孩子身上）。
 _MINOR_WORDS = (
-    "萌宝", "小孩", "孩子", "儿童", "幼童", "女童", "男童", "小女孩", "小男孩", "女孩", "男孩",
-    "婴儿", "宝宝", "小学生", "初中生", "未成年", "少年", "少女",
-    "child", "kid", "toddler", "baby", "teen", "schoolgirl", "schoolboy",
+    "萌宝", "小孩", "儿童", "幼童", "女童", "男童", "小女孩", "小男孩",
+    "婴儿", "宝宝", "小学生", "初中生", "高中生", "未成年", "青少年",
+)
+# 英文按整词认：之前按子串，childhood / kidnap / eighteen 都被当成未成年
+_MINOR_EN = re.compile(
+    r"\b(?:child(?:ren)?|kids?|toddlers?|bab(?:y|ies)|teens?|teenagers?|teenage"
+    r"|school(?:girl|boy)s?)\b",
+    re.I,
+)
+# 没写年龄时这几个词单独出现才算：「少女感 / 少年气质」是成年人的气质形容，「两个孩子的妈」
+# 说的是别人。「女孩 / 男孩」没有年龄时太含糊（「邻家女孩气质」多半是成年人），不再当依据
+# （2026-09-24 审查：之前套上儿童写法出图）
+_MINOR_RE = re.compile(
+    r"少[年女](?!感|气质|气|风|系|时代|时期|般|漫|向|心|模样|情怀)|(?<!的)孩子(?!的|们|气)"
 )
 _AGE = re.compile(r"(\d{1,3})\s*(?:岁|周岁|years?[\s-]*old)", re.I)
 
@@ -267,7 +278,11 @@ def is_minor(text: str) -> bool:
     if m:
         return int(m.group(1)) < 18
     low = t.lower()
-    return any(w in low for w in _MINOR_WORDS)
+    return (
+        any(w in low for w in _MINOR_WORDS)
+        or bool(_MINOR_RE.search(t))
+        or bool(_MINOR_EN.search(t))
+    )
 
 
 def image_suffix(level: str = "") -> str:

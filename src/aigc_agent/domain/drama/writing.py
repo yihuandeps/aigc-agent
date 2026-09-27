@@ -60,12 +60,16 @@ def write_prompt(idea: str, episodes: int = 1, minutes: float = 0, fmt: Any = No
 
     spec = fmt or DEFAULT_FORMAT
     if minutes and minutes > 0:
-        spec = replace(spec, minutes=float(minutes))
+        spec = replace(spec, minutes=float(minutes), follow_script=False)
+    length = (
+        f"每集时长按剧情需要定（参考约 {spec.minutes:g} 分钟、{spec.script_chars} 字）"
+        if spec.follow_script
+        else f"每集约 {spec.minutes:g} 分钟（约 {spec.script_chars} 字）"
+    )
     return (
         f"用户的想法：{idea}\n\n"
         f"{_METHOD}\n\n"
-        f"按这套方法写 **{episodes} 集**短剧剧本，每集约 {spec.minutes:g} 分钟"
-        f"（约 {spec.script_chars} 字）。\n\n"
+        f"按这套方法写 **{episodes} 集**短剧剧本，{length}。\n\n"
         f"{writing_rules(spec)}\n\n"
         f"{_FORMAT}"
     )

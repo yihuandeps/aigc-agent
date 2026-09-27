@@ -83,8 +83,9 @@ class Episode:
         n = 0
         for line in self.desc.splitlines():
             s = line.strip()
-            if s.startswith("【") and "】" in s:
-                s = s.split("】", 1)[1].strip()  # 行首标记（如【高潮点】）不算镜头内容
+            while s.startswith("【") and "】" in s:
+                # 行首标记（【高潮点】【闪前】，可以连着几个）不算镜头内容
+                s = s.split("】", 1)[1].strip()
             if s.startswith("[") and not _is_slug(s):
                 n += 1
         return n
@@ -165,10 +166,19 @@ class Character:
         return f"{self.body} {locked}".strip()
 
     def costume_for(self, scene: str, episode: int = 0) -> Costume | None:
-        """这个场景/这一集该穿哪套：场景显式绑定 > 集数覆盖 > None。"""
+        """这个场景/这一集该穿哪套：场景绑定且这一集能穿 > 场景绑定且没标集数 > 这一集能穿 > None。
+
+        2026-09-25：之前场景绑定不看集数 —— 同一个场景分给了两套（二郎神在「天竺城外·老槐树下」
+        有 1–17 集的战甲和 18–20 集的素战袍），第 18 集取到了排在前面的战甲。
+        """
         if scene:
-            for cos in self.costumes:
-                if scene in cos.scenes:
+            bound = [cos for cos in self.costumes if scene in cos.scenes]
+            if episode:
+                for cos in bound:
+                    if cos.covers_episode(episode):
+                        return cos
+            for cos in bound:
+                if not episode or not (cos.episodes or "").strip():
                     return cos
         if episode:
             for cos in self.costumes:
@@ -286,6 +296,56 @@ def normalize_ref_parens(text: str, known: set[str]) -> str:
     return _FULL_REF.sub(sub, text)
 
 
+_COSTUME_REF = re.compile(r"\(([^()]{2,80}?-\[[^\]]*\])\)")
+
+
+def _episode_set(spec: str) -> set[int] | None:
+    """「1-8, 10-18, 20」→ 集号集合；「全集」这类认不出数字的返回 None（= 每一集都算）。"""
+    nums: set[int] = set()
+    for part in re.split(r"[,，、\s]+", spec or ""):
+        m = re.fullmatch(r"(\d+)\s*[-–~～]\s*(\d+)", part)
+        if m:
+            a, b = sorted((int(m.group(1)), int(m.group(2))))
+            nums |= set(range(a, b + 1))
+        elif part.isdigit():
+            nums.add(int(part))
+    return nums or None
+
+
+def fix_costume_refs(
+    text: str, costume_names: set[str], episode: int = 0
+) -> tuple[str, list[str]]:
+    """服装 ID 的集数范围被模型写短 / 改写了（「孙悟空-黄直裰虎皮围裙-[1]」，库里是「…-[1-18]」）：
+    这个角色的这套服装在库里只有一个（或只有一个的集数范围包含这一集），就换成库里的全名。
+    认不准的不动，留给引用检查报出来（2026-09-25：之前每次都要带一长串全名当 note 重跑）。
+    返回 (新正文, 改了哪些)。"""
+    by_prefix: dict[str, list[str]] = {}
+    for name in costume_names:
+        i = name.rfind("-[")
+        if i > 0 and name.endswith("]"):
+            by_prefix.setdefault(name[:i].strip(), []).append(name)
+    fixed: list[str] = []
+
+    def sub(m: re.Match[str]) -> str:
+        ref = m.group(1).strip()
+        if ref in costume_names:
+            return m.group(0)
+        cands = sorted(by_prefix.get(ref[: ref.rfind("-[")].strip(), []))
+        if len(cands) > 1 and episode:
+            hit = []
+            for c in cands:
+                eps = _episode_set(c[c.rfind("-[") + 2 : -1])
+                if eps is None or episode in eps:
+                    hit.append(c)
+            cands = hit or cands
+        if len(cands) != 1:
+            return m.group(0)
+        fixed.append(f"{ref} → {cands[0]}")
+        return f"({cands[0]})"
+
+    return _COSTUME_REF.sub(sub, text or ""), fixed
+
+
 @dataclass
 class ShotPrompt:
     scene_index: str  # 🟡 如 [第1集-1场]
@@ -296,6 +356,9 @@ class ShotPrompt:
     # 段内各镜头的秒数（2026-09-20 用户定的硬性要求：每个镜头 ≤3 秒）。
     # 一段 10–15s 的视频是多镜头快切，cuts 决定渲染时的时间线，也用来做规格检查。
     cuts: list[float] = field(default_factory=list)
+    # 这一段要叠的上屏字（2026-09-26）：[{"text", "kind", "shot", "at", "dur", "end"}]，
+    # at / dur 是相对这一段开头的秒数。生成的画面里不许有字，拼完成片后用 overlay_text 叠
+    screen_text: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def seconds(self) -> int:
@@ -355,7 +418,7 @@ def as_dict(obj: Any) -> dict[str, Any]:
     if isinstance(obj, Episode):
         return {"episodeIndex": obj.index, "episodeTitle": obj.title, "episodeDesc": obj.desc}
     if isinstance(obj, ShotPrompt):
-        return {
+        out: dict[str, Any] = {
             "scene_index": obj.scene_index,
             "video_name": obj.video_name,
             "video_duration": obj.duration,
@@ -363,4 +426,7 @@ def as_dict(obj: Any) -> dict[str, Any]:
             "description": obj.description,
             "hook": obj.hook,
         }
+        if obj.screen_text:
+            out["screen_text"] = [dict(x) for x in obj.screen_text]
+        return out
     raise TypeError(f"不知道怎么序列化 {type(obj).__name__}")

@@ -63,6 +63,7 @@ def _repair_quotes(raw: str) -> str:
     out: list[str] = []
     in_str = False
     esc = False
+    n = len(raw)
     for i, ch in enumerate(raw):
         if esc:
             out.append(ch)
@@ -77,12 +78,15 @@ def _repair_quotes(raw: str) -> str:
                 in_str = True
                 out.append(ch)
                 continue
-            nxt = ""
-            for c in raw[i + 1 :]:
-                if not c.isspace():
-                    nxt = c
-                    break
-            if nxt in (",", ":", "}", "]", ""):
+            j = i + 1
+            while j < n and raw[j].isspace():
+                j += 1
+            nxt = raw[j] if j < n else ""
+            # 收尾引号：后面紧跟 , : } ] 或到头；或者换了行、下一行以 " { [ 开头 —— 那是模型在
+            # 行尾漏了逗号。2026-09-26 之前把这种当内嵌引号转义掉，整份输出从这里起全乱，
+            # 报「字符串没收尾」（9-17 的资产库、9-22 的分镜都是这样废的）
+            line_end = nxt in ('"', "{", "[") and "\n" in raw[i + 1 : j]
+            if nxt in (",", ":", "}", "]", "") or line_end:
                 in_str = False
                 out.append(ch)
             else:
@@ -95,16 +99,69 @@ def _repair_quotes(raw: str) -> str:
     return "".join(out)
 
 
+# 值的最后一个字符 / 值（或键）的第一个字符。两者之间只隔着空白、没有逗号 = 模型漏了逗号
+_VALUE_END = frozenset('"}]0123456789el')  # 字符串 / 对象 / 数组 / 数字 / true false / null
+_VALUE_START = frozenset('"{[-0123456789tfn')
+_MAX_FIXES = 40
+
+
+def _fix_at(s: str, e: json.JSONDecodeError) -> str | None:
+    """在报错的位置修一处模型常见的 JSON 手误；不是这几种就返回 None（不瞎修）。
+
+    - 漏逗号：`"a": "x"⏎ "b": 1`、`}⏎ {` → 在前一个值后面补逗号
+    - 多余的尾逗号：`[1, 2,]`、`{"a": 1,}` → 删掉
+    """
+    pos = e.pos
+    j = pos - 1
+    while j >= 0 and s[j].isspace():
+        j -= 1
+    prev = s[j] if j >= 0 else ""
+    cur = s[pos] if pos < len(s) else ""
+    if e.msg.startswith("Expecting ',' delimiter") and prev in _VALUE_END and cur in _VALUE_START:
+        return s[: j + 1] + "," + s[j + 1 :]
+    trailing = e.msg.startswith(("Expecting property name", "Expecting value"))
+    if trailing and prev == "," and cur in ("}", "]"):
+        return s[:j] + s[j + 1 :]
+    return None
+
+
+def _loads_lenient(s: str) -> tuple[Any, json.JSONDecodeError | None]:
+    """json.loads；报的是漏逗号 / 尾逗号就就地修了再试（最多修 40 处）。
+
+    返回 (数据, 第一次的报错)。"""
+    first: json.JSONDecodeError | None = None
+    for _ in range(_MAX_FIXES + 1):
+        try:
+            return json.loads(s), None
+        except json.JSONDecodeError as e:
+            first = first or e
+            fixed = _fix_at(s, e)
+            if fixed is None:
+                break
+            s = fixed
+    return None, first
+
+
+def _near(s: str, pos: int, width: int = 60) -> str:
+    """报错位置前后各 width 个字，▲ 标在出错处。"""
+    a, b = max(0, pos - width), min(len(s), pos + width)
+    body = s[a:pos] + "▲" + s[pos:b]
+    return ("…" if a else "") + body.replace("\n", "⏎") + ("…" if b < len(s) else "")
+
+
 def _load(text: str) -> tuple[Any, str]:
+    """模型输出 → JSON。依次试：原样；修漏逗号 / 尾逗号；再修没转义的引号和裸换行。
+
+    2026-09-26：20 集的资产库在第 790 行漏了一个逗号，2 分钟的调用整份作废 —— 之前只会修引号。
+    """
     raw = _unwrap(text)
-    try:
-        return json.loads(raw), ""
-    except json.JSONDecodeError:
-        pass
-    try:
-        return json.loads(_repair_quotes(raw)), ""
-    except json.JSONDecodeError as e:
-        return None, f"不是合法 JSON：{e}（原文前 200 字：{raw[:200]}）"
+    data, e = _loads_lenient(raw)
+    if e is None:
+        return data, ""
+    data, e2 = _loads_lenient(_repair_quotes(raw))
+    if e2 is None:
+        return data, ""
+    return None, f"不是合法 JSON：{e}（出错处附近：{_near(raw, e.pos)}）"
 
 
 def _str_list(v: Any) -> list[str]:
@@ -247,12 +304,39 @@ def parse_shots(text: str) -> tuple[list[ShotPrompt], str]:
                 description=desc,
                 hook=hook,
                 cuts=_cuts(row.get("cuts")),
+                screen_text=_screen_text(row.get("screen_text")),
             )
         )
 
     if not out:
         return [], "一个镜头提示词都没解析出来"
     return out, ""
+
+
+def _screen_text(raw: Any) -> list[dict[str, Any]]:
+    """一段的上屏字：[{"text", "shot"?, "at"?, "dur"?, "kind"?, "end"?}]。认不出的项丢掉。"""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        row: dict[str, Any] = {"text": text}
+        for k in ("shot", "at", "dur"):
+            try:
+                if item.get(k) is not None:
+                    row[k] = float(item[k]) if k != "shot" else int(float(item[k]))
+            except (TypeError, ValueError):
+                continue
+        if item.get("kind"):
+            row["kind"] = str(item["kind"])
+        if item.get("end"):
+            row["end"] = True
+        out.append(row)
+    return out
 
 
 def _cuts(raw: Any) -> list[float]:

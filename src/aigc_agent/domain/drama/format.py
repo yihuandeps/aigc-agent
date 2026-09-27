@@ -28,14 +28,22 @@ from typing import Any
 import yaml
 
 from ..media.naming import parse_scene
+from ..numerals import EPISODE_RE, cn_to_int
+from .cards import CARD_SHOTS_RULE, CARD_STORYBOARD_RULE, Card, card_loss, find_cards
 from .models import Episode, ShotPrompt, _is_slug
 
 HOOK_MARK = "【高潮点】"  # 分镜脚本里高潮镜头的行首标记
 HOOK_LINE = "⚡"  # 剧本标题下的高潮点说明行标记
+# 跟剧本走的剧（自带剧本）开场是铺垫时，可以在最前面加的无台词画面闪前（2026-09-27 用户定的：
+# 开场用剧本自己的，不许把后面的台词复制到开头 —— 《不渡》20 集里 11 集这样复制了约 47 秒）
+FLASH_MARK = "【闪前】"
+FLASH_MAX_SECONDS = 5.0
 DEFAULT_MAX_CUT = 3.0  # 单镜上限（秒），config/drama.yaml cut.max_seconds 没写时用它
 # 分镜 / 视频提示词的规则版本：提示词规则或产物格式有实质改动时改这里（和下面的数值一起
 # 组成规格戳）。按集流水见到旧戳的提示词不直接拿去渲，先按现行规格重出（2026-09-23 审查）
-SPEC_RULES = "2026-09-23"
+# 2026-09-26：剧本里的上屏字（字幕卡）不再写进视频提示词，抽成 screen_text 成片后叠 ——
+# 之前的提示词里带着要画的字，按集流水见到旧戳的没渲过的集会先按新规则重出
+SPEC_RULES = "2026-09-26"
 
 _CONFIG_DIR = Path(__file__).resolve().parents[3].parent / "config"
 
@@ -51,6 +59,11 @@ class EpisodeFormat:
     # 单个镜头（分镜行 / 段内切镜）的时长上下限。2026-09-20 用户定的硬性要求：≤3 秒
     max_cut_seconds: float = DEFAULT_MAX_CUT
     min_cut_seconds: float = 1.0
+    # 集长跟剧本走（/length auto，2026-09-26 用户定的）：不查一集的总时长，只查台词念不念得完、
+    # 单镜 ≤3 秒、开场高潮点。之前集长只能是一个目标值（±15%）：《不渡》设成 20 分钟后，重拆
+    # 任何一集都会被要求凑到 17–23 分钟（加戏），改回 8 分钟又有 7 集被要求压短。
+    # minutes 这时只当写新剧本的参考值
+    follow_script: bool = False
 
     # ---------- 派生 ----------
 
@@ -134,6 +147,11 @@ class EpisodeFormat:
         )
 
     def brief(self) -> str:
+        if self.follow_script:
+            return (
+                "集长跟剧本走（台词念完 + 必要的动作，不凑时长）；"
+                f"单镜 ≤{self.max_cut_seconds:g} 秒；开场 {self.hook_seconds} 秒内给高潮点"
+            )
         lo, hi = self.shot_range
         return (
             f"一集 {self.minutes:g} 分钟（约 {self.script_chars} 字，{lo}–{hi} 段）；"
@@ -142,6 +160,31 @@ class EpisodeFormat:
 
 
 DEFAULT_FORMAT = EpisodeFormat()
+
+_NUM = r"(\d+(?:\.\d+)?|[零〇一二两三四五六七八九十]+)"
+# 「每集 8 分钟」「每集时长：约六分钟」「每集改成 6 分钟」「单集 5 分钟」「8 分钟一集」
+_PLAN_MINUTES = re.compile(
+    rf"(?:每集|单集|(?<!第)一集)[^\d零〇一二两三四五六七八九十\n，,。；;]{{0,6}}?{_NUM}\s*分钟"
+    rf"|{_NUM}\s*分钟\s*一集"
+)
+_PLAN_AUTO = re.compile(r"[跟按随]着?剧本走|/length\s+auto|集长\s*[:：]?\s*(?:自动|auto)")
+
+
+def plan_length(text: str) -> tuple[float, bool]:
+    """创作方案（人审问题）或采纳附言里写的每集时长：(分钟, 是否跟剧本走)。
+    没写 / 不在 1–30 分钟返回 (0, False)。"""
+    t = text or ""
+    if _PLAN_AUTO.search(t):
+        return 0.0, True
+    m = _PLAN_MINUTES.search(t)
+    if not m:
+        return 0.0, False
+    raw = m.group(1) or m.group(2)
+    try:
+        v = float(raw)
+    except ValueError:
+        v = float(cn_to_int(raw))
+    return (v, False) if 1 <= v <= 30 else (0.0, False)
 
 
 def global_max_cut(config_dir: str | Path | None = None) -> float:
@@ -154,10 +197,16 @@ def global_max_cut(config_dir: str | Path | None = None) -> float:
 
 def writing_rules(fmt: EpisodeFormat) -> str:
     lo, hi = fmt.script_range
+    length = (
+        "· 一集多长按剧情需要定：台词和动作写完整，不为凑时长注水，也不为压时长删戏"
+        f"（参考：{fmt.minutes:g} 分钟约 {fmt.script_chars} 字）。\n"
+        if fmt.follow_script
+        else f"· 一集成片 {fmt.minutes:g} 分钟：剧本约 {fmt.script_chars} 字（含台词与动作，"
+        f"允许 {lo}–{hi} 字）。少了会被要求扩写，多了成片会拖长。\n"
+    )
     return (
         "【一集的规格（硬性）】\n"
-        f"· 一集成片 {fmt.minutes:g} 分钟：剧本约 {fmt.script_chars} 字（含台词与动作，"
-        f"允许 {lo}–{hi} 字）。少了会被要求扩写，多了会被截。\n"
+        + length +
         f"· 开场 {fmt.hook_seconds} 秒必须是高潮点：第一个场次的前 2–3 个镜头就是本集冲突的"
         "顶点、反转或危机现场 —— 冷开场直接进入，铺垫后置回叙，不交代背景。"
         f"在标题下面加一行「> {HOOK_LINE} 前{fmt.hook_seconds}秒高潮点：一句话说清是什么」。\n"
@@ -172,6 +221,13 @@ def storyboard_rules(fmt: EpisodeFormat) -> str:
     lo, _ = fmt.cut_line_range
     t_lo, t_hi = fmt.cut_line_typical
     mc = fmt.max_cut_seconds
+    total = (
+        "· 每集分镜总时长跟着剧本走：台词按正常语速念完的时间，再加上必要的动作与反应镜头；"
+        "不要为了凑时长加戏，也不要为了压时长删戏或把镜头压短。\n"
+        if fmt.follow_script
+        else f"· 每集分镜总时长 ≈ {fmt.seconds} 秒（±{int(fmt.tolerance * 100)}%），"
+        f"所以每集至少 {lo} 个镜头行（一般 {t_lo}–{t_hi} 个）。不要一集只拆十几个大镜头。\n"
+    )
     return (
         "【时长与节奏（硬性）】\n"
         f"· **每个镜头不超过 {mc:g} 秒**（最短 {fmt.min_cut_seconds:g} 秒）：一个镜头 = 一个动作、"
@@ -179,12 +235,24 @@ def storyboard_rules(fmt: EpisodeFormat) -> str:
         "长台词按语速切到多个镜头里。\n"
         "· 每个镜头行的方括号里**最后一项写时长**，如 [近景/推入/平视/2s]、[特写/固定/俯拍/1.5s]；"
         "没标时长或超过上限都算不合格。\n"
-        f"· 每集分镜总时长 ≈ {fmt.seconds} 秒（±{int(fmt.tolerance * 100)}%），"
-        f"所以每集至少 {lo} 个镜头行（一般 {t_lo}–{t_hi} 个）。不要一集只拆十几个大镜头。\n"
-        f"· 开场 {fmt.hook_seconds} 秒内必须出现高潮点：把本集冲突顶点、反转或危机的画面放在"
-        f"最前面的镜头里（前 {fmt.hook_seconds} 秒 ≈ 前 {fmt.hook_shots} 镜），"
-        f"这些镜头的行首加标记「{HOOK_MARK}」（放在景别方括号之前），铺垫后置。\n"
-        "· 每 30–40 秒要有一个反转或信息增量，不要连续三个镜头都是走位与环境。"
+        "· 台词按每秒 4 个字左右念：说台词的镜头要给够时长，一句长台词接着分到后面几个镜头里"
+        "（画外音盖在反应镜头上也行）；一集的镜头总时长至少是念完全部台词的时间再加上动作戏。"
+        "**不许为了凑总时长把镜头压短，也不许删台词。**\n"
+        + total
+        + (
+            f"· 开场照剧本自己的开场拆：剧本开场本身就是冲突 / 反转 / 危机 → 那几个镜头行首标"
+            f"「{HOOK_MARK}」，不另加东西；剧本开场是铺垫 → 可以在最前面加一段不超过 "
+            f"{FLASH_MAX_SECONDS:g} 秒的**无台词**画面闪前（取本集后面的高潮画面），这些镜头行首标"
+            f"「{HOOK_MARK}{FLASH_MARK}」，只写画面和声音效果。**不许把后面的台词复制到开头**"
+            "（闪前镜头里不写任何台词、不带引号）；用户说不要闪前就不加。\n"
+            if fmt.follow_script
+            else f"· 开场 {fmt.hook_seconds} 秒内必须出现高潮点："
+            "把本集冲突顶点、反转或危机的画面放在"
+            f"最前面的镜头里（前 {fmt.hook_seconds} 秒 ≈ 前 {fmt.hook_shots} 镜），"
+            f"这些镜头的行首加标记「{HOOK_MARK}」（放在景别方括号之前），铺垫后置。\n"
+        )
+        + "· 每 30–40 秒要有一个反转或信息增量，不要连续三个镜头都是走位与环境。\n"
+        + CARD_STORYBOARD_RULE
     )
 
 
@@ -193,22 +261,46 @@ def shots_rules(fmt: EpisodeFormat) -> str:
     mc = fmt.max_cut_seconds
     n10 = fmt.cuts_per_segment(fmt.min_shot_seconds)
     n15 = fmt.cuts_per_segment(fmt.max_shot_seconds)
+    total = (
+        "一集所有段加起来 = 分镜里这一集镜头时长的合计（不另凑时长）"
+        if fmt.follow_script
+        else f"一集所有段加起来 ≈ {fmt.seconds}s（允许 {lo}–{hi}s）"
+    )
     return (
         "【时长与节奏（硬性）】\n"
         f"· video_duration 每段 {fmt.min_shot_seconds}–{fmt.max_shot_seconds}s"
-        f"（生成模型单段上限 {fmt.max_shot_seconds}s）；一集所有段加起来 ≈ {fmt.seconds}s"
-        f"（允许 {lo}–{hi}s）。分镜脚本里的镜头全部覆盖，不要合并成几段长的。\n"
+        f"（生成模型单段上限 {fmt.max_shot_seconds}s）；{total}。"
+        "分镜脚本里的镜头全部覆盖，不要合并成几段长的。\n"
         f"· **每段是多镜头快切：段内每个镜头不超过 {mc:g} 秒**，所以 {fmt.min_shot_seconds}s 的段"
         f"至少 {n10} 个镜头、{fmt.max_shot_seconds}s 的段至少 {n15} 个。video_name 写清覆盖的"
         '分镜脚本镜头范围（如 "9-13"），并给字段 "cuts": [3, 2, 3, 2, 2] —— 各镜头的秒数、'
         f"按顺序、每个 ≤ {mc:g}、加起来 = video_duration。description 按 cuts 的顺序用"
         f"[切镜：…] 逐镜写，任何一个镜头都不能拖过 {mc:g} 秒。\n"
-        f"· 开场 {fmt.hook_seconds} 秒内必须出现高潮点：第一段（必要时前两段）就是冲突顶点、"
-        '反转或危机画面；在这些对象里加字段 "hook": true。开场没有高潮点视为不合格。'
+        + (
+            f"· 开场：分镜开场标了{HOOK_MARK}的镜头所在的段加字段 \"hook\": true；"
+            "分镜开场没标就不标，不要自己往开头加戏、不要把后面的台词搬到开头。\n"
+            if fmt.follow_script
+            else f"· 开场 {fmt.hook_seconds} 秒内必须出现高潮点："
+            "第一段（必要时前两段）就是冲突顶点、"
+            '反转或危机画面；在这些对象里加字段 "hook": true。开场没有高潮点视为不合格。\n'
+        )
+        + CARD_SHOTS_RULE
     )
 
 
 # ---------------------------------------------------------------- 确定性检查
+
+
+def _strip_marks(s: str) -> str:
+    """去掉镜头行开头的标记（【高潮点】【闪前】，顺序不限）。"""
+    s = s.strip()
+    while True:
+        for mark in (HOOK_MARK, FLASH_MARK):
+            if s.startswith(mark):
+                s = s[len(mark):].strip()
+                break
+        else:
+            return s
 
 
 def shot_lines(desc: str) -> list[str]:
@@ -218,7 +310,7 @@ def shot_lines(desc: str) -> list[str]:
         s = line.strip()
         if not s:
             continue
-        head = s.split(HOOK_MARK, 1)[-1].strip() if s.startswith(HOOK_MARK) else s
+        head = _strip_marks(s)
         if head.startswith("[") and not _is_slug(head):
             out.append(s)
     return out
@@ -230,9 +322,7 @@ _SECONDS = re.compile(r"(\d+(?:\.\d+)?)\s*(?:s|S|秒)")
 
 def shot_seconds(line: str) -> float | None:
     """镜头行的时长：第一个方括号里的「2s / 1.5秒」。没标返回 None。"""
-    s = (line or "").strip()
-    if s.startswith(HOOK_MARK):
-        s = s.split(HOOK_MARK, 1)[-1].strip()
+    s = _strip_marks(line or "")
     m = _FIRST_BRACKET.match(s)
     if not m:
         return None
@@ -246,9 +336,7 @@ def shot_seconds(line: str) -> float | None:
 
 
 def _shot_label(line: str, limit: int = 24) -> str:
-    s = line.strip()
-    if s.startswith(HOOK_MARK):
-        s = s.split(HOOK_MARK, 1)[-1].strip()
+    s = _strip_marks(line)
     return s[:limit] + ("…" if len(s) > limit else "")
 
 
@@ -283,28 +371,49 @@ def check_storyboard(ep: Episode, fmt: EpisodeFormat) -> list[str]:
     if known and len(known) >= 0.8 * max(1, len(lines)):
         total = sum(known)
         lo_t, hi_t = fmt.duration_range
-        if total < lo_t or total > hi_t:
-            problems.append(
-                f"{ep.title}：镜头时长加起来 {total:g}s，应在 {lo_t}–{hi_t}s（一集 {fmt.seconds}s）"
+        need = speech_seconds(_quoted(ep.desc))
+        floor = math.ceil(need / DIALOGUE_SHARE_MAX)  # 不把台词压快的最短总时长
+        if fmt.follow_script:
+            # 集长跟剧本走（/length auto）：不查总时长，只查台词念不念得完
+            lo_a, hi_a, why = floor, 0, ""
+        elif floor > hi_t:
+            # 光台词就超出一集的规格（剧本本身长）：按规格压只能压快或删台词 —— 旧规格下
+            # 《不渡》5 集就是这么「修」达标的。按台词定范围，集长交给用户 /length 放宽
+            lo_a, hi_a = floor, max(hi_t, int(floor * 2.5))
+            why = (
+                f"（光台词就超出一集 {fmt.seconds}s 的规格，集长由用户用 /length 放宽，"
+                "或 /length auto 跟剧本走）"
             )
-    elif len(lines) < lo_n:
+        else:
+            lo_a, hi_a, why = max(lo_t, floor), hi_t, f"（一集 {fmt.seconds}s）"
+        if total < need / DIALOGUE_SHARE_MAX:
+            rng = f"至少放到 {floor}s" if fmt.follow_script else f"放到 {lo_a}–{hi_a}s{why}"
+            problems.append(
+                f"{ep.title}：光念台词就要约 {need:.0f}s（按每秒 {SPEECH_RATE:g} 字的偏快语速），"
+                f"镜头时长加起来只有 {total:g}s，台词被压快了。加长说台词的镜头、长台词接着分到"
+                f"后面的镜头里，总时长{rng}；不许删台词"
+            )
+        elif not fmt.follow_script and (total < lo_a or total > hi_a):
+            keep = (
+                f"；压的时候合并动作和空镜，说台词的镜头别压（光念台词就要约 {need:.0f}s）"
+                if total > hi_a and need >= 1
+                else ""
+            )
+            problems.append(
+                f"{ep.title}：镜头时长加起来 {total:g}s，应在 {lo_a}–{hi_a}s{why}{keep}"
+            )
+    elif len(lines) < lo_n and not fmt.follow_script:
         problems.append(
             f"{ep.title}：{len(lines)} 个镜头行，按单镜 ≤{mc:g}s、一集 {fmt.seconds}s "
             f"至少要 {lo_n} 个"
         )
 
-    # 开场高潮点：有时长就按累计时间算前 15 秒，没有就按前 hook_shots 行
-    opening: list[str] = []
-    t = 0.0
-    for ln, s in zip(lines, secs, strict=False):
-        if s is None:
-            if len(opening) >= fmt.hook_shots:
-                break
-        elif t >= fmt.hook_seconds:
-            break
-        opening.append(ln)
-        t += s if s is not None else mc
-    if not any(HOOK_MARK in ln or "高潮点" in ln for ln in opening):
+    opening = lines[: _opening_count(lines, secs, fmt)]
+    if fmt.follow_script:
+        # 跟剧本走（自带剧本）：开场用剧本自己的，没有高潮点不逼着加（只提醒）；加了闪前的只许
+        # 画面、不超过 5 秒（2026-09-27 用户定的）
+        problems += _flash_problems(ep.title, lines, secs)
+    elif not any(HOOK_MARK in ln or "高潮点" in ln for ln in opening):
         problems.append(
             f"{ep.title}：开场 {fmt.hook_seconds} 秒内没有高潮点"
             f"（前 {fmt.hook_seconds} 秒 ≈ 前 {fmt.hook_shots} 个镜头行，行首要有{HOOK_MARK}，"
@@ -313,8 +422,285 @@ def check_storyboard(ep: Episode, fmt: EpisodeFormat) -> list[str]:
     return problems
 
 
-def check_shots(shots: list[ShotPrompt], fmt: EpisodeFormat) -> list[str]:
-    """视频提示词的规格问题：按集算总时长、单段时长、段内镜头（cuts）、开场高潮点。"""
+def _opening_count(lines: list[str], secs: list[float | None], fmt: EpisodeFormat) -> int:
+    """开场前 15 秒是前几个镜头行：有时长就按累计时间算，没有就按前 hook_shots 行。"""
+    n = 0
+    t = 0.0
+    for s in secs[: len(lines)]:
+        if s is None:
+            if n >= fmt.hook_shots:
+                break
+        elif t >= fmt.hook_seconds:
+            break
+        n += 1
+        t += s if s is not None else fmt.max_cut_seconds
+    return n
+
+
+def _flash_problems(title: str, lines: list[str], secs: list[float | None]) -> list[str]:
+    """开场闪前（跟剧本走的剧）：只许画面和声音效果、合计不超过 5 秒。"""
+    flash = [(ln, s) for ln, s in zip(lines, secs, strict=False) if FLASH_MARK in ln]
+    if not flash:
+        return []
+    out: list[str] = []
+    total = sum(s or 0.0 for _, s in flash)
+    if total > FLASH_MAX_SECONDS + 0.01:
+        out.append(
+            f"{title}：开场闪前 {total:g} 秒，超过 {FLASH_MAX_SECONDS:g} 秒 —— "
+            "只留最要紧的一两个画面"
+        )
+    talk = [ln for ln, _ in flash if _QUOTED.search(ln)]
+    if talk:
+        out.append(
+            f"{title}：闪前镜头里有台词（{_shot_label(talk[0])}）—— 闪前只许画面和声音效果，"
+            "不许把后面的台词搬到开头"
+        )
+    return out
+
+
+def has_flash(desc: str) -> bool:
+    """这一集分镜开场加了闪前。"""
+    return any(FLASH_MARK in ln for ln in shot_lines(desc))
+
+
+def opening_note(ep: Episode, fmt: EpisodeFormat) -> str:
+    """跟剧本走的剧开场没标高潮点：只提醒、不算问题（剧本开场是铺垫、又没加闪前）。"""
+    if not fmt.follow_script:
+        return ""
+    lines = shot_lines(ep.desc)
+    secs = [shot_seconds(ln) for ln in lines]
+    opening = lines[: _opening_count(lines, secs, fmt)]
+    if any(HOOK_MARK in ln or "高潮点" in ln for ln in opening):
+        return ""
+    return f"{ep.title} 开场 {fmt.hook_seconds} 秒没有高潮点（跟剧本走，剧本开场是铺垫，没硬加）"
+
+
+def copied_opening(title: str, script: str, desc: str, fmt: EpisodeFormat) -> str:
+    """开场的台词在这一集后面又出现一次、剧本里却只出现一次 = 把后面的台词复制到了开头
+    （跟剧本走的剧不许，2026-09-27 用户定的）。没有返回空串。"""
+    lines = shot_lines(desc)
+    secs = [shot_seconds(ln) for ln in lines]
+    n = _opening_count(lines, secs, fmt)
+    head = [q for ln in lines[:n] for q in _QUOTED.findall(ln)]
+    later = _dialogue_key(" ".join(q for ln in lines[n:] for q in _QUOTED.findall(ln)))
+    source = _dialogue_key(script)
+    dup: list[str] = []
+    for q in head:
+        k = _dialogue_key(q)[:6]
+        if len(k) >= 4 and k in later and source.count(k) < 2:
+            dup.append(q)
+    if not dup:
+        return ""
+    shown = "、".join(f"「{d[:16]}{'…' if len(d) > 16 else ''}」" for d in dup[:3])
+    return (
+        f"{title}：开场把后面的台词复制了一遍（{shown}）—— 跟剧本走的剧开场用剧本自己的，"
+        f"要加闪前只许画面（行首标{FLASH_MARK}）"
+    )
+
+
+# ---------------------------------------------------------------- 台词：念不念得完、有没有丢
+# 2026-09-25《不渡》：5 集的分镜是旧的 4 分钟规格「修」出来的 —— 分镜原本 7–10 分钟，规格检查
+# 要求压到 204–276 秒，模型就把每个镜头统一压成 1.5 秒：台词一句没删，可光念台词就要 256–363
+# 秒，比整集还长。总时长正好达标，检查看不出来，主模型报了「完成」；渲出来台词只能念得飞快或被
+# 截断。第 5 集压的办法是删台词：剧本 88 句对白，分镜里找不到 21 句。所以分镜还要核两件事：
+# 镜头总时长够不够把台词念完；剧本里的对白是不是都还在。
+
+SPEECH_RATE = 4.5  # 汉字 / 秒：正常语速约 4，按偏快算 —— 只拦怎么念都念不完的
+_RATE_KANA = 8.0  # 假名 / 秒
+_RATE_HANGUL = 7.0  # 谚文音节 / 秒
+_RATE_WORDS = 3.0  # 英文单词 / 秒（偏快，约 180 词 / 分）
+# 台词最多占镜头总时长的 90%。实测健康的分镜在 48%–76%，被压快的五集在 105%–155%
+DIALOGUE_SHARE_MAX = 0.9
+# 分镜比剧本少了台词：至少 3 句、且超过 5% 才算（按句首认，个别句子改了措辞不算）
+LOST_LINES_MIN = 3
+LOST_SHARE_MIN = 0.05
+
+_QUOTED = re.compile(r"[“「『\"]([^”」』\"]*)[”」』\"]")
+_PAREN = re.compile(r"[（(][^）)]*[）)]")
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+_KANA = re.compile(r"[\u3040-\u30ff]")
+_HANGUL = re.compile(r"[\uac00-\ud7af]")
+_WORD = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+_KEY_CHARS = re.compile(r"[0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]")
+# 剧本的对白行：「角色：台词」「角色（动作）：台词」。△ 动作行、# 标题、> 备注、【】标记都不是
+_SPEAKER_LINE = re.compile(
+    r"^[ \t]*([^\s△#>*\-【\[“「\"（(][^：:\n]{0,15}?)[ \t]*[：:][ \t]*(\S[^\n]*?)[ \t]*$", re.M
+)
+_NOT_SPEAKERS = (
+    "人物", "场景", "时间", "地点", "出场", "道具", "服装", "备注", "注", "字幕", "镜头",
+    "画面", "音效", "音乐", "转场", "剩余", "钩子", "本集",
+)
+_EP_HEAD = re.compile(rf"^\s*#*\s*{EPISODE_RE.pattern}")
+
+
+def speech_seconds(text: str) -> float:
+    """按偏快的语速估念完这段话要几秒。括号里的表演提示（「（笑）」）不念。"""
+    t = _PAREN.sub("", text or "")
+    return (
+        len(_CJK.findall(t)) / SPEECH_RATE
+        + len(_KANA.findall(t)) / _RATE_KANA
+        + len(_HANGUL.findall(t)) / _RATE_HANGUL
+        + len(_WORD.findall(t)) / _RATE_WORDS
+    )
+
+
+def _quoted(desc: str) -> str:
+    """分镜镜头行里引号内的话（台词、旁白、画外音），空格隔开。"""
+    return " ".join(" ".join(_QUOTED.findall(ln)) for ln in shot_lines(desc))
+
+
+def dialogue_timing(ep: Episode) -> tuple[float, float]:
+    """(光念台词至少要几秒, 镜头标的总时长)。镜头行大多没标时长的，总时长记 0。"""
+    lines = shot_lines(ep.desc)
+    secs = [s for s in (shot_seconds(ln) for ln in lines) if s is not None]
+    total = sum(secs) if lines and len(secs) >= 0.8 * len(lines) else 0.0
+    return speech_seconds(_quoted(ep.desc)), total
+
+
+def dialogue_rushed(ep: Episode) -> bool:
+    """镜头总时长不够念完台词（台词要占 90% 以上）：分镜把台词压快了。"""
+    need, total = dialogue_timing(ep)
+    return total > 0 and need > DIALOGUE_SHARE_MAX * total
+
+
+def split_script(text: str) -> dict[int, str]:
+    """多集剧本按「第N集」标题行拆开 → {集号: 这一集的正文}。一个标题都没有返回空。"""
+    out: dict[int, list[str]] = {}
+    cur = 0
+    for line in (text or "").splitlines():
+        m = _EP_HEAD.match(line)
+        if m:
+            cur = cn_to_int(m.group(1)) or cur
+        if cur:
+            out.setdefault(cur, []).append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def _dialogue_key(text: str) -> str:
+    return "".join(_KEY_CHARS.findall(_PAREN.sub("", text or "")))
+
+
+def script_dialogue(script: str) -> list[str]:
+    """剧本里的对白（「角色：台词」一行一句）。不到 4 个字的（「嗯」「饭！」）不算。"""
+    out: list[str] = []
+    for m in _SPEAKER_LINE.finditer(script or ""):
+        if m.group(1).strip().startswith(_NOT_SPEAKERS):
+            continue
+        if len(_dialogue_key(m.group(2))) >= 4:
+            out.append(m.group(2).strip())
+    return out
+
+
+def _mostly_cjk(text: str) -> bool:
+    han = len(_CJK.findall(text))
+    return han > 0 and han >= len(_WORD.findall(text))
+
+
+def missing_dialogue(script: str, desc: str) -> tuple[int, list[str]]:
+    """剧本的对白在分镜里找不到的：(剧本对白句数, 找不到的句子)。
+
+    按每句开头 6 个字认：先在引号里的话连起来找（长台词拆到几个镜头里也连得上，句尾标点改了
+    也不影响），再在整段分镜里找（没加引号的）。两边不是同一种文字（剧本中文、分镜按
+    language=en 译成了英文）不查，返回 (0, [])。"""
+    lines = script_dialogue(script)
+    said = _quoted(desc)
+    if not lines or _mostly_cjk(" ".join(lines)) != _mostly_cjk(said):
+        return 0, []
+    spoken, board = _dialogue_key(said), _dialogue_key(desc)
+    keys = [(ln, _dialogue_key(ln)[:6]) for ln in lines]
+    return len(lines), [ln for ln, k in keys if k not in spoken and k not in board]
+
+
+def quoted_lost(board: str, text: str) -> list[str]:
+    """分镜里引号内的台词，在 text（视频提示词正文）里找不到的（按句首 6 个字认）。
+    用克制措辞重写过的视频提示词要核对这个（2026-09-26）。"""
+    have = _dialogue_key(text)
+    out: list[str] = []
+    # 喂给模型的分镜每行前面标了镜号「〔N〕」：去掉再认镜头行
+    plain = "\n".join(re.sub(r"^\s*〔\d+〕", "", ln) for ln in (board or "").splitlines())
+    for ln in shot_lines(plain):
+        for q in _QUOTED.findall(ln):
+            k = _dialogue_key(q)[:6]
+            if len(k) >= 4 and k not in have:
+                out.append(q)
+    return out
+
+
+def scene_count(script: str) -> int:
+    """剧本 / 分镜里有几个场景标头（[夜] [内] [酒店走廊] 这种）。"""
+    return len(Episode(0, "", script or "").scenes)
+
+
+def lost_lines(script: str, desc: str) -> int:
+    """分镜比剧本少了几句台词；少得不多（不到 3 句或 5%）、查不了都返回 0。"""
+    total, miss = missing_dialogue(script, desc)
+    if len(miss) < LOST_LINES_MIN or len(miss) < LOST_SHARE_MIN * total:
+        return 0
+    return len(miss)
+
+
+def dialogue_loss(title: str, script: str, desc: str) -> str:
+    """分镜比剧本少了台词的问题描述；没少（或少得不多、查不了）返回空串。"""
+    if not lost_lines(script, desc):
+        return ""
+    total, miss = missing_dialogue(script, desc)
+    clean = [_PAREN.sub("", m).strip() for m in miss[:3]]  # 「（低声）」这类提示不展示
+    shown = "、".join(f"「{m[:16]}{'…' if len(m) > 16 else ''}」" for m in clean)
+    return (
+        f"{title}：剧本里 {total} 句对白，分镜里找不到 {len(miss)} 句（如 {shown}）—— "
+        "台词要逐字保留，补回来（长台词可以拆到几个镜头里）"
+    )
+
+
+def storyboard_problems(eps: list[Episode], script: str, fmt: EpisodeFormat) -> list[str]:
+    """分镜的全部确定性问题：规格（check_storyboard，含台词念不念得完）+ 比剧本少了台词
+    + 比剧本少了上屏字（字幕卡，2026-09-26）。
+
+    剧本按「第N集」标题拆开对到各集；没有标题、分镜又只有一集时，整份剧本算这一集。"""
+    by_ep = split_script(script)
+    out: list[str] = []
+    for e in eps:
+        out += check_storyboard(e, fmt)
+        src = by_ep.get(e.index) or (script if not by_ep and len(eps) == 1 else "")
+        losses = [dialogue_loss(e.title, src, e.desc), card_loss(e.title, src, e.desc)]
+        if fmt.follow_script:
+            losses.append(copied_opening(e.title, src, e.desc, fmt))
+        for loss in losses:
+            if src and loss:
+                out.append(loss)
+    return out
+
+
+def card_lines(desc: str) -> dict[int, list[Card]]:
+    """分镜里的上屏字落在哪个镜头：镜号（和 scene_blocks 同一套编号）→ 这一镜的字幕卡。
+
+    写在镜头行里的归这一镜；单独成行或写在场景标头上的，归下一个镜头。"""
+    out: dict[int, list[Card]] = {}
+    pending: list[Card] = []
+    n = 0
+    for raw in (desc or "").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        found = find_cards(s)
+        head = _strip_marks(s)
+        if head.startswith("[") and not _is_slug(head):
+            n += 1
+            got = pending + found
+            pending = []
+            if got:
+                out.setdefault(n, []).extend(got)
+        else:
+            pending += found
+    if pending and n:
+        out.setdefault(n, []).extend(pending)  # 最后一个镜头之后才写的：归最后一镜
+    return out
+
+
+def check_shots(shots: list[ShotPrompt], fmt: EpisodeFormat, hook: bool = True) -> list[str]:
+    """视频提示词的规格问题：按集算总时长、单段时长、段内镜头（cuts）、开场高潮点。
+
+    hook=False：不查开场高潮点（分批生成时第二批起不是开场）。"""
     by_ep: dict[int, list[ShotPrompt]] = {}
     for s in shots:
         ep, _ = parse_scene(s.scene_index)
@@ -325,7 +711,8 @@ def check_shots(shots: list[ShotPrompt], fmt: EpisodeFormat) -> list[str]:
     for ep, items in by_ep.items():
         label = f"第{ep}集" if ep else "未标集号"
         total = sum(s.seconds for s in items)
-        if total < lo or total > hi:
+        # 集长跟剧本走（/length auto）时不查总时长 —— 时长由分镜定（覆盖和压缩另有检查）
+        if not fmt.follow_script and (total < lo or total > hi):
             problems.append(f"{label}：总时长 {total}s，应在 {lo}–{hi}s（一集 {fmt.seconds}s）")
         lo_s, hi_s = fmt.min_shot_seconds, fmt.max_shot_seconds
         bad = [s for s in items if s.seconds < lo_s or s.seconds > hi_s]
@@ -383,6 +770,8 @@ def check_shots(shots: list[ShotPrompt], fmt: EpisodeFormat) -> list[str]:
             )
             problems.append(f"{label}：{len(few)} 段覆盖的镜头太少，每镜 ≤{mc:g}s 切不够：{shown}")
 
+        if not hook or fmt.follow_script:
+            continue  # 跟剧本走：开场有没有高潮点由分镜（剧本）定，提示词这步不逼着加
         t = 0
         opening: list[ShotPrompt] = []
         for s in items:
@@ -397,6 +786,234 @@ def check_shots(shots: list[ShotPrompt], fmt: EpisodeFormat) -> list[str]:
     return problems
 
 
+# ---------------------------------------------------------------- 第③步：分批、覆盖、压缩
+# 2026-09-25：之前整集一次生成、按「一集 4 分钟」压总时长 —— 第 3 集 217 镜的分镜只写到第
+# 128 镜，后半集整个没了，工具还报成功；一集 200 多镜时输出 3 万多 token，被截断、流式传输
+# 也更容易被中途断开。现在给分镜标镜号、按场分批，逐段核对覆盖和时长。
+
+# 一批最多多少个分镜镜头：约 80 镜 ≈ 3 分钟视频 ≈ 十几段提示词，一次输出一两万 token
+SHOTS_CHUNK_LINES = 80
+# 一段视频提示词的时长不能比它覆盖的分镜镜头合计短太多，短了就是把镜头合并 / 删了
+COMPRESSION_RATIO = 0.75
+
+_RANGE = re.compile(r"(\d+)\s*[-–—~～至到]\s*(\d+)")
+_SHOT_NO = re.compile(r"^〔(\d+)〕")
+
+
+@dataclass(frozen=True)
+class SceneBlock:
+    """分镜正文里的一场：场次、镜号范围、标好镜号的正文、标了时长的镜头合计秒数。"""
+
+    label: str
+    first: int
+    last: int
+    text: str
+    seconds: float
+
+    @property
+    def count(self) -> int:
+        return max(0, self.last - self.first + 1)
+
+
+def scene_blocks(desc: str, episode: int = 0) -> tuple[list[SceneBlock], dict[int, float]]:
+    """按场景标头把一集分镜切成场：镜头行前加镜号「〔N〕」，标头前加场次「【第N集-M场】」。
+
+    镜号就是 shot_lines 的顺序（第③步 video_name 写的「9-13」就是它）。喂给模型时写明，不让它
+    自己数 —— 分批时每批从中间开始，自己数必然错位。返回 (各场, 镜号 → 标注的秒数)。
+    """
+    blocks: list[SceneBlock] = []
+    secs: dict[int, float] = {}
+    n = scene = 0
+    label, lines, first, total = "", [], 1, 0.0
+
+    def close() -> None:
+        if lines:
+            blocks.append(SceneBlock(label, first, n, "\n".join(lines), total))
+
+    for raw in (desc or "").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        head = _strip_marks(s)
+        if _is_slug(head):
+            close()
+            scene += 1
+            label = f"第{episode}集-{scene}场" if episode else f"第{scene}场"
+            lines, first, total = [f"【{label}】{s}"], n + 1, 0.0
+        elif head.startswith("["):
+            n += 1
+            sec = shot_seconds(s)
+            if sec is not None:
+                secs[n] = sec
+                total += sec
+            lines.append(f"〔{n}〕{s}")
+        else:
+            lines.append(s)
+    close()
+    return blocks, secs
+
+
+def plan_chunks(
+    blocks: list[SceneBlock], max_lines: int = SHOTS_CHUNK_LINES
+) -> list[list[SceneBlock]]:
+    """按场分批：每批大约不超过 max_lines 个镜头（单场超过的自成一批），批与批尽量一样大。"""
+    total = sum(b.count for b in blocks)
+    if total <= max_lines or len(blocks) <= 1:
+        return [blocks]
+    target = total / math.ceil(total / max_lines)
+    groups: list[list[SceneBlock]] = []
+    cur: list[SceneBlock] = []
+    size = 0
+    for b in blocks:
+        if cur and size + b.count > target * 1.15:
+            groups.append(cur)
+            cur, size = [], 0
+        cur.append(b)
+        size += b.count
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def only_lines(text: str, keep: set[int]) -> str:
+    """一批分镜正文里只留 keep 里的镜头（补写漏掉的镜头时用），没有镜头的场次标头也去掉。"""
+    out: list[str] = []
+    label = ""
+    for ln in text.splitlines():
+        m = _SHOT_NO.match(ln)
+        if m:
+            if int(m.group(1)) in keep:
+                if label:
+                    out.append(label)
+                    label = ""
+                out.append(ln)
+        elif ln.startswith("【第"):
+            label = ln
+    return "\n".join(out)
+
+
+def covered_numbers(video_name: str) -> set[int]:
+    """一段视频提示词覆盖的分镜镜号：「9-13」→ 9..13；只写一个数就是那一个。"""
+    m = _RANGE.search(video_name or "")
+    if m:
+        a, b = sorted((int(m.group(1)), int(m.group(2))))
+        return set(range(a, b + 1)) if b - a <= 300 else set()
+    nums = re.findall(r"\d+", video_name or "")
+    return {int(nums[-1])} if nums else set()
+
+
+def number_ranges(nums: list[int]) -> list[tuple[int, int]]:
+    """[3, 4, 5, 9] → [(3, 5), (9, 9)]（要先排好序）。"""
+    out: list[tuple[int, int]] = []
+    for x in nums:
+        if out and x == out[-1][1] + 1:
+            out[-1] = (out[-1][0], x)
+        else:
+            out.append((x, x))
+    return out
+
+
+def format_ranges(ranges: list[tuple[int, int]], limit: int = 6) -> str:
+    parts = [f"{a}" if a == b else f"{a}–{b}" for a, b in ranges[:limit]]
+    return "、".join(parts) + ("…" if len(ranges) > limit else "")
+
+
+def coverage_gaps(shots: list[ShotPrompt], expected: set[int]) -> list[tuple[int, int]]:
+    """expected 里哪些镜号没被任何一段覆盖（合并成区间）。"""
+    got: set[int] = set()
+    for s in shots:
+        got |= covered_numbers(s.video_name)
+    return number_ranges(sorted(expected - got))
+
+
+def compression_problems(
+    shots: list[ShotPrompt],
+    secs_by_no: dict[int, float],
+    label: str = "",
+    ratio: float = COMPRESSION_RATIO,
+) -> list[str]:
+    """哪些段把分镜镜头压缩了：这段的时长比它覆盖的分镜镜头合计短太多（合并 / 删了镜头）。"""
+    bad: list[tuple[str, float, int]] = []
+    for s in shots:
+        sb = sum(secs_by_no.get(n, 0.0) for n in covered_numbers(s.video_name))
+        if sb and s.seconds + 0.5 < ratio * sb:
+            bad.append((s.video_name, sb, s.seconds))
+    if not bad:
+        return []
+    shown = "；".join(f"{v}：分镜 {sb:g}s → 这段 {sec}s" for v, sb, sec in bad[:4])
+    return [
+        f"{label}{len(bad)} 段把分镜的镜头压缩了（{shown}）。分镜里每个镜头保留原来的时长，"
+        "一段放不下就多分几段，不要合并或删镜头"
+    ]
+
+
+CARD_MIN_SECONDS = 2.5  # 字幕卡至少停留多久（镜头可能只有 1.5 秒，字卡跨过切点没关系）
+
+
+def place_cards(
+    shots: list[ShotPrompt],
+    cards: dict[int, list[Card]],
+    secs_by_no: dict[int, float],
+) -> list[Card]:
+    """把分镜里的字幕卡排进视频提示词的时间线：找到覆盖这个镜号的那一段，按 cuts（没有就按分镜
+    标的秒数折算）算出它在段内第几秒出现，写进这一段的 screen_text。返回没找到段的卡。
+
+    片尾卡（end=True）叠到这一集结束；别的至少停 CARD_MIN_SECONDS 秒。"""
+    lost: list[Card] = []
+    for no in sorted(cards):
+        seg = next((s for s in shots if no in covered_numbers(s.video_name)), None)
+        if seg is None:
+            lost += cards[no]
+            continue
+        nums = sorted(covered_numbers(seg.video_name))
+        idx = nums.index(no)
+        if seg.cuts and len(seg.cuts) == len(nums):
+            at, dur = float(sum(seg.cuts[:idx])), float(seg.cuts[idx])
+        else:
+            marked = [secs_by_no.get(n, 0.0) for n in nums]
+            whole = sum(marked)
+            if whole > 0:
+                scale = seg.seconds / whole
+                at, dur = sum(marked[:idx]) * scale, (marked[idx] or 0.0) * scale
+            else:
+                step = seg.seconds / max(1, len(nums))
+                at, dur = idx * step, step
+        at = min(max(0.0, at), max(0.0, seg.seconds - 0.5))
+        for c in cards[no]:
+            seg.screen_text.append({
+                "text": c.text,
+                "kind": c.kind,
+                "shot": no,
+                "at": round(at, 2),
+                "dur": round(max(dur, CARD_MIN_SECONDS), 2),
+                **({"end": True} if c.ending else {}),
+            })
+    return lost
+
+
+def prompt_problems(shots: list[ShotPrompt], eps: list[Episode]) -> list[str]:
+    """视频提示词和它的分镜对不上的地方（漏镜头 / 被压缩），按集。空列表 = 对得上。"""
+    by_ep: dict[int, list[ShotPrompt]] = {}
+    for s in shots:
+        ep_no, _ = parse_scene(s.scene_index)
+        by_ep.setdefault(ep_no, []).append(s)
+    out: list[str] = []
+    for e in eps:
+        items = by_ep.get(e.index)
+        if not items:
+            continue
+        blocks, secs = scene_blocks(e.desc, e.index)
+        n = sum(b.count for b in blocks)
+        gaps = coverage_gaps(items, set(range(1, n + 1))) if n else []
+        if gaps:
+            out.append(f"{e.title} 漏了分镜第 {format_ranges(gaps)} 镜")
+        elif compression_problems(items, secs):
+            # 镜头都覆盖了、时长却被压了一截：合并了镜头，台词放不下就被丢了
+            got = sum(s.seconds for s in items)
+            out.append(f"{e.title} 的镜头被压缩了（分镜 {sum(secs.values()):g}s → 提示词 {got}s）")
+    return out
+
+
 _HOOK_LINE_RE = re.compile(rf"^\s*>?\s*{HOOK_LINE}", re.M)
 
 
@@ -405,7 +1022,9 @@ def check_script(text: str, fmt: EpisodeFormat) -> list[str]:
     problems: list[str] = []
     n = len(text or "")
     lo, hi = fmt.script_range
-    if n < lo:
+    if fmt.follow_script:
+        pass  # 集长跟剧本走（/length auto）：不按字数要求扩写或压缩
+    elif n < lo:
         problems.append(
             f"只有 {n} 字，一集 {fmt.minutes:g} 分钟需要约 {fmt.script_chars} 字（至少 {lo}）"
         )

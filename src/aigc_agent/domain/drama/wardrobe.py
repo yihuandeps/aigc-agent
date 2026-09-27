@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 from ..media.naming import parse_scene
-from .models import AssetLibrary, ShotPrompt
+from .models import AssetLibrary, Costume, ShotPrompt
 
 
 def scene_of(shot: ShotPrompt, lib: AssetLibrary) -> str:
@@ -22,27 +24,69 @@ def scene_of(shot: ShotPrompt, lib: AssetLibrary) -> str:
     return next((r for r in shot.refs() if r in names), "")
 
 
-def bind_costumes(shots: list[ShotPrompt], lib: AssetLibrary) -> tuple[list[str], list[str]]:
-    """把每个镜头里的角色/服装引用换成该场景绑定的服装 ID（原地改 description）。
+def _wearable(cos: Costume, episode: int) -> bool:
+    """这一集能不能穿这套：没标集数的、或集数范围包含这一集的。"""
+    return not episode or not (cos.episodes or "").strip() or cos.covers_episode(episode)
 
-    返回 (改动说明, 缺口警告)。规则：
-      场景显式绑定的服装 > 集数覆盖的服装 > 裸角色名换成第一套 > 不动并警告
+
+def bind_costumes(
+    shots: list[ShotPrompt], lib: AssetLibrary
+) -> tuple[list[str], list[str], list[str]]:
+    """校正每个镜头里的角色/服装引用（原地改 description）。返回 (改动, 缺口警告, 按剧情保留的)。
+
+    规则（2026-09-25 改）：
+      · 模型点名的服装、这一集能穿的 → 按剧情保留；同一场次里同一角色统一成点名最多的那套
+        （回忆戏里的婚服、同一地点临时换装，之前被场景分配表一律改回默认服装，note 也拦不住）
+      · 裸角色名、或点了这一集不穿的服装 → 换成分配表里这个场景 / 这一集的那套
+      · 按剧情保留、但和分配表不一致的 → 报出来给人看
     """
     changes: list[str] = []
     warnings: list[str] = []
+    kept: list[str] = []
     warned: set[tuple[str, str]] = set()
+    # ① 每个场次里，每个角色被显式点名、而且这一集能穿的服装 → 取点名最多的那套
+    tally: dict[tuple[str, str], Counter[str]] = {}
+    scene_name: dict[str, str] = {}
     for s in shots:
         episode, _ = parse_scene(s.scene_index)
-        scene = scene_of(s, lib)
+        scene_name.setdefault(s.scene_index, scene_of(s, lib))
+        for ref in s.refs():
+            ch = lib.character_of(ref)
+            if ch is None or ref == ch.name:
+                continue
+            cos = next((c for c in ch.costumes if c.name == ref), None)
+            if cos is not None and _wearable(cos, episode):
+                tally.setdefault((s.scene_index, ch.name), Counter())[ref] += 1
+    picked = {key: cnt.most_common(1)[0][0] for key, cnt in tally.items()}
+    # ② 逐镜校正
+    for s in shots:
+        episode, _ = parse_scene(s.scene_index)
+        scene = scene_name.get(s.scene_index) or scene_of(s, lib)
         for ref in s.refs():
             ch = lib.character_of(ref)
             if ch is None:
                 continue
+            name = picked.get((s.scene_index, ch.name))
+            if name is not None:
+                if name != ref:
+                    s.description = s.description.replace(f"({ref})", f"({name})")
+                    changes.append(f"{s.scene_index}：{ref} → {name}（同一场统一）")
+                continue
             want = ch.costume_for(scene, episode)
             if want is None:
                 if ref == ch.name and ch.costumes:
-                    # 裸角色名：至少换成一套服装 ID，渲视频时才对得上参考图
-                    want = ch.costumes[0]
+                    # 裸角色名：至少换成一套服装 ID，渲视频时才对得上参考图。先挑这一集能穿的；
+                    # 这一集一套能穿的都没有是缺口，要报出来（2026-09-26：之前默认第一套、一声
+                    # 不吭 —— 第一套可能是第 11–20 集的戏服）
+                    want = next((c for c in ch.costumes if _wearable(c, episode)), ch.costumes[0])
+                    key = (ch.name, scene)
+                    if not _wearable(want, episode) and key not in warned:
+                        warned.add(key)
+                        where = scene or "未识别场景"
+                        warnings.append(
+                            f"{ch.name} 在「{where}」（{s.scene_index}）这一集没有能穿的服装，"
+                            f"先用 {want.name}（它标的是第 {want.episodes} 集）"
+                        )
                 else:
                     key = (ch.name, scene)
                     if key not in warned:
@@ -55,7 +99,14 @@ def bind_costumes(shots: list[ShotPrompt], lib: AssetLibrary) -> tuple[list[str]
             if want.name != ref:
                 s.description = s.description.replace(f"({ref})", f"({want.name})")
                 changes.append(f"{s.scene_index}：{ref} → {want.name}")
-    return changes, warnings
+    # ③ 按剧情保留、但和分配表不一致的：报出来
+    for (scene_index, ch_name), name in picked.items():
+        ch = lib.character_of(name)
+        episode, _ = parse_scene(scene_index)
+        planned = ch.costume_for(scene_name.get(scene_index, ""), episode) if ch else None
+        if planned is not None and planned.name != name:
+            kept.append(f"{scene_index}：{ch_name} 穿 {name}（分配表是 {planned.name}）")
+    return changes, warnings, kept
 
 
 def unbound_costumes(lib: AssetLibrary) -> list[str]:

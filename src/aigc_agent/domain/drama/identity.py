@@ -109,6 +109,10 @@ class IdentityVerdict:
     issues: list[str] = field(default_factory=list)
     characters: dict[str, int] = field(default_factory=dict)
     note: str = ""  # 解析不了时的说明
+    # 这次没查成（调用失败 / 没本地副本 / 抽不出帧 / 输出读不出来）—— 视频段按「没过」算：
+    # 不进成片、重跑时补查（2026-09-27 用户定的）。只有 note 没有 unchecked = 配置里就没开，
+    # 不算没查成
+    unchecked: bool = False
 
 
 def parse_identity_verdict(text: str, pass_score: int = 7) -> IdentityVerdict:
@@ -119,11 +123,11 @@ def parse_identity_verdict(text: str, pass_score: int = 7) -> IdentityVerdict:
         raw = m.group(1).strip()
     i, j = raw.find("{"), raw.rfind("}")
     if i < 0 or j <= i:
-        return IdentityVerdict(note="一致性校验输出不是 JSON")
+        return IdentityVerdict(note="一致性校验输出不是 JSON", unchecked=True)
     try:
         data = json.loads(raw[i : j + 1])
     except json.JSONDecodeError:
-        return IdentityVerdict(note="一致性校验输出不是合法 JSON")
+        return IdentityVerdict(note="一致性校验输出不是合法 JSON", unchecked=True)
     try:
         score = int(float(data.get("score", -1)))
     except (TypeError, ValueError):
