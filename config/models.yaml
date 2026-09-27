@@ -80,21 +80,26 @@ text:
         cached_input_per_mtok: 2     # 十分之一 —— 这就是批量驱逐要保住的收益
 
     # 短剧流水线专用。用户的三段 system prompt 是按 Gemini 调的，
-    # 换模型会让那些约束的效果漂移（族裔锁定、台词逐字还原这些尤其敏感）。
-    # ⚠️ APIMart 上**没有纯 gemini-3.1-flash**，只有 lite 和 pro：
-    #    三步都是长文本结构化输出，lite 容易塌（漏集、JSON 截断），所以用 pro。
-    gemini_31:
+    # 换模型会让那些约束的效果漂移（族裔锁定、台词逐字还原这些尤其敏感）——所以留在 Gemini 家族。
+    # ⚠️ 2026-09-25：APIMart 上 Gemini 的 Pro 型号**全部没定价**，调用直接 400「价格尚未由管理员配置」：
+    #    gemini-3.1-pro-preview / -thinking、gemini-3-pro-preview（被转到 3.1 pro）、gemini-2.5-pro。
+    #    之前选 pro 是因为 3.1 只有 lite（长结构化输出容易塌）；现在有非 lite 的新一代 flash，
+    #    实测 gemini-3.8-flash 与 3.7-flash 都收 json 模式 + 流式 + max_tokens 32768，拆分镜 JSON 合法
+    #    （偶尔包一层 ```json 围栏，drama/parse 本来就会剥）。Pro 恢复定价想换回来，改下面 model 这一行；
+    #    APIMart 实际有哪些型号：agent models --role drama（列表里有的不一定定了价，要试一次才知道）。
+    gemini:
       vendor: google-via-apimart
       protocol: openai_compatible
       base_url: https://api.apimart.ai/v1
       api_key: ${APIMART_API_KEY}
-      model: gemini-3.1-pro-preview
+      model: gemini-3.8-flash
       timeout_seconds: 300          # 拆整集剧本输出很长，180 会超时
 
 
-  # 降级链：主模型不可用时按顺序尝试
+  # 降级链：**代码里没有实现，配了也不会自动换模型**。换模型要人拍板（用户 2026-09-20 定的规则）。
+  # 某个角色的模型在服务端用不了时，工具会报 ModelUnavailableError，说清是哪个角色、哪个 provider、
+  # 哪个型号，由人来改上面 providers 里的 model。
   fallback_chain: []
-    # 建议至少配一个备用，避免单点故障导致整个 Agent 停摆。
 
 
   # ---------- 角色映射 ----------
@@ -115,8 +120,8 @@ text:
     summarize:        kimi_k3    # 上下文压缩、资产摘要
     skill_select:     kimi_k3    # Skill Hub 的候选筛选（M7）
     compliance_check: kimi_k3    # 合规初审（M15）
-    drama:            gemini_31  # 短剧三段式：分镜脚本 / 资产库 / 视频提示词
-    drama_prose:      gemini_31  # 一句话想法 → 剧本 / 扩写：散文输出，不套 drama 的 JSON 约束
+    drama:            gemini     # 短剧三段式：分镜脚本 / 资产库 / 视频提示词
+    drama_prose:      gemini     # 一句话想法 → 剧本 / 扩写：散文输出，不套 drama 的 JSON 约束
     episode_writer:   kimi_k3    # 逐集写剧本的子代理（2026-09-17 写作从主循环搬出来）
     realism_check:    kimi_k3    # 人物参考图生成后的真实感校验（看图判磨皮/毛孔/硬光，2026-09-18）
     vision:           kimi_k3    # 看图 / 看视频（view_image / view_video，2026-09-18）
@@ -155,7 +160,10 @@ text:
       thinking_effort: high
     drama:
       temperature: 0.8           # 分镜是创作，要留发挥空间
-      max_output_tokens: 32768   # 一集十几场、每场上百字，给不够会被截断
+      # 一集十几场、每场上百字，给不够会被截断。2026-09-25 从 32768 提到 65536：一集放到 8 分钟后，
+      # 视频提示词一次要写 40 多段，改写时输出到过 3.6 万 token，超了被截断、没保存。
+      # gemini-3.8-flash 实测收 65536；换模型时先确认新模型收这么大的上限（不收会直接 400）
+      max_output_tokens: 65536
       response_format: json      # 三步的契约都是严格 JSON
     drama_prose:
       temperature: 0.8
@@ -296,8 +304,10 @@ cost_guard:
   # 一集 4 分钟约 240–276 秒，质检重生成留一倍余量
   seconds_limit: 600          # 本次开工生成的视频总秒数上限
   daily_seconds_limit: 3000   # 单日（所有会话合计，靠台账）
-  # 单日媒体调用次数（跨会话）。没单价时这是唯一有效的日级刹车
+  # 单日媒体调用次数（跨会话）。没单价时这是唯一有效的日级刹车。
+  # 要 ≥ 3 × 本次开工上限：之前 video 60 = 一集的量，同一天渲第二集必停，而 /budget set
+  # 碰不到单日口径（2026-09-24 审查）。撞到单日上限用 /budget allow 视频 20 追加
   daily_call_limits:
-    image: 120
-    video: 60
+    image: 240
+    video: 200
     audio: 200

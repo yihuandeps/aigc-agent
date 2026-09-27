@@ -3,7 +3,8 @@
 # ============================================================
 # 来源：awesome-seedance 模板 product-commercial-shotlist（27 条人工核对案例；策划内容 CC BY 4.0）。
 # 核心结论：**开头先写死广告美学词，它决定后面每个镜头的光线逻辑**；每个微距都指名拍什么；
-# 关键词堆在最末尾；logo / slogan 别指望模型渲染，留一个干净的收尾帧后期加字。
+# 关键词堆在最末尾；logo / slogan 别指望模型渲染，留一个干净的收尾帧后期加字
+# （成片出来后 overlay_text 叠：end_card 叠在最后几秒的英雄帧上，items 叠卖点）。
 # 细节与锚定案例：load_skill_reference(skill="seedance-prompting", name="03-商业与产品")
 #
 # 适合：美妆、饮品、珠宝、香水、数码 —— 要读成"投放级制作"，不能读成创作者视频。
@@ -74,7 +75,7 @@ voiceover:
     总字数不要超过 {chars} 字。
 
 subtitle:
-  enabled: false # 上屏文字后期合成（带出现时段），不走 ASR
+  enabled: false # 上屏文字成片后用 overlay_text 叠（带出现时段），不走 ASR
   source: asr
   language: zh
 
