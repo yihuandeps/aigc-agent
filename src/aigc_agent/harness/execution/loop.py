@@ -506,13 +506,15 @@ class LoopRuntime:
     def _is_major_review(self, payload: dict[str, Any]) -> bool:
         """这次人审是不是大节点：/auto 下大节点仍挂起问人一次，小节点自动采纳。
 
-        request_review 显式给了 major 就听它的；没给才按 stage 关键词判：
-        命中「第N集/单集」一律算小节点（即使带着「剧本」字样，如「剧本第3集」）；
-        否则含任一 major_stages 关键词即大节点。
+        显式 major=True 一律算大节点；否则按 stage 关键词判：命中「第N集/单集」算小节点
+        （即使带着「剧本」字样，如「剧本第3集」）；含任一 major_stages 关键词即大节点。
+
+        **显式 major 只能升级、不能降级**（2026-09-26）：之前模型传 major=false 就能把
+        「视频生成」这种大节点降成小节点，/auto 下直接被自动采纳 —— 哪些节点必须停下来
+        问人是人定的规则，不能由请求审批的一方自己改。
         """
-        major = payload.get("major")
-        if isinstance(major, bool):
-            return major
+        if payload.get("major") is True:
+            return True
         stage = str(payload.get("stage") or "")
         if self.minor_stage is not None and self.minor_stage.search(stage):
             return False

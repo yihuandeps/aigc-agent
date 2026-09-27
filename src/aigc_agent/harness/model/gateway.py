@@ -17,6 +17,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx2 as httpx
+
+try:  # httpx2 的依赖；流式中途断开时抛的是它的异常，不一定被映射成 httpx 的
+    import httpcore2 as _httpcore
+except ImportError:  # pragma: no cover
+    _httpcore = None
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -223,7 +228,14 @@ class ModelGateway:
         )
 
         started = time.perf_counter()
-        resp = await self._with_retry(provider, kwargs, use_stream)
+        try:
+            resp = await self._with_retry(provider, kwargs, use_stream)
+        except Exception as e:
+            # 模型在服务端用不了：换成一条说清「哪个角色、哪个 provider、怎么办」的错误往上抛。
+            # 工具层会把它原样报给主模型 —— 之前报的是原始 400，主模型绕了 11 轮去改自己的配置
+            if classify_model_error(e)[0] == "model_unavailable":
+                raise ModelUnavailableError(role, provider.key, provider.model, str(e)) from e
+            raise
         resp.duration_ms = int((time.perf_counter() - started) * 1000)
         resp.model = provider.model
 
@@ -292,6 +304,13 @@ class ModelGateway:
             except APIStatusError as e:
                 last = e
                 retryable = e.status_code in cfg.retry_status
+            except _STREAM_BROKEN as e:
+                # 流式输出中途被服务端断开（incomplete chunked read）：这次的输出已经丢了，只能整包
+                # 重发。2026-09-25 实测：拆视频提示词时 40 秒左右断过两次，之前直接判失败，主模型
+                # 只好手动重跑。只重发一次 —— 反复断多半是服务端的问题，再重发只是再花一次钱
+                last = e
+                retryable = True
+                budget = min(cfg.max_attempts, 2)
             except Exception as e:  # noqa: BLE001
                 await self.bus.emit(
                     EventType.MODEL_ERROR, error=f"{type(e).__name__}: {e}", attempt=attempt
@@ -402,6 +421,36 @@ _CONTEXT_OVERFLOW = re.compile(
     re.I,
 )
 _QUOTA = re.compile(r"usage limit|quota|insufficient|额度|余额|balance", re.I)
+# 流式输出被服务端中途断开（httpx 和 httpcore 各有一套异常类，互不继承）
+_STREAM_BROKEN: tuple[type[BaseException], ...] = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    *((_httpcore.RemoteProtocolError, _httpcore.ReadError) if _httpcore is not None else ()),
+)
+# 模型在服务端用不了：没开通 / 没定价 / 下架 / 型号写错。重试、换写法都没用，只能换模型。
+# 2026-09-25 实例（APIMart，new-api 系网关）：「模型 gemini-3.1-pro-preview 的价格尚未由管理员配置，
+# 暂时无法使用」——drama 工具把原始 400 报给主模型，主模型绕了 11 轮去翻、去改 Agent 自己的配置
+_MODEL_UNAVAILABLE = re.compile(
+    r"has not been priced|价格尚未由管理员配置|倍率或价格未配置|model_price_error"
+    r"|无可用渠道|no available channel|model_not_found|模型不存在"
+    r"|the model .{0,80}does not exist|model .{0,80}not found",
+    re.I,
+)
+
+
+class ModelUnavailableError(Exception):
+    """某个角色配的模型在服务端用不了。消息本身写清楚该怎么办 —— 工具层照例只把
+    「异常类名: 消息」报给主模型，这段话会原样到它眼前。"""
+
+    def __init__(self, role: str, provider: str, model: str, detail: str) -> None:
+        self.role, self.provider, self.model, self.detail = role, provider, model, detail
+        super().__init__(
+            f"角色「{role}」用的模型 {model} 在服务端用不了（config/models.yaml 里 provider "
+            f"「{provider}」的 model）。服务端原话：{detail[:200]}。"
+            "这不是参数、剧本或网络的问题：重试、换写法、换工具都没用，也不要去读写 Agent 自己的"
+            "配置文件。请把这句话告诉用户，由用户决定换成哪个可用型号"
+            f"（agent models --role {role} 能列出服务端的型号）。"
+        )
 
 
 def classify_model_error(exc: BaseException) -> tuple[str, str]:
@@ -414,6 +463,8 @@ def classify_model_error(exc: BaseException) -> tuple[str, str]:
     Kimi 对超长上下文返回的是 401（"k3-256k supports only 256K context"），
     所以判类别看的是报错文本，不看状态码。
     """
+    if isinstance(exc, ModelUnavailableError):
+        return "model_unavailable", ""  # 消息本身已经写清楚怎么办
     if isinstance(exc, APITimeoutError):
         return "timeout", "模型响应超时，多半是上下文太大或服务端拥堵；发「继续」会重试。"
     if isinstance(exc, APIConnectionError):
@@ -427,6 +478,11 @@ def classify_model_error(exc: BaseException) -> tuple[str, str]:
         return "context_overflow", "请求超过模型上下文上限。"
     if status in (402, 403, 429) and _QUOTA.search(msg):
         return "quota", "模型额度用尽（订阅窗口或余额）。等额度恢复后发「继续」即可，进度不会丢。"
+    if status in (400, 403, 404, 503) and _MODEL_UNAVAILABLE.search(msg):
+        return "model_unavailable", (
+            "这个模型在服务端用不了（没开通 / 没定价 / 下架）。重试没用：换 config/models.yaml 里"
+            "对应 provider 的 model（agent models 能列出服务端的型号）。"
+        )
     return "other", ""
 
 

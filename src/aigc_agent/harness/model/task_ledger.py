@@ -37,6 +37,7 @@ class TaskRecord:
     urls: list[str] = field(default_factory=list)
     error: str = ""
     delivered: bool = False
+    recoveries: int = 0  # 自动取回过几次（取回后又没等到的，不再无限取回）
 
     @property
     def undelivered(self) -> bool:
@@ -49,8 +50,13 @@ class TaskRecord:
 class MediaTaskLedger:
     """一个 JSONL 文件。写入是追加（一行一次变化），读的时候折叠；按文件 mtime 缓存。"""
 
-    def __init__(self, path: str | Path, max_age_h: float = 24.0) -> None:
+    def __init__(
+        self, path: str | Path, max_age_h: float = 24.0, max_auto_recoveries: int = 2
+    ) -> None:
         self.path = Path(path)
+        # 同一个任务自动取回的上限：取回后又等超时的，多半卡死了（或状态词不认识），再取回只是
+        # 每次再等满一轮（2026-09-24 审查）。人仍可用 media_recover 点名取回
+        self.max_auto_recoveries = max_auto_recoveries
         # 超过这个时长的任务不再自动取回：生成链接约 24h 失效，取回来也下载不了
         self.max_age_h = max_age_h
         self._cache: dict[str, TaskRecord] = {}
@@ -104,6 +110,25 @@ class MediaTaskLedger:
             and r.undelivered
             and r.task_id not in skip
             and r.age_h(now) <= self.max_age_h
+            and int(r.recoveries or 0) < self.max_auto_recoveries
+        ]
+        cands.sort(key=lambda r: r.submitted_at or r.updated_at, reverse=True)
+        return cands[0] if cands else None
+
+    def recoverable_where(self, pick: Any) -> TaskRecord | None:
+        """按条件找最近一个能自动取回的任务（没交付、在有效期内、没超自动取回次数）。
+
+        按请求指纹找不到的：质检重生成时提示词改过（加了「上一版出了字」这类修正），轮询超时后
+        重跑，指纹对不上、取不回来，白付一次（2026-09-26）。调用方按参数里的标签（比如片段的
+        段指纹）来找。"""
+        now = time.time()
+        cands = [
+            r
+            for r in self._load().values()
+            if r.undelivered
+            and r.age_h(now) <= self.max_age_h
+            and int(r.recoveries or 0) < self.max_auto_recoveries
+            and pick(r)
         ]
         cands.sort(key=lambda r: r.submitted_at or r.updated_at, reverse=True)
         return cands[0] if cands else None
@@ -160,14 +185,22 @@ class MediaTaskLedger:
             row["error"] = error[:500]
         self._append(row)
 
+    def recovered(self, task_id: str) -> None:
+        """自动取回了一次：计数（超过上限就不再自动取回，改为正常提交）。"""
+        rec = self.get(task_id)
+        self._append({"task_id": task_id, "recoveries": int(rec.recoveries if rec else 0) + 1})
+
     def delivered(self, task_id: str) -> None:
         """结果已经登记成资产：以后不再自动取回它。"""
         self._append({"task_id": task_id, "delivered": True})
 
 
-def append_jsonl(path: Path, row: dict[str, Any] | str) -> None:
+def append_jsonl(path: Path, row: dict[str, Any] | str) -> tuple[int, int]:
     """往 JSONL 追加一行。上一个进程被杀、最后一行只写了一半（没有换行）时先补换行 ——
-    不补的话新记录会拼在半行后面，整行解析失败，这条新记录也跟着丢。"""
+    不补的话新记录会拼在半行后面，整行解析失败，这条新记录也跟着丢。
+
+    返回 (这一行写在哪个偏移, 写了几个字节)：增量读台账的进程靠它知道自己这行在哪，
+    别的进程在它读完和写入之间追加的行才不会被跳过。"""
     line = row if isinstance(row, str) else json.dumps(row, ensure_ascii=False)
     data = (line.rstrip("\n") + "\n").encode("utf-8")
     with Path(path).open("a+b") as f:
@@ -176,7 +209,9 @@ def append_jsonl(path: Path, row: dict[str, Any] | str) -> None:
             f.seek(-1, 2)
             if f.read(1) != b"\n":
                 f.write(b"\n")
+        start = f.tell()
         f.write(data)
+    return start, len(data)
 
 
 def _jsonable(v: Any) -> Any:

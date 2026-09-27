@@ -335,6 +335,52 @@ class CostGuard:
                     )
         return Verdict(True)
 
+    def room(self, kind: str) -> dict[str, float | None]:
+        """还剩多少额度：calls / seconds / money，本次开工和单日（金额再加单项目）取更紧的。
+        None = 这一维不限。整批报价时给人看（2026-09-26）。"""
+
+        def tighter(a: float | None, b: float | None) -> float | None:
+            return b if a is None else a if b is None else min(a, b)
+
+        calls: float | None = None
+        limit = self.limit_for(kind)
+        if limit is not None:
+            calls = limit - self.usage.calls.get(kind, 0)
+        seconds: float | None = None
+        if self.seconds_limit is not None:
+            seconds = self.seconds_limit + self.extra_seconds - self.usage.seconds
+        money: float | None = None
+        if self.money_limit is not None:
+            money = self.money_limit + self.extra_money - self.usage.money
+        if self.ledger is not None:
+            day = today()
+            if kind in self.daily_call_limits:
+                calls = tighter(
+                    calls,
+                    self.daily_call_limits[kind] + self.extra.get(f"day:{kind}", 0)
+                    - self.ledger.calls(kind, day=day),
+                )
+            if self.daily_seconds_limit is not None:
+                seconds = tighter(
+                    seconds,
+                    self.daily_seconds_limit + self.extra_seconds - self.ledger.seconds(day=day),
+                )
+            if self.daily_limit is not None:
+                money = tighter(
+                    money, self.daily_limit + self.extra_money - self.ledger.money(day=day)
+                )
+            if self.project_limit is not None:
+                money = tighter(
+                    money,
+                    self.project_limit + self.extra_money
+                    - self.ledger.money(project=self.project_id),
+                )
+        return {
+            "calls": None if calls is None else max(0.0, float(calls)),
+            "seconds": None if seconds is None else max(0.0, float(seconds)),
+            "money": None if money is None else max(0.0, float(money)),
+        }
+
     def allow_more(self, kind: str, n: int = 1, seconds: float = 0.0) -> None:
         """人确认后放行：只给这一类加 n 次（视频再加 seconds 秒）额度，不动配置。"""
         self.extra[kind] = self.extra.get(kind, 0) + n

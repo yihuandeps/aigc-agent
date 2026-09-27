@@ -77,6 +77,11 @@ _STATUS_MAP = {
     "failure": TaskStatus.FAILED,
     "error": TaskStatus.FAILED,
     "cancelled": TaskStatus.FAILED,
+    "canceled": TaskStatus.FAILED,
+    "expired": TaskStatus.FAILED,
+    "rejected": TaskStatus.FAILED,
+    "timeout": TaskStatus.FAILED,
+    "timed_out": TaskStatus.FAILED,
 }
 
 
@@ -245,9 +250,11 @@ class ApiMartProvider:
                 raw=payload,
                 stage="submit",
                 http_status=code,
-                # 429 是被拒收（没建任务、不扣费）；502/503/504 是网关没转到后端。
-                # 400/401/403/500 等说明请求本身或服务端有问题，原样重提没意义或有风险
-                retryable=code == 429 or code in (502, 503, 504),
+                # 429 是被拒收（没建任务、不扣费）；503 是服务不可用（没转到后端）。
+                # 502/504 是上游没及时回 —— 和 ReadTimeout 一样，上游可能已经建了任务，
+                # 原样重提可能付两份（2026-09-24 审查）。400/401/403/500 等说明请求本身或
+                # 服务端有问题，重提没意义或有风险
+                retryable=code in (429, 503),
             )
 
         urls = extract_urls(payload)
@@ -481,6 +488,7 @@ class MediaGateway:
                     f"（{rec.status}），先取回它，不重新提交"
                 ),
             )
+            self.ledger.recovered(rec.task_id)
             task = MediaTask(
                 task_id=rec.task_id, kind=kind, model=rec.model or model,
                 status=TaskStatus.RUNNING, recovered=True,
@@ -675,6 +683,12 @@ class MediaGateway:
                 continue
             return task
 
+    async def close(self) -> None:
+        # 2026-09-24 审查：这个方法曾被误缩进到模块级函数 task_fingerprint 的 return 之后，
+        # 成了死代码 —— httpx 连接池从此没人关，每次退出刷一屏 athrow 堆栈
+        for p in self.providers.values():
+            await p.close()
+
 
 def task_fingerprint(kind: MediaKind, model: str, prompt: str, params: dict[str, Any]) -> str:
     """同一份生成请求的指纹：模态 + 模型 + 提示词 + 会影响产物的参数。"""
@@ -686,10 +700,6 @@ def task_fingerprint(kind: MediaKind, model: str, prompt: str, params: dict[str,
         ensure_ascii=False, sort_keys=True, default=str,
     )
     return hashlib.sha1(body.encode("utf-8")).hexdigest()[:20]
-
-    async def close(self) -> None:
-        for p in self.providers.values():
-            await p.close()
 
 
 # ---------------------------------------------------------------- 测试替身

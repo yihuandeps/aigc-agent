@@ -62,12 +62,12 @@ class CostLedger:
         self.entries = 0
         self._offset = 0  # 已经读进聚合的字节数
 
-    def _load(self) -> None:
-        """从上次读到的位置往后读完整的行（最后半行留着，等它写完）。"""
+    def _load(self, until: int | None = None) -> None:
+        """从上次读到的位置往后读完整的行（最后半行留着，等它写完）。until：只读到这个偏移。"""
         if self.path is None:
             return
         try:
-            size = self.path.stat().st_size
+            size = self.path.stat().st_size if until is None else until
         except OSError:
             return
         if size < self._offset:  # 文件被换掉 / 截断：从头重算
@@ -77,7 +77,7 @@ class CostLedger:
         try:
             with self.path.open("rb") as f:
                 f.seek(self._offset)
-                chunk = f.read()
+                chunk = f.read(size - self._offset)
         except OSError:
             return
         end = chunk.rfind(b"\n")
@@ -108,8 +108,12 @@ class CostLedger:
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                append_jsonl(self.path, e.model_dump_json())
-                self._offset = self.path.stat().st_size  # 自己这行已经在聚合里了
+                start, n = append_jsonl(self.path, e.model_dump_json())
+                if start > self._offset:
+                    # 别的进程在我们 _load() 之后、写入之前追加的行：读进来，别跳过
+                    # （之前直接把偏移设成文件大小，这些行本进程再也不读，合计偏小）
+                    self._load(until=start)
+                self._offset = start + n  # 自己这行已经在聚合里了
             except OSError:
                 pass
         return e
