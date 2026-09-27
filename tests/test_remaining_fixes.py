@@ -58,6 +58,7 @@ async def test_短视频镜头画面有字_带禁令重生成():
 
     fns._burned_text = fake  # type: ignore[method-assign]
     bid = await _brief(fns)
+    fns.approve(bid)  # 人在确认单上点了头（2026-09-26：confirm=true 只认人的确认）
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     prompts = [a["prompt"] for a in reg.of("gen_video")]
@@ -75,9 +76,13 @@ async def test_短视频镜头重生成后还有字_不进成片():
 
     fns._burned_text = fake  # type: ignore[method-assign]
     bid = await _brief(fns)
+    fns.approve(bid)  # 人在确认单上点了头（2026-09-26：confirm=true 只认人的确认）
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     assert "第1镜：画面里有字（左上角标题字）" in r.content
+    # 有字的镜头不进成片，缺镜头就不合成（2026-09-26：和短剧「缺段不成片」同一条规则）
+    assert "未成片" in r.content and r.meta.get("complete") is False
+    assert not reg.of("compose_video")
 
 
 async def test_短视频查不了字幕要说出来():
@@ -85,6 +90,7 @@ async def test_短视频查不了字幕要说出来():
     reg = Registry(store)
     fns = _fns(store, reg)  # 假注册表生成的片段没有本地副本 → 查不了
     bid = await _brief(fns)
+    fns.approve(bid)  # 人在确认单上点了头（2026-09-26：confirm=true 只认人的确认）
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     assert "没做成字幕检查" in r.content
@@ -104,6 +110,7 @@ async def test_配方里的tts_model接上():
 
     fns._recipe = with_tts  # type: ignore[method-assign]
     bid = await _brief(fns)
+    fns.approve(bid)  # 人在确认单上点了头（2026-09-26：confirm=true 只认人的确认）
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     tts = reg.of("tts")

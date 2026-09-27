@@ -23,6 +23,7 @@ from aigc_agent.domain.pipeline.short_video import (
     parse_brief,
     parse_material_reply,
 )
+from aigc_agent.harness.events.bus import Event, EventType
 from aigc_agent.harness.tools.provider import ToolResult
 
 RECIPES = Path(__file__).resolve().parents[1] / "config" / "recipes"
@@ -258,6 +259,10 @@ async def test_出片_素材直用_缺的并发生成_配音字幕合成_重跑�
     ask = await fns.invoke("short_video_produce", {"brief_id": bid})
     assert ask.suspend and ask.suspend_payload["major"] is True and not reg.of("gen_video")
     assert "要新生成 2 段视频" in ask.suspend_payload["question"]
+    # 人在确认单上采纳（总线 CHECKPOINT_DECIDED）之后，confirm=true 才生效（2026-09-26）
+    fns.on_event(Event(type=EventType.CHECKPOINT_DECIDED, data={
+        "node": "出片确认", "decision": "adopt", "decided_by": "human", "candidates": [bid],
+    }))
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     gens = reg.of("gen_video")
@@ -293,6 +298,7 @@ async def test_没给实拍素材_改用生成并标出_图片素材做成镜头
     reg = Registry(store)
     fns = _fns(store, reg)
     bid = (await fns.invoke("short_video_brief", {"keyword": "k", "style": "tech-short"})).asset_ref
+    fns.approve(bid)  # 人在终端点了头（2026-09-26：confirm=true 只认人的确认）
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok and "第2镜需要实拍素材但没提供" in r.content
     assert len(reg.of("gen_video")) == 3
@@ -319,6 +325,7 @@ async def test_没给实拍素材_改用生成并标出_图片素材做成镜头
     mod.ffmpeg.still_to_clip = fake_still  # type: ignore[assignment]
     try:
         reg.calls.clear()
+        fns.approve(bid)
         r = await fns.invoke(
             "short_video_produce",
             {"brief_id": bid, "materials": {"2": photo.id}, "reuse": False, "confirm": True},

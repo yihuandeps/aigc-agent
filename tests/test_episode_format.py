@@ -247,9 +247,11 @@ def _lib_asset(store: AssetStore) -> Any:
     )
 
 
-def _shots_json(durs: list[int], hook_idx: set[int]) -> str:
+def _shots_json(durs: list[int], hook_idx: set[int], names: list[str] | None = None) -> str:
+    """names：每段覆盖的分镜镜号（如 "1-2"），不给就是第 i 段只覆盖第 i 镜。"""
     rows = [
-        {"scene_index": f"[第1集-{i}场]", "video_name": f"{i}", "video_duration": f"{d}s",
+        {"scene_index": f"[第1集-{i}场]",
+         "video_name": names[i - 1] if names else f"{i}", "video_duration": f"{d}s",
          "cuts": _cuts_for(d),
          "description": f"(地铁车厢) (陆离-风衣-[全集]) 镜头{i}", "hook": i in hook_idx}
         for i, d in enumerate(durs, 1)
@@ -259,12 +261,14 @@ def _shots_json(durs: list[int], hook_idx: set[int]) -> str:
 
 async def test_提示词不合规格_改一次_合格版落资产():
     store = AssetStore()
+    # 96 镜 × 2.5s = 240s 的分镜（合规格）；第一版只写了 8 段 96s，改一次后 20 段覆盖全部 96 镜
     sb = store.create(
-        json.dumps([{"episodeIndex": 1, "episodeTitle": "第1集", "episodeDesc": _desc(18)}]),
+        json.dumps([{"episodeIndex": 1, "episodeTitle": "第1集", "episodeDesc": _desc(96)}]),
         summary="分镜", creator="tool:drama_storyboard",
     )
     lib = _lib_asset(store)
-    gw = SeqGateway([_shots_json([12] * 8, set()), _shots_json([12] * 20, {1})])
+    spans = [f"{5 * i - 4}-{min(5 * i, 96)}" for i in range(1, 21)]
+    gw = SeqGateway([_shots_json([12] * 8, set()), _shots_json([12] * 20, {1}, spans)])
     fns = DramaFunctions(gw, store, registry=None, catalog=None, fmt=EpisodeFormat())
     r = await fns._fn_drama_shots(sb.id, lib.id)
     assert r.ok, r.error
@@ -283,7 +287,9 @@ async def test_改一次仍不合格_如实报出():
         summary="分镜", creator="tool:drama_storyboard",
     )
     lib = _lib_asset(store)
-    gw = SeqGateway([_shots_json([12] * 8, set()), _shots_json([12] * 8, set())])
+    # 八段覆盖分镜全部 18 个镜头（2026-09-25 起漏镜头会先补写、补不上就不保存），只是总时长不够
+    spans = ["1-2", "3-4", "5-6", "7-8", "9-10", "11-12", "13-15", "16-18"]
+    gw = SeqGateway([_shots_json([12] * 8, set(), spans), _shots_json([12] * 8, set(), spans)])
     fns = DramaFunctions(gw, store, registry=None, catalog=None, fmt=EpisodeFormat())
     r = await fns._fn_drama_shots(sb.id, lib.id, note="第一段就是推下站台")
     assert r.ok and "⚠ 规格检查未过" in r.content and "总时长 96s" in r.content

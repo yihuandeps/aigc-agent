@@ -103,8 +103,12 @@ def test_集数范围解析():
 def test_按场景选服装_场景优先于集数():
     lib = _lib()
     luli, xiaoman, laogui = lib.characters
-    assert luli.costume_for("疾控中心实验室", 1).name == "陆离-白大褂-[2-4]", "场景绑定压过集数"
-    assert luli.costume_for("修表铺", 4).name == "陆离-深色风衣-[1-3]"
+    assert luli.costume_for("疾控中心实验室", 3).name == "陆离-白大褂-[2-4]", "场景绑定压过集数"
+    # 2026-09-25：场景分给的那套这一集不穿（集数不含）就按集数选 —— 之前不看集数，二郎神第 18 集
+    # 取到了只在 1–17 集穿的战甲
+    assert luli.costume_for("疾控中心实验室", 1).name == "陆离-深色风衣-[1-3]"
+    assert luli.costume_for("修表铺", 4).name == "陆离-白大褂-[2-4]"
+    assert luli.costume_for("修表铺", 2).name == "陆离-深色风衣-[1-3]"
     assert luli.costume_for("没登记的场景", 2).name == "陆离-深色风衣-[1-3]", "没场景就按集数"
     assert luli.costume_for("没登记的场景", 4).name == "陆离-白大褂-[2-4]"
     assert luli.costume_for("没登记的场景", 9) is None
@@ -151,28 +155,80 @@ SHOTS = [
 ]
 
 
-def test_按场景绑定服装_裸名换成服装_缺口报出来():
+def test_按场景绑定服装_裸名换成服装_点名的按剧情保留():
+    """2026-09-25 改：模型按剧情点名、这一集能穿的服装保留（回忆戏的婚服、同一地点临时换装，
+    之前被场景分配表一律改回默认服装，note 也拦不住）；和分配表不一致的报出来给人看。"""
     lib = _lib()
     shots, err = parse_shots(json.dumps(SHOTS, ensure_ascii=False))
     assert not err
-    changes, warns = bind_costumes(shots, lib)
+    changes, warns, kept = bind_costumes(shots, lib)
 
-    assert "(陆离-白大褂-[2-4])" in shots[0].description, "实验室里该穿白大褂"
-    assert "(陆离-深色风衣-[1-3])" not in shots[0].description
+    assert "(陆离-深色风衣-[1-3])" in shots[0].description, "第 2 集能穿风衣：按剧情保留"
     assert "(小满-旧连帽衫-[全集])" in shots[0].description, "裸角色名换成服装 ID"
-    assert "(陆离-深色风衣-[1-3])" in shots[1].description, "修表铺换回风衣"
+    assert "(陆离-白大褂-[2-4])" in shots[1].description, "第 2 集能穿白大褂：按剧情保留"
     assert "(老鬼-劳保服-[1])" in shots[2].description, "没绑定但只有一套：裸名至少换成它"
-    assert shots[3].description.count("(老鬼-劳保服-[1])") == 1, "没绑定的引用原样保留"
+    assert shots[3].description.count("(老鬼-劳保服-[1])") == 1, "点名的原样保留"
     assert changes == [
-        "[第2集-1场]：陆离-深色风衣-[1-3] → 陆离-白大褂-[2-4]",
         "[第2集-1场]：小满 → 小满-旧连帽衫-[全集]",
-        "[第2集-2场]：陆离-白大褂-[2-4] → 陆离-深色风衣-[1-3]",
         "[第5集-1场]：老鬼 → 老鬼-劳保服-[1]",
     ]
-    assert len(warns) == 1 and "老鬼 在「地铁车厢」" in warns[0]
+    assert kept == [
+        "[第2集-1场]：陆离 穿 陆离-深色风衣-[1-3]（分配表是 陆离-白大褂-[2-4]）",
+        "[第2集-2场]：陆离 穿 陆离-白大褂-[2-4]（分配表是 陆离-深色风衣-[1-3]）",
+    ]
+    assert warns == []
 
-    again, _ = bind_costumes(shots, lib)
+    again, _, _ = bind_costumes(shots, lib)
     assert again == [], "绑定是幂等的"
+
+
+def test_点了这一集不穿的服装_换成分配表的_同一场统一成点名最多的():
+    lib = _lib()
+    rows = [
+        # 第 4 集修表铺点了只在 1–3 集穿的风衣：换成这一集能穿的白大褂
+        _shot("[第4集-1场]", "1-3", "场景设定: (修表铺)。(陆离-深色风衣-[1-3]) 推门。"),
+        # 同一场次三段：两段点风衣、一段点白大褂（第 2 集都能穿）→ 统一成风衣
+        _shot("[第2集-3场]", "4-6", "场景设定: (修表铺)。(陆离-深色风衣-[1-3]) 看表。"),
+        _shot("[第2集-3场]", "7-9", "(陆离-深色风衣-[1-3]) 抬头。"),
+        _shot("[第2集-3场]", "10-12", "(陆离-白大褂-[2-4]) 转身。"),
+    ]
+    shots, err = parse_shots(json.dumps(rows, ensure_ascii=False))
+    assert not err
+    changes, _, _ = bind_costumes(shots, lib)
+    assert "(陆离-白大褂-[2-4])" in shots[0].description
+    assert all("(陆离-深色风衣-[1-3])" in s.description for s in shots[1:])
+    assert changes == [
+        "[第4集-1场]：陆离-深色风衣-[1-3] → 陆离-白大褂-[2-4]",
+        "[第2集-3场]：陆离-白大褂-[2-4] → 陆离-深色风衣-[1-3]（同一场统一）",
+    ]
+
+
+def test_同一场景分给两套_按集数选对的那套():
+    """二郎神在「老槐树下」有 1–17 集的战甲和 18–20 集的素战袍：第 18 集要素战袍。"""
+    lib, err = parse_assets(json.dumps({
+        "characters": [{
+            "baseRoleName": "二郎神",
+            "roleTotalDesc": "男 | 30岁",
+            "roleCostumeList": [
+                {"costumeName": "二郎神-战甲-[1-17]", "costumeDesc": "战甲",
+                 "scenes": ["老槐树下", "凌霄殿"], "episodes": "1-17"},
+                {"costumeName": "二郎神-素战袍-[18-20]", "costumeDesc": "素战袍",
+                 "scenes": ["老槐树下"], "episodes": "18-20"},
+            ],
+        }],
+        "scenes": [{"name": "老槐树下", "description": "x"}],
+        "props": [],
+    }, ensure_ascii=False))
+    assert not err
+    erlang = lib.characters[0]
+    assert erlang.costume_for("老槐树下", 18).name == "二郎神-素战袍-[18-20]"
+    assert erlang.costume_for("老槐树下", 3).name == "二郎神-战甲-[1-17]"
+    shots, _ = parse_shots(json.dumps(
+        [_shot("[第18集-1场]", "1-3", "场景设定: (老槐树下)。(二郎神-素战袍-[18-20]) 抗旨。")],
+        ensure_ascii=False,
+    ))
+    changes, _, kept = bind_costumes(shots, lib)
+    assert changes == [] and kept == [], "点对了就不动（之前被改成战甲 17 处）"
 
 
 # ---------------------------------------------------------------- 第③步集成
@@ -204,13 +260,14 @@ async def test_drama_shots产物已按场景绑定():
 
     r = await fns._fn_drama_shots(sb_id, lib_id)
     assert r.ok, r.error
-    # 三处：实验室里风衣→白大褂、裸名「小满」→服装、修表铺白大褂→风衣
-    assert "服装已按场景绑定，改了 3 处引用" in r.content
-    assert "陆离-深色风衣-[1-3] → 陆离-白大褂-[2-4]" in r.content
+    # 裸名「小满」→服装；陆离点名的风衣 / 白大褂第 2 集都能穿：按剧情保留、报出来给人看
+    assert "服装已按场景绑定，改了 1 处引用" in r.content
+    assert "服装按剧情保留了 2 处" in r.content and "分配表是 陆离-白大褂-[2-4]" in r.content
     stored, _ = parse_shots(store.content(r.asset_ref))
-    assert "(陆离-白大褂-[2-4])" in stored[0].description
+    assert "(陆离-深色风衣-[1-3])" in stored[0].description
     assert "(小满-旧连帽衫-[全集])" in stored[0].description
-    assert store.get(r.asset_ref).gen_params["costume_bindings"] == 3
+    gp = store.get(r.asset_ref).gen_params
+    assert gp["costume_bindings"] == 1 and gp["costume_kept"] == 2
     # 资产库摘要（带场景标注）进了模型的输入
     user_msg = gw.calls[0][-1]["content"]
     assert "// 用于 疾控中心实验室" in user_msg

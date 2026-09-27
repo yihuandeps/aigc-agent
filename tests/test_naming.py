@@ -198,7 +198,14 @@ async def test_分镜视频按集内序号命名_过滤不影响编号():
     assert r2.ok
     # 只渲第 1 集且 limit=1：编号仍按完整列表，不会因为过滤变成 01
     assert [a["local_name"] for a in reg2.of("gen_video")] == ["第01集-01_1场_镜1-4"]
-    assert reg2.of("compose_video")[0]["filename"] == "第01集.mp4"
+    assert not reg2.of("compose_video"), "limit 只渲了一部分：不算渲完、不拼成片（2026-09-24）"
+
+    # 整集渲完才拼，成片按集命名
+    reg3 = _Reg(store)
+    r3 = await DramaFunctions(None, store, registry=reg3)._fn_drama_render_shots(
+        shots_id, episode=1, reuse=False
+    )
+    assert r3.ok and reg3.of("compose_video")[0]["filename"] == "第01集.mp4"
 
 
 # ---------------------------------------------------------------- 已生成文件补改

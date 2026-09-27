@@ -560,9 +560,14 @@ async def test_同一迭代第二个人审按失败回填():
     ("stage", "major", "suspended"),
     [
         ("第3集", True, True),  # 显式 major 压过关键词
-        ("剧本", False, False),  # 显式 minor 压过关键词
+        # 显式 major=false 不能把大节点降级（2026-09-26）：之前模型标一句 false，
+        # /auto 下「剧本 / 视频生成」就被自动采纳了
+        ("剧本", False, True),
+        ("视频生成", False, True),
+        ("大纲", False, False),  # 关键词判不出大节点的环节，false 照常自动过
         ("剧本", None, True),  # 没给就按关键词
         ("第3集", None, False),
+        ("图片生成（全剧12集）", None, True),  # 集数不是「某一集」，不能被当成小节点
     ],
 )
 async def test_auto模式显式major优先(stage, major, suspended):

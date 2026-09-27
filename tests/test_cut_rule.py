@@ -229,13 +229,15 @@ async def test_关掉镜头门或没本地副本就不查(tmp_path: Path):
     r = await fns._fn_drama_render_shots(_shots(store))
     assert r.ok and not checked and "超过" not in r.content
 
-    # 真实 _check_cuts：没有本地副本 → 静默跳过，不记备注
+    # 真实 _check_cuts：没有本地副本 → 不量，但要留一句备注（2026-09-24 复审：之前静默跳过，
+    # 结果里看不出这段根本没量）
     store2 = AssetStore()
     fns2 = DramaFunctions(None, store2, registry=Registry(store2, tmp_path), catalog=None)
     a = store2.create("", type_=AssetType.VIDEO, summary="远端", creator="model:x")
     a.uri = "https://fake/x.mp4"
     store2.put(a)
-    assert await fns2._check_cuts(a.id, 0.3) == (None, "")
+    longest, why = await fns2._check_cuts(a.id, 0.3)
+    assert longest is None and "没有本地副本" in why
     assert fns2._cut_cfg() == (True, 1, 0.3, 0.5), "catalog=None 时按默认值开着"
 
 

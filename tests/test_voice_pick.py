@@ -145,43 +145,54 @@ def test_候选池够大才谈得上自动选():
 
 import asyncio  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
+from typing import Any  # noqa: E402
 
+from aigc_agent.domain.assets.store import AssetStore  # noqa: E402
+from aigc_agent.domain.functions.short_video import ShortVideoFunctions  # noqa: E402
 from aigc_agent.interfaces.cli import video_cmd  # noqa: E402
+from tests.test_short_video import RECIPES, Gateway, Registry, _plan  # noqa: E402
 
 
-class _Cat:
-    speech_voices = [SimpleNamespace(name=n, note=t) for n, t in VOICES]
-    speech_default_voice = FALLBACK
-    provider = "x"
-    speech_provider = "x"
+class _Gateway(Gateway):
+    """选音色那步选 Radio_Host、语速 0.9；简报按 test_short_video 的计划走。"""
+
+    async def chat(self, role: str, messages: list[dict[str, Any]], **kw: Any) -> Any:
+        if role == "voice_select":
+            self.calls.append((role, messages[-1]["content"]))
+            return SimpleNamespace(text=_resp(voice=ALLOWED[1], speed=0.9, why="叙事"))
+        return await super().chat(role, messages, **kw)
 
 
 class _Agent:
-    """记下每一次工具调用，好断言 tts 拿到了什么。"""
+    """真的简报 / 出片工具，假的生成、配音、合成；记下 tts 拿到了什么。
+
+    `agent video make` 2026-09-23 起走和对话同一组工具（short_video_brief →
+    short_video_produce），选音色在 produce 里做，所以这里要把真工具接上。
+    """
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict]] = []
-        self.catalog = _Cat()
-        self.registry = SimpleNamespace(invoke=self._invoke)
-        self.gateway = SimpleNamespace(chat=self._chat)
-        self.assets = SimpleNamespace(
-            content=lambda _i: "1\n00:00:00,000 --> 00:00:02,000\n占位\n",
-            revise=lambda _i, _c, **_k: SimpleNamespace(id="sub2"),
+        self.assets = AssetStore()
+        self.inner = Registry(self.assets)  # gen_video / tts / transcribe / compose_video
+        self.gateway = _Gateway(_plan())
+        self.catalog = SimpleNamespace(
+            drama={"realism_level": "subtle", "video_retries": "1"},
+            max_concurrency=lambda kind: 0,
+            speech_voices=[SimpleNamespace(name=n, note=t) for n, t in VOICES],
+            speech_default_voice=FALLBACK,
         )
+        self.fns = ShortVideoFunctions(
+            self.gateway, self.assets, registry=self, catalog=self.catalog, recipes_dir=RECIPES
+        )
+        self.short_video_fns = self.fns  # 终端确认后命令行调它的 approve()
+        self.registry = self
 
     async def setup(self, mcp: bool = True) -> None: ...
     async def aclose(self) -> None: ...
 
-    async def _invoke(self, name: str, args: dict):
-        self.calls.append((name, args))
-        return SimpleNamespace(ok=True, content="ok", error="", asset_ref="a1", duration_ms=1)
-
-    async def _chat(self, role: str, messages: list[dict]):
-        if role == "voice_select":
-            return SimpleNamespace(text=_resp(voice=ALLOWED[1], speed=0.9, why="叙事"))
-        return SimpleNamespace(
-            text='{"script": "一段口播", "shots": ["一", "二", "三", "四", "五", "六"]}'
-        )
+    async def invoke(self, name: str, args: dict[str, Any]) -> Any:
+        if name.startswith("short_video_"):
+            return await self.fns.invoke(name, args)
+        return await self.inner.invoke(name, args)
 
 
 def test_选出来的音色真的传给了tts(monkeypatch):
@@ -198,8 +209,8 @@ def test_选出来的音色真的传给了tts(monkeypatch):
         video_cmd._make("科技", "tech-short", "", 0, "", "", False, False, True, False, True, 0.0)
     )
 
-    tts = next((args for name, args in a.calls if name == "tts"), None)
-    assert tts is not None, "压根没调 tts"
-    assert tts["voice"] != "auto", "把配方里的 auto 字面量直接发出去了"
-    assert tts["voice"] in ALLOWED
-    assert tts["speed"] == 0.9, "选出来的语速也没传过去"
+    tts = a.inner.of("tts")
+    assert tts, "压根没调 tts"
+    assert tts[0]["voice"] != "auto", "把配方里的 auto 字面量直接发出去了"
+    assert tts[0]["voice"] in ALLOWED
+    assert tts[0]["speed"] == 0.9, "选出来的语速也没传过去"

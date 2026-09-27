@@ -93,6 +93,7 @@ async def test_镜头多于刀数_多的不生成():
     shots = [{"desc": f"镜头{i}", "seconds": 1, "source": "generate"} for i in range(1, 31)]
     fns = _fns(store, reg, _plan(shots=shots, duration_seconds=20))
     bid = await _brief(fns)
+    fns.approve(bid)  # 人在确认单上点了头（2026-09-26：confirm=true 只认人的确认）
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     assert len(reg.of("gen_video")) < 30 and "进不了成片，没有生成" in r.content
@@ -103,6 +104,7 @@ async def test_产品参考图逐镜带上当身份锁():
     reg = Registry(store)
     fns = _fns(store, reg)
     bid = await _brief(fns)
+    fns.approve(bid)
     r = await fns.invoke("short_video_produce", {
         "brief_id": bid, "confirm": True,
         "ref_images": ["https://cdn/product.png"],
@@ -132,6 +134,7 @@ async def test_口播出镜_不配TTS_字幕从出镜原声转写(tmp_path):
     talk.write_bytes(b"mp4")
     a = store.create("", type_=AssetType.VIDEO, summary="出镜", creator="human:import",
                      gen_params={"local": str(talk)})
+    fns.approve(bid)
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "aroll": a.id, "confirm": True})
     assert r.ok, r.error
     assert not reg.of("tts"), "出镜人自己在说，不配 TTS"
@@ -148,6 +151,7 @@ async def test_实拍配方没给出镜素材_用TTS兜底():
     fns.recipes_dir = None
     made = await fns.invoke("short_video_brief", {"keyword": "k", "style": "talking-head"})
     bid = made.asset_ref
+    fns.approve(bid)
     r = await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})
     assert r.ok, r.error
     assert reg.of("tts") and "TTS 口播兜底" in r.content
@@ -158,6 +162,7 @@ async def test_改版后的简报也复用上次的镜头(tmp_path):
     reg = Registry(store)
     fns = _fns(store, reg)
     bid = await _brief(fns)
+    fns.approve(bid)
     assert (await fns.invoke("short_video_produce", {"brief_id": bid, "confirm": True})).ok
     n = len(reg.of("gen_video"))
     new = (await fns.invoke("resolve_materials", {"brief_id": bid, "reply": "第2镜 生成"}))

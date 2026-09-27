@@ -132,8 +132,9 @@ def test_brief含今日与项目(tmp_path: Path):
 def test_真实配置三级都有值():
     cg = ModelsConfig.load(ROOT / "config" / "models.yaml").cost_guard
     assert cg.per_task_limit == 200 and cg.per_project_limit == 400 and cg.daily_limit == 800
-    # 次数上限按一集的规格留余量（2026-09-23：之前 14 段每集渲到第 15 段必停），加了秒数口径
-    assert cg.daily_call_limits["video"] == 60 and cg.call_limits["video"] == 60
+    # 次数上限按一集的规格留余量（2026-09-23：之前 14 段每集渲到第 15 段必停），加了秒数口径；
+    # 单日上限要 ≥ 3 × 开工上限（2026-09-24：之前 60 = 一集的量，同一天渲第二集必停且没有出口）
+    assert cg.call_limits["video"] == 60 and cg.daily_call_limits["video"] >= 3 * 60
     assert cg.seconds_limit == 600 and cg.daily_seconds_limit == 3000
 
 

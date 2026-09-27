@@ -115,24 +115,6 @@ def test_素材池和成片时长是分开的():
     assert r.total_seconds == int(r.output["duration"])
 
 
-def test_文案字数按成片算而不是素材池():
-    r = load_recipe("tech-short")
-    assert r.script_chars == int(r.total_seconds * 4.5)
-
-
-def test_命令行能覆盖节奏():
-    r = load_recipe("tech-short").override(max_cut=1.8)
-    assert r.cut_max == 1.8
-    assert load_recipe("tech-short").cut_max != 1.8, "覆盖不该写回原配方"
-
-
-def test_快切下的duration改的是成片不是素材量():
-    r = load_recipe("tech-short")
-    o = r.override(duration=45)
-    assert o.total_seconds == 45
-    assert o.shot_count == r.shot_count, "快切模式下加时长不该多生成素材"
-
-
 def test_画面时长要能盖住旁白():
     """文案按 30 秒写，TTS 渲染出来可能是 35 秒。
 

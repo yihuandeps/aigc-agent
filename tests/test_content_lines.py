@@ -121,9 +121,42 @@ def _fake_agent() -> SimpleNamespace:
         allocator=SimpleNamespace(content_type=""),
         memory=_Mem(),
         session_store=SimpleNamespace(saved=[], set_content_line=lambda k: None),
+        media_fns=None,
+        catalog=SimpleNamespace(
+            drama={"video_model": "seedance-2.0", "image_model": "gpt-image-2"}
+        ),
     )
     a._pin_line = lambda: Agent._pin_line(a)
+    a._apply_locks = lambda: Agent._apply_locks(a)
+    a._default_lock = lambda kind: Agent._default_lock(a, kind)
     return a
+
+
+def test_默认模型锁按产线取_人定过的锁不跟着换():
+    """2026-09-26 用户定的：默认锁取自短剧配置、之前对所有产线生效 —— 新开广告文件夹，
+    product-ad 的 quality 档被锁成 seedance-2.0，海报也用 gpt-image-2。"""
+    a = _fake_agent()
+    a.media_fns = SimpleNamespace(video_lock="", image_lock="", on_video_lock=None,
+                                  on_image_lock=None)
+    a.session_store = SimpleNamespace(
+        video_model="", image_model="", set_content_line=lambda k: None,
+        set_video_model=lambda m: None, set_image_model=lambda m: None,
+    )
+    Agent.set_content_line(a, "", persist=False)
+    assert (a.media_fns.video_lock, a.media_fns.image_lock) == ("seedance-2.0", "gpt-image-2"), (
+        "不限定：沿用短剧配置（老行为）"
+    )
+    Agent.set_content_line(a, "ad")
+    assert (a.media_fns.video_lock, a.media_fns.image_lock) == ("", ""), "广告线交给配方的档位"
+    Agent.set_content_line(a, "design")
+    assert a.media_fns.image_lock == ""
+    Agent.set_content_line(a, "drama")
+    assert a.media_fns.video_lock == "seedance-2.0"
+
+    a.session_store.video_model = "veo3.1-quality"  # 人同意换过：这个项目就用它，换产线也不动
+    Agent.set_content_line(a, "ad")
+    assert a.media_fns.video_lock == "veo3.1-quality"
+    assert a.media_fns.image_lock == ""
 
 
 def test_选定产线_三件事一起生效():

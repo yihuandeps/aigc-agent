@@ -27,7 +27,7 @@ def test_手持vlog_风格骨架():
     assert r.style.get("footage") == "mixed", "用户实拍优先，缺的镜头按同一质感生成"
     assert r.cut_max == 3.0 and r.cut_min == 1.5
     assert r.grounded, "vlog 选题要接热点里的'一件小事'"
-    assert r.total_seconds == 30 and r.script_chars > 0
+    assert r.total_seconds == 30
 
 
 def test_手持vlog_靠相机缺陷换真实感():
@@ -47,8 +47,9 @@ def test_手持vlog_台词跟着镜头走():
     assert "8 个词" in hint and "焊在动作里" in hint
     assert "单向递进" in hint, "身体状态只能单向递进，给模型不可逆的时间线"
     assert "塑料感" in hint, "要说清为什么不能混电影感"
-    script = str(r.voiceover.get("script_hint")).format(chars=r.script_chars)
-    assert "第一人称" in script and str(r.script_chars) in script
+    # 简报按风格的最长时长 × 4.5 字/秒 填 {chars}（domain/pipeline/short_video.brief_prompt）
+    script = str(r.voiceover.get("script_hint")).replace("{chars}", "135")
+    assert "第一人称" in script and "135" in script
 
 
 # ---------------------------------------------------------------- 产品广告
