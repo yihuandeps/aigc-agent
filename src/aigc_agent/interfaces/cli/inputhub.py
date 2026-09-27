@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from rich.console import Console
+from rich.markup import escape
 
 STOP_WORDS = {"/stop", "/pause", "/停", "/暂停", "/停止"}
 NOW_PREFIXES = ("/now ", "/插队 ")
@@ -180,7 +181,7 @@ class InputHub:
             self.console.print("[dim]排队为空[/]")
             return
         for i, m in enumerate(self.pending, 1):
-            self.console.print(f"  [dim]{i}.[/] {m[:120]}")
+            self.console.print(f"  [dim]{i}.[/] {escape(m[:120])}")
 
     # ---------- 读输入 ----------
 
@@ -206,7 +207,7 @@ class InputHub:
         """下一条要发给模型的话：有排队的先发排队的，没有就等人打。"""
         if self.pending:
             msg = self.pending.pop(0)
-            self.console.print(f"{prompt}[dim]▶ 排队消息：[/]{msg}")
+            self.console.print(f"{prompt}[dim]▶ 排队消息：[/]{escape(msg)}")
             return msg
         return await self.ask(prompt)
 

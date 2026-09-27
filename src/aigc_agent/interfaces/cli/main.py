@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,12 @@ from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
 from ...app import PROJECT_ROOT, Agent, load_dotenv  # noqa: E402
+from ...domain.aspect import (  # noqa: E402
+    VIDEO_ASPECTS,
+    aspect_label,
+    parse_aspect,
+    supported_aspects,
+)
 from ...domain.lines import get_line, is_off, parse_line  # noqa: E402
 from ...domain.lines import menu as lines_menu  # noqa: E402
 from ...domain.media.naming import apply_renames, plan_renames, write_manifest  # noqa: E402
@@ -141,8 +148,8 @@ def make_renderer(verbose: bool):
         elif ev.type is EventType.SUBAGENT_END:
             mark = "[green]✓[/]" if d.get("ok") else "[red]✗[/]"
             console.print(
-                f"  {mark} 子代理 {d.get('name')} {d.get('iterations')} 次迭代 "
-                f"[dim]{d.get('duration_ms', 0)}ms {d.get('error') or ''}[/]"
+                f"  {mark} 子代理 {escape(str(d.get('name')))} {d.get('iterations')} 次迭代 "
+                f"[dim]{d.get('duration_ms', 0)}ms {escape(str(d.get('error') or ''))}[/]"
             )
         elif ev.type is EventType.BUDGET_EXCEEDED:
             console.print(
@@ -246,9 +253,59 @@ def _warn_store(agent: Agent) -> None:
         )
 
 
+def _ratio_brief(agent: Agent) -> str:
+    """一句话说清这个项目的视频画幅，以及锁定的视频模型支持哪些。"""
+    where = "本项目设置" if agent.aspect_custom else "默认；短视频没设时按配方"
+    lock = getattr(agent.media_fns, "video_lock", "") or ""
+    listed = supported_aspects(agent.catalog, lock) if lock else []
+    tail = f"；锁定的视频模型 {lock} 支持 {' / '.join(listed)}" if listed else ""
+    return f"视频画幅 {aspect_label(agent.aspect_ratio)}（{where}）{tail}"
+
+
+def _cut_brief(agent: Agent) -> str:
+    """一句话说清这个项目镜头超 3 秒怎么处理。"""
+    if agent.cut_block:
+        return (
+            "镜头超 3 秒：拦（本项目设置）—— 超了自动重生成 1 次，仍超的段不进成片、"
+            "等你放行或重渲；/cut 标 改回只标出来"
+        )
+    return (
+        "镜头超 3 秒：只标出来、照样进成片（默认；检测准不准还没验证）—— 第 1 集渲完抽看几段，"
+        "确实超了就 /cut 拦"
+    )
+
+
+def _length_brief(agent: Agent) -> str:
+    """一句话说清这个项目的集长：几分钟、分镜总长区间、每集大约几段视频。"""
+    fmt = agent.episode_fmt
+    if fmt.follow_script:
+        return (
+            "集长跟剧本走（本项目设置）：分镜总长按台词念完 + 必要的动作定，不按集长凑；"
+            "每集段数按分镜时长算"
+        )
+    lo, hi = fmt.duration_range
+    seg_lo, seg_hi = fmt.shot_range
+    base = agent.base_episode_fmt.minutes
+    where = "默认" if fmt.minutes == base else f"本项目设置，默认 {base:g} 分钟"
+    return (
+        f"一集 {fmt.minutes:g} 分钟（{where}）：分镜总长 {lo}–{hi} 秒，"
+        f"每集约 {seg_lo}–{seg_hi} 段视频"
+    )
+
+
+def _is_number(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
 def _ensure_dir(text: str) -> Path:
-    """校验并创建产物目录。同步函数，经 to_thread 调，别在事件循环里直接做文件操作。"""
-    p = Path(text).expanduser()
+    """校验并创建产物目录。同步函数，经 to_thread 调，别在事件循环里直接做文件操作。
+    先 resolve：相对路径（/out 蜘蛛精）存进快照后换个目录启动会解析成另一个项目
+    （2026-09-24 审查）。"""
+    p = Path(text).expanduser().resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -369,6 +426,78 @@ def _parse_decision(raw: str) -> tuple[str, str] | None:
     return decision, tail.strip()
 
 
+_MEM_ID = re.compile(r"mem_[0-9a-f]{10}")
+_EVERYWHERE = ("全局 ", "全局：", "全局:", "所有项目 ", "--all ")
+
+
+async def _remember(agent: Agent, arg: str) -> None:
+    """/remember 一句话 → 这个项目的规则（人亲口定的，每轮 pin）；「/remember 全局 …」→ 所有项目；
+    /remember mem_xxx → 把一条没有项目键、被隔离的旧记忆认领到这个项目。"""
+    mem = agent.mem_agent
+    if mem is None:
+        console.print("[dim]没有装配记忆代理[/]")
+        return
+    if not arg:
+        console.print(
+            "[dim]用法：/remember 一句话（只对这个项目，每轮都带上）· /remember 全局 一句话"
+            "（所有项目）· /remember mem_xxx（把一条待认领的旧记忆认领到这个项目）[/]"
+        )
+        return
+    if _MEM_ID.fullmatch(arg):
+        try:
+            m = mem.store.claim(arg, mem.project_id)
+        except (KeyError, ValueError) as e:
+            console.print(f"[red]{escape(str(e))}[/]")
+            return
+        console.print(f"[green]已认领到这个项目[/]：{escape(m.content)}")
+        return
+    everywhere = False
+    for p in _EVERYWHERE:
+        if arg.startswith(p):
+            everywhere, arg = True, arg[len(p):].strip()
+            break
+    try:
+        m = mem.store.remember(arg, project_id=mem.project_id, everywhere=everywhere)
+    except ValueError as e:
+        console.print(f"[red]{escape(str(e))}[/]")
+        return
+    where = "所有项目" if everywhere else "这个项目"
+    console.print(
+        f"[green]记住了（{where}，每轮都会带上）[/]：{escape(m.content)}"
+        f" [dim]{m.id}；不要了用 /forget {m.id}[/]"
+    )
+
+
+async def _forget(agent: Agent, hub: InputHub, arg: str) -> None:
+    """/forget 关键词或记忆 id：先列出匹配的记忆，人确认 y 才作废（标记不删，可复盘）。"""
+    mem = agent.mem_agent
+    if mem is None:
+        console.print("[dim]没有装配记忆代理[/]")
+        return
+    if not arg:
+        console.print("[dim]用法：/forget 关键词 或 /forget mem_xxx（先列出来，你确认了才作废）[/]")
+        return
+    found = mem.store.find(arg, mem.project_id)
+    if not found:
+        console.print("[dim]没找到匹配的记忆（/brief 看这个项目现在带着哪些）[/]")
+        return
+    if len(found) > 10:
+        console.print(
+            f"[yellow]匹配到 {len(found)} 条，太多了 —— 关键词再具体一点，或直接给记忆 id[/]"
+        )
+        return
+    for m in found:
+        scope = m.project_id or ("全局" if m.layer.value == "account" else "待认领")
+        console.print(f"  {m.id}  [dim]{escape(scope)}[/]  {escape(m.content[:80])}")
+    ans = (await hub.ask(f"作废这 {len(found)} 条？(y/N) ")).strip().lower()
+    if ans not in ("y", "yes"):
+        console.print("[dim]没动[/]")
+        return
+    for m in found:
+        mem.store.forget(m.id)
+    console.print(f"[green]已作废 {len(found)} 条[/] [dim]（标记作废、不删文件，可复盘）[/]")
+
+
 def _print_result(result: LoopResult) -> None:
     console.print()
     # 模型回复原样显示，不当 rich 标记解析（回复里的 [/] [/budget allow 50] 之类会让
@@ -440,6 +569,9 @@ async def _decide_review(agent: Agent, board: ProgressBoard, hub: InputHub) -> L
         if low in {"/stop", "/pause", "/停", "/exit", "/quit"}:
             console.print("[dim]先不定：这条人审挂着，下一条输入会先问它[/]")
             return None
+        if raw.strip().lower() in {"/auto on", "/auto 开"} and agent.second_window:
+            console.print(f"[yellow]{_SECOND_WINDOW_AUTO}[/]")
+            continue
         if raw.strip().lower() in {"/auto on", "/auto 开"}:
             # 在决策口开 /auto：后续小节点人审不再逐条问
             agent.loop.auto_review = True
@@ -458,6 +590,22 @@ async def _decide_review(agent: Agent, board: ProgressBoard, hub: InputHub) -> L
                 "大节点（剧本/视频生成/图片生成/换模型）仍会停下来问你一次。"
             )
             return await _watched(hub, _resume("adopt", decided_by="auto"))
+        if low in {"/auto stop", "/auto 停"}:
+            # 人审挂着时流水线照样在后台跑：硬停不用先答完这一条
+            n = agent.pipeline.stop()
+            agent.loop.auto_review = False
+            console.print(
+                f"[yellow]■ 流水线已停[/][dim]（取消了 {n} 个在跑的环节）。"
+                "眼前这条人审仍要你定：[/]"
+            )
+            continue
+        if low in {"/auto go", "/auto 放行"}:
+            what = agent.pipeline.pass_gate()
+            console.print(
+                f"[green]已放行[/]：{escape(what)}[dim]。眼前这条人审仍要你定：[/]" if what
+                else "[dim]流水线现在没有停在停点上。眼前这条人审仍要你定：[/]"
+            )
+            continue
         parsed = _parse_decision(raw)
         if parsed is None:
             console.print("[dim]请输入 a / r / j（理由可直接跟在后面）[/]")
@@ -470,10 +618,20 @@ async def _decide_review(agent: Agent, board: ProgressBoard, hub: InputHub) -> L
                 console.print("[red]这是命令不是理由；请写一句为什么打回。[/]")
                 reason = ""
                 continue
+            again = _parse_decision(reason)
+            if again is not None:
+                # 追问理由时又把决定字母敲了一遍（「r 不允许换」）：只留后面的理由 ——
+                # 之前原样当理由存，记忆库里是「r 不允许换」（2026-09-26）
+                reason = again[1]
             if not reason:
                 console.print("[red]理由不能为空。不记原因的话下一版会犯一模一样的错。[/]")
         return await _watched(hub, _resume(decision, reason=reason))
 
+
+_SECOND_WINDOW_AUTO = (
+    "这个窗口是同一个文件夹的第二个窗口，/auto 只能在主窗口开 —— 两个窗口的流水线会重复派发渲染、"
+    "重复花钱。要在这里开，先关掉另一个窗口再重开这个"
+)
 
 # 网络断了在同一轮里自动重试几次、每次等多久（第 N 次等 N×_NET_WAIT 秒）
 _NET_RETRIES = 3
@@ -793,7 +951,9 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
     agent.bus.subscribe(make_renderer(verbose))
     agent.bus.subscribe(board.on_event)
     # 按集流水管线的派发/完成提示（/auto on 时才开始派发，提示随时可见）
-    agent.pipeline.note = lambda m: console.print(f"[dim]{m}[/]")
+    agent.pipeline.note = lambda m: console.print(f"[dim]{escape(str(m))}[/]")
+    # 两个停点（参考图看脸、第 1 集看片）：有人在控制台前才开 —— 停下来等的是 /auto go
+    agent.pipeline.gates = True
     await agent.setup()
     restored = await agent.restore_session()
 
@@ -801,6 +961,19 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
     # 内容都在本地跑，生成的东西该落在他眼前的目录里。产物目录 = 项目（缺口 A）。
     # 开工前先把这个文件夹清点一遍报给他：有什么、没什么。
     await _settle_output_dir(agent, hub, explicit_session=bool(session))
+    if agent.second_window:
+        console.print(
+            Panel(
+                Text(
+                    "这个文件夹已经有一个 Agent 窗口在用（它的对话、挂起的人审、模型锁归它）。\n"
+                    f"这个窗口另起了会话「{agent.session_store.name}」：项目设置从主窗口抄了一份，"
+                    "在这里改只对这个窗口生效；/auto 只能在主窗口开"
+                    "（两个窗口的流水线会重复派发渲染）。"
+                ),
+                title="第二个窗口",
+                border_style="yellow",
+            )
+        )
     _warn_store(agent)
     if getattr(agent, "local_materials", None) is not None:
         try:
@@ -836,6 +1009,8 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
             f"（涨到 {agent.memory.policy.evict_at} 轮批量驱逐）\n"
             f"skill {len(agent.skills.available)} 篇（改 skills/*.md 存盘即生效）\n"
             f"产线 [bold]{_line_label(agent)}[/]（短剧 / 抖音短视频 / 广告 / 设计，/type 可改）\n"
+            f"画幅 [bold]{aspect_label(agent.aspect_ratio)}[/]"
+            "（/ratio 可改：16:9 横屏 / 9:16 竖屏 / 1:1 方形）\n"
             f"产物目录 [bold]{agent.output_prefs.root}[/]"
             "（当前文件夹；生成的东西默认都落这里，/out 可改）\n"
             f"项目 [bold]{escape(agent.project_title)}[/] [dim]{agent.project}[/]"
@@ -852,7 +1027,9 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
             f"/brief 记忆简报   /skills 已加载的 skill 与能力区占用\n"
             f"模型请人审时会暂停等你决策：a 采纳（可带补充）· r 打回（必填理由）· j 退回\n"
             f"/auto on 后小节点人审自动采纳、大节点（剧本/视频生成/图片生成）仍问你一次，"
-            f"超出开工额度也仍问你，\n"
+            f"渲图 / 渲一集之前整批报价问你一次；\n"
+            f"按集流水在参考图渲完、第 1 集渲完各停一次，/auto go 放行；/auto stop 硬停"
+            f"（在跑的渲染当场取消）\n"
             f"挂起/撞线的活当场接着跑不用再发话触发（长剧批量出稿用），Ctrl+C 随时叫停\n"
             f"生成过程中照样能打字：会排队、本轮结束后自动发送；/stop 立即停止当前一轮，\n"
             f"/now <消息> 停止当前并立即发送这条；/queue 看排队、/queue clear 清空\n"
@@ -878,364 +1055,579 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
 
     # 上一轮怎么停下的。/auto on 要看它决定要不要把停下的活当场接着跑。
     last_result: LoopResult | None = None
+    loop_errors = 0  # 连续出错次数（读到一条输入就清零）
     try:
         while True:
             try:
-                text = await hub.next_message("\n[bold cyan]你[/] ")
-            except (EOFError, KeyboardInterrupt):
-                break
-
-            text = text.strip()
-            if not text:
-                continue
-            if text in {"/exit", "/quit"}:
-                break
-            if text.lower() in {"/help", "/?", "/帮助"}:
-                console.print(Panel(Text(help_text()), title="命令", border_style="cyan"))
-                continue
-            if text.startswith("/") and not known_command(text):
-                # 拼错的命令不当聊天发给模型（之前 /xxx 原样发出去，还会被当成要求去执行）
-                near = [c for c, _ in search(text.split(" ", 1)[0])][:4]
-                console.print(
-                    f"[yellow]没有这个命令：{escape(text.split(' ', 1)[0])}[/]"
-                    + (f"[dim]　是不是：{' '.join(near)}[/]" if near else "")
-                    + "[dim]　/help 看全部命令[/]"
-                )
-                continue
-            if text.lower() in {"/stop", "/pause", "/停", "/暂停", "/停止"}:
-                console.print("[dim]现在没有在跑的任务[/]")
-                continue
-            if text.lower() in {"/retry", "/重试", "/继续跑"}:
-                # 在**同一轮**里接着跑：网络中断、撞迭代上限之后用它，本轮进度不用重来
-                if agent.loop.pending_review is not None:
-                    console.print("[yellow]上一条人审还没结案，先对它做决定。[/]")
-                    continue
-                if last_result is None:
-                    console.print("[dim]没有可接着跑的轮次[/]")
-                    continue
-                if not (
-                    last_result.resumable
-                    or last_result.stop_reason
-                    in (StopReason.MAX_ITERATIONS, StopReason.BUDGET_EXCEEDED)
-                ):
-                    # 正常结束的、被内容过滤拦下的，接着跑只会让模型把同样的话再说一遍
-                    console.print(
-                        f"[dim]上一轮是「{last_result.stop_reason.value}」停的，没有可以接着跑的"
-                        " —— 直接说下一句话[/]"
-                    )
-                    continue
-                console.print("[dim]↻ 在同一轮接着跑…[/]")
-
-                async def _resume_same(turn: Any = last_result.turn) -> LoopResult:
-                    with board.running():
-                        return await agent.loop.continue_turn(turn)
-
                 try:
-                    again = await _watched(hub, _resume_same())
-                except KeyboardInterrupt:
-                    console.print("[yellow]已中断[/]")
+                    text = await hub.next_message("\n[bold cyan]你[/] ")
+                except (EOFError, KeyboardInterrupt):
+                    break
+
+                text = text.strip()
+                loop_errors = 0
+                if not text:
                     continue
-                if again is not None:
-                    _print_result(again)
-                    last_result = await _run_tail(agent, board, hub, again)
-                continue
-            if text.lower() == "/queue":
-                hub.print_queue()
-                continue
-            if text.lower() in {"/queue clear", "/queue 清空"}:
-                hub.pending.clear()
-                console.print("[dim]排队已清空[/]")
-                continue
-            if text == "/stat":
-                _print_stat(agent)
-                continue
-            if text == "/trace":
-                console.print(
-                    Panel(agent.trace.to_text(), title="执行痕迹", border_style="magenta")
-                )
-                console.print(f"[dim]{agent.trace.summary()}[/]")
-                continue
-            if text == "/mermaid":
-                console.print(
-                    Panel(
-                        agent.trace.to_mermaid(), title="自动生成的流程图", border_style="magenta"
-                    )
-                )
-                continue
-            if text == "/tools":
-                for m in agent.registry.catalog():
-                    console.print(f"  [dim]{m.permission.value:12}[/] {m.name} — {m.summary}")
-                continue
-            if text in ("/brief full", "/brief 整理"):
-                # 完整模式：规则版简报再交给子代理合并重复、标出矛盾（花一次模型调用）
-                if agent.mem_agent is None:
-                    console.print("[dim]没有装配记忆代理[/]")
+                if text in {"/exit", "/quit"}:
+                    break
+                if text.lower() in {"/help", "/?", "/帮助"}:
+                    console.print(Panel(Text(help_text()), title="命令", border_style="cyan"))
                     continue
-                with board.running():
-                    b = await agent.mem_agent.consolidate()
-                if b.empty:
-                    console.print("[dim]简报为空[/]")
-                else:
-                    console.print(Panel(Text(b.render()), title="Memory Brief（整理后）",
-                                        border_style="magenta"))
-                continue
-            if text == "/brief":
-                b = agent.mem_agent.brief() if agent.mem_agent else None
-                if b is None or b.empty:
-                    console.print("[dim]简报为空：没有约束、打回记录或偏好[/]")
-                else:
-                    console.print(Panel(Text(b.render()), title="Memory Brief",
-                                        border_style="magenta"))
-                continue
-            if text == "/skills":
-                if agent.allocator is None:
-                    console.print("[dim]没有装配能力预算[/]")
-                else:
-                    active = ", ".join(agent.allocator.active) or "无"
-                    console.print(f"[dim]已加载：{active}[/]")
-                    console.print(f"[dim]{agent.allocator.brief()}[/]")
-                continue
-            if text == "/budget" or text.startswith("/budget "):
-                arg = text[len("/budget"):].strip()
-                if agent.guard is None:
-                    console.print("[dim]没有装配 Cost Guard[/]")
-                elif arg == "reset":
-                    agent.guard.reset()
-                    agent.pipeline.kick()  # 预算恢复 → 流水线渲染刹车自动解除
+                if text.startswith("/") and not known_command(text):
+                    # 拼错的命令不当聊天发给模型（之前 /xxx 原样发出去，还会被当成要求去执行）
+                    near = [c for c, _ in search(text.split(" ", 1)[0])][:4]
                     console.print(
-                        "[dim]本次开工的用量已清零（额度不变）；"
-                        "台账里的单日 / 单项目累计不清 —— 撞的是那两级就用 /budget allow[/]"
+                        f"[yellow]没有这个命令：{escape(text.split(' ', 1)[0])}[/]"
+                        + (f"[dim]　是不是：{' '.join(near)}[/]" if near else "")
+                        + "[dim]　/help 看全部命令[/]"
                     )
-                elif arg.startswith("set"):
-                    changes = parse_budget(arg[len("set"):])
-                    if not changes:
-                        console.print(
-                            "[yellow]用法：/budget set 金额 300 视频秒 900 视频 80 图 100"
-                            "（写哪项改哪项）[/]"
-                        )
+                    continue
+                if text.lower().startswith(("/now ", "/插队 ")):
+                    # 空闲时没有队列可插：把 /now 去掉当普通一句话发（之前原样连 /now 发给模型）
+                    text = text.split(" ", 1)[1].strip()
+                    if not text:
                         continue
-                    agent.apply_budget({**agent.budget_defaults(), **changes})
-                    agent.pipeline.kick()
-                    console.print(f"[green]额度已改[/] [dim]{agent.guard.brief()}[/]")
-                elif arg.startswith("allow"):
-                    amount = arg[len("allow"):].strip() or "50"
-                    try:
-                        total = agent.guard.allow_more_money(float(amount))
-                    except ValueError:
-                        console.print("[yellow]用法：/budget allow 50（追加的金额，元）[/]")
+                if text.lower() in {"/stop", "/pause", "/停", "/暂停", "/停止"}:
+                    console.print("[dim]现在没有在跑的任务[/]")
+                    continue
+                if text.lower() in {"/retry", "/重试", "/继续跑"}:
+                    # 在**同一轮**里接着跑：网络中断、撞迭代上限之后用它，本轮进度不用重来
+                    if agent.loop.pending_review is not None:
+                        console.print("[yellow]上一条人审还没结案，先对它做决定。[/]")
                         continue
-                    agent.pipeline.kick()
-                    console.print(
-                        f"[green]已临时追加 ¥{float(amount):.0f}[/]"
-                        f"[dim]（本次会话累计追加 ¥{total:.0f}，配置不变）[/]"
-                    )
-                else:
-                    console.print(f"[dim]{agent.guard.brief()}[/]")
-                continue
-            if text == "/auto" or text.startswith("/auto "):
-                arg = text[len("/auto"):].strip().lower()
-                if arg in {"on", "开"}:
-                    agent.loop.auto_review = True
-                    agent.pipeline.enabled = True
-                    agent.pipeline.on_enable()  # 扫存量剧本按批补派，on 之前写的不漏
-                elif arg in {"off", "关"}:
-                    agent.loop.auto_review = False
-                    agent.pipeline.enabled = False  # 在跑的跑完，不再派新任务
-                elif arg in {"retry", "重试"}:
-                    # 失败的环节之前只在重启后才会重派（2026-09-23 审查）
-                    keys = agent.pipeline.retry()
-                    if not keys:
-                        console.print("[dim]流水线没有失败的环节[/]")
-                    else:
-                        names = escape("、".join(keys))
-                        off = "" if agent.pipeline.enabled else "（/auto 没开，开了才派）"
-                        console.print(
-                            f"[green]重派 {len(keys)} 个失败的环节[/]：{names}  [yellow]{off}[/]"
-                        )
-                    continue
-                elif arg:
-                    console.print(
-                        "[yellow]用法：/auto on 开 · /auto off 关 · /auto retry 重派失败的环节[/]"
-                    )
-                    continue
-                if not agent.loop.auto_review:
-                    console.print("[dim]自动模式已关：每条人审都会停下来问你，流水线暂停派发。[/]")
-                    continue
-                console.print(
-                    "[green]自动模式已开[/]：小节点人审自动采纳不再逐条问你，"
-                    "每条决策都会打印出来；大节点（剧本/视频生成/图片生成）"
-                    "仍会停下来等你拍板一次。\n"
-                    "[dim]按集流水已开：每落一集剧本就拆这一集的分镜；全剧齐后拆资产库、"
-                    "渲参考图，再逐集出提示词、渲染（渲染仍受预算闸约束）。\n"
-                    "随时 Ctrl+C 打断，/auto off 回到逐条确认。"
-                    "注意：L-external 不可逆操作与预算超限也仍会问你。[/]"
-                )
-                # 开 auto 这一刻就该自己跑起来，不用再发一句话触发：
-                # · 有挂着的人审 → 按采纳结案续跑
-                # · 上一轮撞单轮迭代上限停下 → 同一轮接着跑
-                # （预算超限仍由人拍板，不自动续 —— 钱是最后一道闸）
-                resumed: LoopResult | None = None
-
-                async def _auto_resume() -> LoopResult:
-                    with board.running():
-                        return await agent.loop.resume_turn("adopt", decided_by="auto")
-
-                async def _auto_continue(turn: Any) -> LoopResult:
-                    with board.running():
-                        return await agent.loop.continue_turn(turn)
-
-                try:
-                    pending = agent.loop.pending_review
-                    if pending is not None and agent.loop._is_major_review(pending):  # noqa: SLF001
-                        # 大节点（换模型、剧本、视频生成）开了 /auto 也要人定 —— 之前这里一律按采纳
-                        # 结案，挂着的「换视频模型」就这么被换了（2026-09-23 审查）
-                        console.print(
-                            "[yellow]挂着的人审是大节点，仍需你来定：发任意一句话会先问它[/]"
-                        )
-                    elif pending is not None:
-                        console.print("[dim]↻ 有挂起的人审，按采纳结案继续跑[/]")
-                        resumed = await _watched(hub, _auto_resume())
-                    elif (
-                        last_result is not None
-                        and last_result.stop_reason is StopReason.MAX_ITERATIONS
+                    if last_result is None:
+                        console.print("[dim]没有可接着跑的轮次[/]")
+                        continue
+                    if not (
+                        last_result.resumable
+                        or last_result.stop_reason
+                        in (StopReason.MAX_ITERATIONS, StopReason.BUDGET_EXCEEDED)
                     ):
-                        console.print("[dim]↻ 上一轮撞迭代上限停下，同一轮自动续跑[/]")
-                        resumed = await _watched(hub, _auto_continue(last_result.turn))
+                        # 正常结束的、被内容过滤拦下的，接着跑只会让模型把同样的话再说一遍
+                        console.print(
+                            f"[dim]上一轮是「{last_result.stop_reason.value}」停的，没有可以接着跑的"
+                            " —— 直接说下一句话[/]"
+                        )
+                        continue
+                    console.print("[dim]↻ 在同一轮接着跑…[/]")
+
+                    async def _resume_same(turn: Any = last_result.turn) -> LoopResult:
+                        with board.running():
+                            return await agent.loop.continue_turn(turn)
+
+                    try:
+                        again = await _watched(hub, _resume_same())
+                    except KeyboardInterrupt:
+                        console.print("[yellow]已中断[/]")
+                        continue
+                    if again is not None:
+                        _print_result(again)
+                        last_result = await _run_tail(agent, board, hub, again)
+                    continue
+                if text.lower() == "/queue":
+                    hub.print_queue()
+                    continue
+                if text.lower() in {"/queue clear", "/queue 清空"}:
+                    hub.pending.clear()
+                    console.print("[dim]排队已清空[/]")
+                    continue
+                if text == "/stat":
+                    _print_stat(agent)
+                    continue
+                if text == "/trace":
+                    console.print(
+                        Panel(agent.trace.to_text(), title="执行痕迹", border_style="magenta")
+                    )
+                    console.print(f"[dim]{agent.trace.summary()}[/]")
+                    continue
+                if text == "/mermaid":
+                    console.print(
+                        Panel(
+                            agent.trace.to_mermaid(),
+                            title="自动生成的流程图",
+                            border_style="magenta",
+                        )
+                    )
+                    continue
+                if text == "/tools":
+                    for m in agent.registry.catalog():
+                        console.print(f"  [dim]{m.permission.value:12}[/] {m.name} — {m.summary}")
+                    continue
+                if text in ("/brief full", "/brief 整理"):
+                    # 完整模式：规则版简报再交给子代理合并重复、标出矛盾（花一次模型调用）
+                    if agent.mem_agent is None:
+                        console.print("[dim]没有装配记忆代理[/]")
+                        continue
+                    with board.running():
+                        b = await agent.mem_agent.consolidate()
+                    if b.empty:
+                        console.print("[dim]简报为空[/]")
+                    else:
+                        console.print(Panel(Text(b.render()), title="Memory Brief（整理后）",
+                                            border_style="magenta"))
+                    continue
+                if text == "/brief":
+                    b = agent.mem_agent.brief() if agent.mem_agent else None
+                    if b is None or b.empty:
+                        console.print("[dim]简报为空：没有约束、打回记录或偏好[/]")
+                    else:
+                        console.print(Panel(Text(b.render()), title="Memory Brief",
+                                            border_style="magenta"))
+                    continue
+                if text in ("/remember", "/记住") or text.startswith(("/remember ", "/记住 ")):
+                    # 人亲口定的规则：这个项目每轮都带上（2026-09-26）。之前对话里说的规则只被
+                    # 记忆提取当成「推测」，从不 pin；打回理由反而永久 pin
+                    await _remember(agent, text.split(" ", 1)[1].strip() if " " in text else "")
+                    continue
+                if text in ("/forget", "/忘掉") or text.startswith(("/forget ", "/忘掉 ")):
+                    await _forget(agent, hub, text.split(" ", 1)[1].strip() if " " in text else "")
+                    continue
+                if text == "/skills":
+                    if agent.allocator is None:
+                        console.print("[dim]没有装配能力预算[/]")
+                    else:
+                        active = ", ".join(agent.allocator.active) or "无"
+                        console.print(f"[dim]已加载：{active}[/]")
+                        console.print(f"[dim]{agent.allocator.brief()}[/]")
+                    continue
+                if text == "/budget" or text.startswith("/budget "):
+                    arg = text[len("/budget"):].strip()
+                    if agent.guard is None:
+                        console.print("[dim]没有装配 Cost Guard[/]")
+                    elif arg == "reset":
+                        agent.guard.reset()
+                        agent.pipeline.kick()  # 预算恢复 → 流水线渲染刹车自动解除
+                        console.print(
+                            "[dim]本次开工的用量已清零（额度不变）；"
+                            "台账里的单日 / 单项目累计不清 —— 撞的是那两级就用 /budget allow[/]"
+                        )
+                    elif arg.startswith("set"):
+                        changes = parse_budget(arg[len("set"):])
+                        if not changes:
+                            console.print(
+                                "[yellow]用法：/budget set 金额 300 视频秒 900 视频 80 图 100"
+                                "（写哪项改哪项）[/]"
+                            )
+                            continue
+                        agent.apply_budget({**agent.budget_defaults(), **changes})
+                        agent.pipeline.kick()
+                        console.print(f"[green]额度已改[/] [dim]{agent.guard.brief()}[/]")
+                    elif arg.startswith("allow"):
+                        amount = arg[len("allow"):].strip() or "50"
+                        more = parse_budget(amount) if not _is_number(amount) else {}
+                        if more:
+                            # 「/budget allow 视频 20 视频秒 300 图 10」：本次开工和单日口径一起抬
+                            # （单日次数上限之前没有任何出口，撞上就永久暂停，2026-09-24 审查）
+                            parts: list[str] = []
+                            if "video_calls" in more or "video_seconds" in more:
+                                agent.guard.allow_more(
+                                    "video", n=int(more.get("video_calls", 0)),
+                                    seconds=float(more.get("video_seconds", 0.0)),
+                                )
+                                if more.get("video_calls"):
+                                    parts.append(f"视频 {int(more['video_calls'])} 段")
+                                if more.get("video_seconds"):
+                                    parts.append(f"视频 {int(more['video_seconds'])} 秒")
+                            if "image_calls" in more:
+                                agent.guard.allow_more("image", n=int(more["image_calls"]))
+                                parts.append(f"图片 {int(more['image_calls'])} 张")
+                            if "money" in more:
+                                agent.guard.allow_more_money(float(more["money"]))
+                                parts.append(f"金额 ¥{float(more['money']):.0f}")
+                            agent.pipeline.kick()
+                            console.print(
+                                f"[green]已临时追加：{'、'.join(parts)}[/]"
+                                "[dim]（本次开工与单日口径一起抬，配置不变）[/]"
+                            )
+                            continue
+                        try:
+                            total = agent.guard.allow_more_money(float(amount))
+                        except ValueError:
+                            console.print(
+                                "[yellow]用法：/budget allow 50（追加金额，元）或 "
+                                "/budget allow 视频 20 视频秒 300 图 10[/]"
+                            )
+                            continue
+                        agent.pipeline.kick()
+                        console.print(
+                            f"[green]已临时追加 ¥{float(amount):.0f}[/]"
+                            f"[dim]（本次会话累计追加 ¥{total:.0f}，配置不变）[/]"
+                        )
+                    else:
+                        console.print(f"[dim]{agent.guard.brief()}[/]")
+                    continue
+                if text == "/auto" or text.startswith("/auto "):
+                    arg = text[len("/auto"):].strip().lower()
+                    if arg in {"on", "开"} and agent.second_window:
+                        console.print(f"[yellow]{_SECOND_WINDOW_AUTO}[/]")
+                        continue
+                    if arg in {"on", "开"}:
+                        agent.loop.auto_review = True
+                        agent.pipeline.enabled = True
+                        agent.pipeline.on_enable()  # 扫存量剧本按批补派，on 之前写的不漏
+                    elif arg in {"off", "关"}:
+                        agent.loop.auto_review = False
+                        agent.pipeline.enabled = False  # 在跑的跑完，不再派新任务
+                        if agent.pipeline.busy:
+                            console.print(
+                                "[dim]流水线上在跑的环节会跑完；要当场停掉用 /auto stop[/]"
+                            )
+                    elif arg in {"stop", "停"}:
+                        # 硬停（2026-09-26 用户定的）：/auto off 让在跑的跑完，两集并行时还有
+                        # 几十段照渲照付
+                        agent.loop.auto_review = False
+                        n = agent.pipeline.stop()
+                        console.print(
+                            f"[yellow]■ 流水线已停[/]：取消了 {n} 个在跑的环节，不再派新活。"
+                            "[dim]已经提交的渲染任务留在台账上，"
+                            "下次 /auto on 重渲这一集时按段取回，"
+                            "不重付。[/]"
+                            if n else "[yellow]■ 流水线已停[/][dim]（没有在跑的环节）[/]"
+                        )
+                        continue
+                    elif arg in {"go", "放行", "继续"}:
+                        what = agent.pipeline.pass_gate()
+                        if not what:
+                            console.print("[dim]流水线现在没有停在停点上[/]")
+                        elif not agent.pipeline.enabled:
+                            console.print(
+                                f"[green]已放行[/]（{escape(what)}）"
+                                "[yellow]/auto 没开，开了才派[/]"
+                            )
+                        else:
+                            console.print(f"[green]已放行[/]：{escape(what)}")
+                        continue
+                    elif arg in {"retry", "重试"}:
+                        # 失败的环节之前只在重启后才会重派（2026-09-23 审查）
+                        keys = agent.pipeline.retry()
+                        if not keys:
+                            console.print("[dim]流水线没有失败的环节[/]")
+                        else:
+                            names = escape("、".join(keys))
+                            off = "" if agent.pipeline.enabled else "（/auto 没开，开了才派）"
+                            console.print(
+                                f"[green]重派 {len(keys)} 个失败的环节[/]：{names}  "
+                                f"[yellow]{off}[/]"
+                            )
+                        continue
+                    elif arg:
+                        console.print(
+                            "[yellow]用法：/auto on 开 · /auto off 关（在跑的跑完）· "
+                            "/auto stop 硬停（在跑的当场取消）· /auto go 放行停点 · "
+                            "/auto retry 重派失败的环节[/]"
+                        )
+                        continue
+                    if not agent.loop.auto_review:
+                        console.print("[dim]自动模式已关：每条人审都会停下来问你，流水线暂停派发。[/]")
+                        continue
+                    console.print(
+                        "[green]自动模式已开[/]：小节点人审自动采纳不再逐条问你，"
+                        "每条决策都会打印出来；大节点（剧本/视频生成/图片生成）"
+                        "仍会停下来等你拍板一次。\n"
+                        "[dim]按集流水已开：每落一集剧本就拆这一集的分镜；全剧齐后拆资产库、"
+                        "渲参考图，再逐集出提示词、渲染。渲参考图、渲每一集之前整批报价问你一次。\n"
+                        "两个停点：参考图渲完停一次（看脸，可以说「定音」给角色定音色）、"
+                        "第 1 集单独渲、"
+                        "渲完停一次（看片）；都用 /auto go 放行，之后其余各集自动并行渲。\n"
+                        "随时 Ctrl+C 打断，/auto off 回到逐条确认（在跑的跑完），"
+                        "/auto stop 当场硬停。"
+                        "注意：L-external 不可逆操作与预算超限也仍会问你。[/]"
+                    )
+                    if agent.pipeline.holding:
+                        console.print(f"[yellow]{escape(agent.pipeline.holding)}[/]")
+                    # 开 auto 这一刻就该自己跑起来，不用再发一句话触发：
+                    # · 有挂着的人审 → 按采纳结案续跑
+                    # · 上一轮撞单轮迭代上限停下 → 同一轮接着跑
+                    # （预算超限仍由人拍板，不自动续 —— 钱是最后一道闸）
+                    resumed: LoopResult | None = None
+
+                    async def _auto_resume() -> LoopResult:
+                        with board.running():
+                            return await agent.loop.resume_turn("adopt", decided_by="auto")
+
+                    async def _auto_continue(turn: Any) -> LoopResult:
+                        with board.running():
+                            return await agent.loop.continue_turn(turn)
+
+                    try:
+                        pending = agent.loop.pending_review
+                        if pending is not None and agent.loop._is_major_review(pending):  # noqa: SLF001
+                            # 大节点（换模型、剧本、视频生成）开了 /auto 也要人定 ——
+                            # 之前这里一律按采纳结案，挂着的「换视频模型」就这么被换了
+                            # （2026-09-23 审查）
+                            console.print(
+                                "[yellow]挂着的人审是大节点，仍需你来定：发任意一句话会先问它[/]"
+                            )
+                        elif pending is not None:
+                            console.print("[dim]↻ 有挂起的人审，按采纳结案继续跑[/]")
+                            resumed = await _watched(hub, _auto_resume())
+                        elif (
+                            last_result is not None
+                            and last_result.stop_reason is StopReason.MAX_ITERATIONS
+                        ):
+                            console.print("[dim]↻ 上一轮撞迭代上限停下，同一轮自动续跑[/]")
+                            resumed = await _watched(hub, _auto_continue(last_result.turn))
+                    except KeyboardInterrupt:
+                        console.print("[yellow]已中断[/]")
+                        continue
+                    if resumed is not None:
+                        _print_result(resumed)
+                        last_result = await _run_tail(agent, board, hub, resumed)
+                    continue
+                if text == "/rename" or text.startswith("/rename "):
+                    # 已生成的图/视频改成带序号的可读文件名；/rename dry 只看计划
+                    arg = text[len("/rename"):].strip().lower()
+                    root = agent.output_prefs.root
+                    plan = await asyncio.to_thread(plan_renames, agent.assets, root)
+                    if not plan:
+                        console.print(f"[dim]{root} 里没有需要改名的文件[/]")
+                        continue
+                    for r in plan:
+                        console.print(
+                            f"  [dim]{r.old.name}[/] → [bold]{r.new.name}[/]  "
+                            f"[dim]{r.why} · {r.asset_id}[/]"
+                        )
+                    if arg in {"dry", "预览", "--dry-run"}:
+                        console.print(f"[dim]预览 {len(plan)} 项，未改动。/rename 执行[/]")
+                        continue
+                    report = await asyncio.to_thread(apply_renames, agent.assets, plan)
+                    manifest = await asyncio.to_thread(write_manifest, agent.assets, root)
+                    console.print(
+                        f"[green]已改名 {len(report.done)} 个文件[/]"
+                        + (f"[dim]，清单 {manifest}[/]" if manifest else "")
+                    )
+                    if report.failed:
+                        console.print(
+                            f"[yellow]{len(report.failed)} 个没改成：[/]\n{report.render_failed()}"
+                        )
+                    continue
+                if text in ("/type", "/line") or text.startswith(("/type ", "/line ")):
+                    arg = text.split(" ", 1)[1].strip() if " " in text else ""
+                    if not arg:
+                        console.print(
+                            f"[dim]当前产线：{_line_label(agent)}[/]\n{lines_menu()}\n"
+                            "[dim]/type <序号或名字> 切换，/type off 不限定[/]"
+                        )
+                        continue
+                    if is_off(arg):
+                        agent.set_content_line("")
+                        console.print("[green]产线已改为：不限定[/]")
+                        continue
+                    chosen = parse_line(arg)
+                    if chosen is None:
+                        console.print("[yellow]没认出来。可选：短剧 / 抖音短视频 / 广告 / 设计[/]")
+                        continue
+                    agent.set_content_line(chosen.key)
+                    console.print(
+                        f"[green]产线已改为：{chosen.label}[/] [dim]（本会话记住，重启沿用）[/]"
+                    )
+                    continue
+                if text in ("/ratio", "/比例", "/画幅") or text.startswith(
+                    ("/ratio ", "/比例 ", "/画幅 ")
+                ):
+                    arg = text.split(" ", 1)[1].strip() if " " in text else ""
+                    if arg.lower() in ("reset", "默认", "off"):
+                        agent.set_aspect_ratio(None)
+                        console.print(f"[green]画幅已恢复默认[/] [dim]{_ratio_brief(agent)}[/]")
+                        continue
+                    if arg:
+                        ratio = parse_aspect(arg)
+                        if not ratio:
+                            console.print(
+                                f"[yellow]用法：/ratio 16:9（可选 {' / '.join(VIDEO_ASPECTS)}，"
+                                "也可以写 横屏 / 竖屏 / 方形）· /ratio reset 恢复默认[/]"
+                            )
+                            continue
+                        lock = getattr(agent.media_fns, "video_lock", "") or ""
+                        listed = supported_aspects(agent.catalog, lock) if lock else []
+                        if listed and ratio not in listed:
+                            console.print(
+                                f"[yellow]锁定的视频模型 {lock} 不支持 {ratio}"
+                                f"（支持 {' / '.join(listed)}）。换一个比例，"
+                                "或先在对话里说要换哪个视频模型[/]"
+                            )
+                            continue
+                        agent.set_aspect_ratio(ratio)
+                        console.print(
+                            f"[green]这个项目的视频改成 {aspect_label(ratio)}[/] "
+                            "[dim]短剧渲染、短视频出片、gen_video 没传比例时都按它"
+                            "（本项目记住，重启沿用）。\n已经渲好的片段是原来的比例，"
+                            "不会被拼进新比例的成片，会按新比例重新生成[/]"
+                        )
+                        continue
+                    console.print(
+                        f"[dim]{_ratio_brief(agent)}（/ratio 16:9 改，/ratio reset 恢复默认）[/]"
+                    )
+                    continue
+                if text in ("/cut", "/镜头") or text.startswith(("/cut ", "/镜头 ")):
+                    # 镜头超 3 秒拦不拦成片（2026-09-27 用户定的：先只标，第 1 集抽看过再定）
+                    arg = text.split(" ", 1)[1].strip().lower() if " " in text else ""
+                    if arg in ("拦", "on", "block"):
+                        agent.set_cut_block(True)
+                    elif arg in ("标", "off", "mark"):
+                        agent.set_cut_block(False)
+                    elif arg:
+                        console.print(
+                            "[yellow]用法：/cut 拦（超 3 秒不进成片）· /cut 标（只标出来）[/]"
+                        )
+                        continue
+                    console.print(f"[dim]{_cut_brief(agent)}[/]")
+                    continue
+                if text in ("/length", "/集长") or text.startswith(("/length ", "/集长 ")):
+                    arg = text.split(" ", 1)[1].strip() if " " in text else ""
+                    if arg.lower() in ("reset", "默认", "off"):
+                        agent.set_episode_minutes(None)
+                        console.print(f"[green]集长已恢复默认[/] [dim]{_length_brief(agent)}[/]")
+                        continue
+                    if arg.lower() in ("auto", "自动", "跟剧本", "按剧本"):
+                        agent.set_episode_minutes(None, auto=True)
+                        console.print(
+                            "[green]这个项目的集长改成跟剧本走[/] "
+                            f"[dim]{_length_brief(agent)}"
+                            "\n拆分镜时不再要求凑到某个时长，"
+                            "只查台词念不念得完、单镜 ≤3 秒、开场高潮点；"
+                            "视频提示词的时长跟着分镜走。已经拆好的不会自动重做[/]"
+                        )
+                        continue
+                    if arg:
+                        try:
+                            minutes = float(arg.removesuffix("分钟").removesuffix("分"))
+                        except ValueError:
+                            minutes = 0.0
+                        if not 1 <= minutes <= 30:
+                            console.print(
+                                "[yellow]用法：/length 8（1–30 分钟）· /length auto（跟剧本走）"
+                                " · /length reset[/]"
+                            )
+                            continue
+                        agent.set_episode_minutes(minutes)
+                        console.print(
+                            f"[green]这个项目一集改成 {minutes:g} 分钟[/] "
+                            f"[dim]{_length_brief(agent)}"
+                            "\n已经拆好的分镜 / 视频提示词不会自动重做；"
+                            "要按新集长重拆哪一集，跟我说一声。"
+                            "\n每集要生成的视频段数跟着变，开工额度不够时用 /budget set 调[/]"
+                        )
+                        continue
+                    console.print(
+                        f"[dim]{_length_brief(agent)}（/length 8 改，/length auto 跟剧本走，"
+                        "/length reset 恢复默认）[/]"
+                    )
+                    continue
+                if text == "/out" or text.startswith("/out "):
+                    arg = text[len("/out"):].strip().strip('"')
+                    if not arg:
+                        console.print(f"[dim]产物目录：{agent.output_prefs.root}[/]")
+                        continue
+                    try:
+                        p = await asyncio.to_thread(_ensure_dir, arg)
+                    except OSError as e:
+                        console.print(f"[red]目录不可用：{e}[/]")
+                        continue
+                    before = agent.session_store.name if agent.session_store else ""
+                    try:
+                        # 换项目 = 换会话（2026-09-26 用户定的）：对话窗口和项目设置跟着换
+                        key = agent.switch_project(p, session=True)
+                    except RuntimeError as e:
+                        console.print(f"[yellow]{e}[/]")
+                        continue
+                    swapped = bool(agent.session_store) and agent.session_store.name != before
+                    if swapped:
+                        await agent.restore_skills()
+                        last_result = None  # 上一轮是旧项目的，/retry 不能拿它在新项目里接着跑
+                    console.print(
+                        f"[green]产物目录已改为 {p}[/]，"
+                        f"项目 [bold]{escape(agent.project_title)}[/] "
+                        f"[dim]{key}（资产 / 记忆 / 单项目预算都换成这个项目的）[/]"
+                    )
+                    if swapped:
+                        n = len(agent.memory.turns)
+                        console.print(
+                            "[dim]对话也换成这个项目的"
+                            + (f"（接上它上次的 {n} 轮）" if n else "（这个项目还没有对话）")
+                            + "，原来的对话存回原项目，/out 回去就接着聊。"
+                            f"\n产线 {_line_label(agent)} · {_length_brief(agent)} · "
+                            f"{_ratio_brief(agent)} · 视频模型 "
+                            f"{getattr(agent.media_fns, 'video_lock', '') or '未锁定'} · 生图模型 "
+                            f"{getattr(agent.media_fns, 'image_lock', '') or '未锁定'}[/]"
+                        )
+                        if agent.loop.pending_review is not None:
+                            console.print("[yellow]这个项目有一条挂着的人审，下一条输入会先问它[/]")
+                    continue
+                if text == "/rollback" or text.startswith("/rollback "):
+                    target = text[len("/rollback"):].strip()
+                    if not target:
+                        console.print(
+                            "[yellow]用法：/rollback <资产id>。"
+                            "先用 /trace 或让模型 list_assets 找到 id[/]"
+                        )
+                        continue
+                    plan = await agent.rollback(target)
+                    if not plan.get("ok"):
+                        console.print(f"[red]{escape(str(plan.get('error')))}[/]")
+                        continue
+                    console.print(
+                        Panel(
+                            f"{plan['note']}\n\n"
+                            f"[dim]作废调用 {len(plan['supersede'])} 次 · "
+                            f"丢弃资产 {', '.join(plan['lost_assets']) or '无'} · "
+                            f"下一句话模型会以此为起点[/]",
+                            title="已回退",
+                            border_style="magenta",
+                        )
+                    )
+                    continue
+
+                console.print()
+
+                async def _turn(user_text: str) -> LoopResult:
+                    with board.running():
+                        return await agent.chat(user_text)
+
+                try:
+                    if agent.loop.pending_review is not None:
+                        # 上一条人审没结案（比如上次决策时被打断）。带着挂起的
+                        # tool_calls 开新轮，上下文缺 tool 响应，API 会 400。
+                        console.print("[yellow]上一条人审还没结案，先对它做决定。[/]")
+                        result = await _decide_review(agent, board, hub)
+                    else:
+                        result = await _watched(hub, _turn(text))
+                    if result is None:
+                        last_result = None
+                        continue
+                    _print_result(result)
+                    last_result = await _run_tail(agent, board, hub, result)
                 except KeyboardInterrupt:
                     console.print("[yellow]已中断[/]")
                     continue
-                if resumed is not None:
-                    _print_result(resumed)
-                    last_result = await _run_tail(agent, board, hub, resumed)
-                continue
-            if text == "/rename" or text.startswith("/rename "):
-                # 已生成的图/视频改成带序号的可读文件名；/rename dry 只看计划
-                arg = text[len("/rename"):].strip().lower()
-                root = agent.output_prefs.root
-                plan = await asyncio.to_thread(plan_renames, agent.assets, root)
-                if not plan:
-                    console.print(f"[dim]{root} 里没有需要改名的文件[/]")
-                    continue
-                for r in plan:
+                except Exception as e:  # noqa: BLE001 — 任何没接住的异常都不许把整个 chat 带走
+                    # 2026-09-23 审查：之前一个 MarkupError / 渲染异常就直接退出 chat，挂着的人审
+                    # 只在内存里、跟着丢了。现在报出来、存快照、回到输入
                     console.print(
-                        f"  [dim]{r.old.name}[/] → [bold]{r.new.name}[/]  "
-                        f"[dim]{r.why} · {r.asset_id}[/]"
+                        f"[red]这一轮出错了：{escape(type(e).__name__)}: {escape(str(e)[:300])}[/]"
+                        "\n[dim]对话现场已保存，可以接着说；反复出现请把这段报错发给维护者[/]"
                     )
-                if arg in {"dry", "预览", "--dry-run"}:
-                    console.print(f"[dim]预览 {len(plan)} 项，未改动。/rename 执行[/]")
-                    continue
-                report = await asyncio.to_thread(apply_renames, agent.assets, plan)
-                manifest = await asyncio.to_thread(write_manifest, agent.assets, root)
-                console.print(
-                    f"[green]已改名 {len(report.done)} 个文件[/]"
-                    + (f"[dim]，清单 {manifest}[/]" if manifest else "")
-                )
-                if report.failed:
-                    console.print(
-                        f"[yellow]{len(report.failed)} 个没改成：[/]\n{report.render_failed()}"
-                    )
-                continue
-            if text in ("/type", "/line") or text.startswith(("/type ", "/line ")):
-                arg = text.split(" ", 1)[1].strip() if " " in text else ""
-                if not arg:
-                    console.print(
-                        f"[dim]当前产线：{_line_label(agent)}[/]\n{lines_menu()}\n"
-                        "[dim]/type <序号或名字> 切换，/type off 不限定[/]"
-                    )
-                    continue
-                if is_off(arg):
-                    agent.set_content_line("")
-                    console.print("[green]产线已改为：不限定[/]")
-                    continue
-                chosen = parse_line(arg)
-                if chosen is None:
-                    console.print("[yellow]没认出来。可选：短剧 / 抖音短视频 / 广告 / 设计[/]")
-                    continue
-                agent.set_content_line(chosen.key)
-                console.print(
-                    f"[green]产线已改为：{chosen.label}[/] [dim]（本会话记住，重启沿用）[/]"
-                )
-                continue
-            if text == "/out" or text.startswith("/out "):
-                arg = text[len("/out"):].strip().strip('"')
-                if not arg:
-                    console.print(f"[dim]产物目录：{agent.output_prefs.root}[/]")
-                    continue
-                try:
-                    p = await asyncio.to_thread(_ensure_dir, arg)
-                except OSError as e:
-                    console.print(f"[red]目录不可用：{e}[/]")
-                    continue
-                try:
-                    key = agent.switch_project(p)
-                except RuntimeError as e:
-                    console.print(f"[yellow]{e}[/]")
-                    continue
-                console.print(
-                    f"[green]产物目录已改为 {p}[/]，项目 [bold]{escape(agent.project_title)}[/] "
-                    f"[dim]{key}（资产 / 记忆 / 单项目预算都换成这个项目的；本会话记住）[/]"
-                )
-                continue
-            if text == "/rollback" or text.startswith("/rollback "):
-                target = text[len("/rollback"):].strip()
-                if not target:
-                    console.print(
-                        "[yellow]用法：/rollback <资产id>。"
-                        "先用 /trace 或让模型 list_assets 找到 id[/]"
-                    )
-                    continue
-                plan = await agent.rollback(target)
-                if not plan.get("ok"):
-                    console.print(f"[red]{plan.get('error')}[/]")
-                    continue
-                console.print(
-                    Panel(
-                        f"{plan['note']}\n\n"
-                        f"[dim]作废调用 {len(plan['supersede'])} 次 · "
-                        f"丢弃资产 {', '.join(plan['lost_assets']) or '无'} · "
-                        f"下一句话模型会以此为起点[/]",
-                        title="已回退",
-                        border_style="magenta",
-                    )
-                )
-                continue
-
-            console.print()
-
-            async def _turn(user_text: str) -> LoopResult:
-                with board.running():
-                    return await agent.chat(user_text)
-
-            try:
-                if agent.loop.pending_review is not None:
-                    # 上一条人审没结案（比如上次决策时被打断）。带着挂起的
-                    # tool_calls 开新轮，上下文缺 tool 响应，API 会 400。
-                    console.print("[yellow]上一条人审还没结案，先对它做决定。[/]")
-                    result = await _decide_review(agent, board, hub)
-                else:
-                    result = await _watched(hub, _turn(text))
-                if result is None:
+                    try:
+                        agent.session_store.save(
+                            agent.memory, pending_review=agent.loop.pending_review
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     last_result = None
                     continue
-                _print_result(result)
-                last_result = await _run_tail(agent, board, hub, result)
-            except KeyboardInterrupt:
-                console.print("[yellow]已中断[/]")
-                continue
-            except Exception as e:  # noqa: BLE001 — 任何没接住的异常都不许把整个 chat 带走
-                # 2026-09-23 审查：之前一个 MarkupError / 渲染异常就直接退出 chat，挂着的人审
-                # 只在内存里、跟着丢了。现在报出来、存快照、回到输入
+            except EOFError:
+                break
+            except Exception as e:  # noqa: BLE001
+                # 命令处理（/rollback /rename /brief full /out …）或读输入时没接住的异常：报出来、
+                # 回到输入，不把整个 chat 带走（2026-09-24 复审：之前只有对话轮包了 try）。
+                # 连读输入都接连出错（输入枢纽坏了）就别硬撑，免得刷屏死循环
+                loop_errors += 1
                 console.print(
-                    f"[red]这一轮出错了：{escape(type(e).__name__)}: {escape(str(e)[:300])}[/]"
-                    "\n[dim]对话现场已保存，可以接着说；反复出现请把这段报错发给维护者[/]"
+                    f"[red]出错了：{escape(type(e).__name__)}: {escape(str(e)[:300])}[/]"
+                    "\n[dim]回到输入；反复出现请把这段报错发给维护者[/]"
                 )
-                try:
-                    agent.session_store.save(
-                        agent.memory, pending_review=agent.loop.pending_review
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                last_result = None
+                if loop_errors >= 5:
+                    raise
                 continue
 
         _print_stat(agent)
@@ -1270,6 +1662,9 @@ def _print_stat(agent: Agent) -> None:
         f"折叠 {asm.last_folded} 处{'（应急档）' if asm.shrink else ''}[/]"
     )
     console.print(f"[dim]产线：{_line_label(agent)}（/type 可改）[/]")
+    console.print(f"[dim]集长：{_length_brief(agent)}（/length 可改）[/]")
+    console.print(f"[dim]画幅：{_ratio_brief(agent)}（/ratio 可改）[/]")
+    console.print(f"[dim]{_cut_brief(agent)}[/]")
     counts = agent.assets.projects()
     console.print(
         f"[dim]项目：{escape(agent.project_title)}（{agent.project}）· "
@@ -1279,6 +1674,9 @@ def _print_stat(agent: Agent) -> None:
         console.print(f"[dim]预算：{agent.guard.brief()}[/]")
     if agent.loop.auto_review:
         console.print("[dim]自动模式：开（小节点人审自动采纳，大节点仍问，/auto off 关闭）[/]")
+    notices = agent.pipeline.notices() if agent.pipeline is not None else ""
+    if notices:
+        console.print(f"[yellow]{escape(notices)}[/]")
     if agent.allocator is not None:
         console.print(f"[dim]{agent.allocator.brief()}[/]")
 

@@ -31,15 +31,23 @@ COMMANDS: tuple[tuple[str, str], ...] = (
     ("/mermaid", "导出流程图"),
     ("/skills", "已加载的 skill 与能力区占用"),
     ("/brief", "记忆简报"),
+    ("/remember", "记住一条规则（这个项目每轮都带上）：/remember 开头别写成硬广 · "
+                  "/remember 全局 … 所有项目 · /remember mem_xxx 认领旧记忆"),
+    ("/forget", "作废记忆：/forget 关键词 或 /forget mem_xxx（先列出来，你确认了才作废）"),
     ("/out", "改产物目录：/out E:\\西游记"),
     ("/type", "选产线：短剧 / 抖音短视频 / 广告 / 设计；/type off 不限定"),
     ("/line", "同 /type"),
+    ("/length", "这个项目一集几分钟：/length 8 · /length auto 跟剧本走 · /length reset 恢复默认"),
+    ("/ratio", "视频画幅：/ratio 16:9 横屏 · /ratio 9:16 竖屏 · /ratio 1:1 方形 · "
+               "/ratio reset 默认"),
+    ("/cut", "镜头超 3 秒：/cut 拦 不进成片（超了自动重生成 1 次）· /cut 标 只标出来（默认）"),
     ("/rename", "把已生成的图/视频改成带序号的可读文件名（/rename dry 只看计划）"),
     ("/rollback", "回退到某个资产版本重来：/rollback as_xxx"),
     ("/retry", "同一轮续跑（网络失败后不用重发话）"),
     ("/budget", "预算用量；/budget set 金额 300 视频秒 900 改额度；/budget allow 50 临时追加；"
                 "/budget reset 清零本次开工的用量"),
-    ("/auto", "自动人审：/auto on 打开、/auto off 关闭、/auto retry 重派流水线失败的环节"),
+    ("/auto", "自动人审：/auto on 打开、/auto off 关闭（在跑的跑完）、/auto stop 硬停、"
+              "/auto go 放行停点（参考图看脸 / 第 1 集看片）、/auto retry 重派失败的环节"),
     ("/stop", "停掉正在跑的这一轮"),
     ("/pause", "同 /stop"),
     ("/now", "停掉当前并插队发送：/now 先渲第 3 段"),
@@ -49,7 +57,8 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 # 同义的写法（中文、别名）：分发时认，补全菜单不列
 ALIASES: dict[str, str] = {
     "/停": "/stop", "/暂停": "/stop", "/停止": "/stop", "/重试": "/retry", "/继续跑": "/retry",
-    "/插队": "/now",
+    "/插队": "/now", "/集长": "/length", "/比例": "/ratio", "/画幅": "/ratio",
+    "/记住": "/remember", "/忘掉": "/forget", "/镜头": "/cut",
 }
 
 

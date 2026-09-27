@@ -7,25 +7,28 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from .capabilities.capability_budget import BudgetConfig, CapabilityAllocator
 from .capabilities.memory.agent import MemoryAgent
 from .capabilities.memory.recorder import RejectionRecorder
-from .capabilities.memory.session import SessionSnapshot
+from .capabilities.memory.session import SessionLock, open_session
 from .capabilities.memory.store import MemoryStore
 from .capabilities.retrieval import MemorySource, RetrievalHub, ToolSource
 from .capabilities.skill_hub import SkillHub
 from .capabilities.skill_hub.functions import SkillFunctions
 from .capabilities.subagents import SubAgentRunner
 from .domain.analytics import Feedback, MetricsStore, Reviewer
+from .domain.aspect import DEFAULT_ASPECT, aspect_label, orientation_of, parse_aspect
 from .domain.assets.store import AssetStatus, AssetStore
 from .domain.compliance import ComplianceChecker, ComplianceRules
 from .domain.distribution import Packager, PlatformCatalog
 from .domain.drama.card import CARD_PIN, build_project_card
-from .domain.drama.format import EpisodeFormat
+from .domain.drama.format import DEFAULT_FORMAT, EpisodeFormat, plan_length
 from .domain.functions.analytics import AnalyticsFunctions
 from .domain.functions.audio import AudioFunctions
 from .domain.functions.compliance import ComplianceFunctions
@@ -81,6 +84,8 @@ from .harness.tools.registry import ToolRegistry
 
 ROLLBACK_PIN = "rollback"
 BRIEF_PIN = "memory_brief"
+ASPECT_PIN = "project_aspect"  # 项目画幅（/ratio 设过才 pin）
+PIPELINE_PIN = "pipeline_notices"  # 按集流水等人处理的事（停点 / 失败 / 额度刹车）
 MATERIAL_SEARCH_TOOL = "material_lib__search_materials"
 
 
@@ -143,11 +148,24 @@ class Agent:
         self.metrics: Any = None  # M17 数据
         self.ledger: Any = None  # 成本台账（跨会话）
         self.session_store: Any = None  # 会话现场快照（create() 里装）
+        # 占着这份会话的锁；second_window = 这个文件夹已经有窗口在用，本窗口另起了会话
+        self.session_lock: SessionLock | None = None
+        self.second_window = False
         self.output_prefs: Any = None  # 产物目录偏好（create() 里装）
         self.local_materials: Any = None  # 产物目录 / 素材目录索引（create() 里装，每轮 pin 摘要）
         self.media_fns: Any = None  # 媒体工具（视频模型锁在它身上；create() 里装）
         self.pipeline: Any = None  # 按集流水管线（create() 里装，/auto on 打开）
         self.content_line: str = ""  # 用户选的产线标签（/type；create() 里从会话快照恢复）
+        # 一集的规格：base 是 config/drama.yaml 的默认，episode_fmt 是这个项目实际用的（/length）
+        self.base_episode_fmt: EpisodeFormat = DEFAULT_FORMAT
+        self.episode_fmt: EpisodeFormat = DEFAULT_FORMAT
+        self.drama_fns: Any = None  # 短剧三段式（按项目的集长要套到它身上）
+        self.episode_fns: Any = None  # 逐集写剧本（同上）
+        # 视频画幅（/ratio）：aspect_ratio 是生效的值，aspect_custom = 用户给这个项目设过
+        self.aspect_ratio: str = DEFAULT_ASPECT
+        self.aspect_custom = False
+        self.short_video_fns: Any = None  # 短视频出片（项目画幅套到它身上）
+        self.material_fns: Any = None  # 素材站搜索（按项目画幅挑横竖）
         self.workspace: Path | None = None  # 运行时产物目录（create() 里定）
         self.config_dir: Path = PROJECT_ROOT / "config"
         self.mcp = None  # type: ignore[assignment]  # setup() 里按需装配
@@ -264,7 +282,8 @@ class Agent:
         # 看图 / 看视频：图片直接给视觉模型，视频抽帧（可选转写音轨）；路径边界同上
         registry.register(VisionFunctions(gateway, assets, files, registry))
         # 抖音分支（2026-09-18）：关键词+风格 → RPA 热点 → 归纳成新内容 → 素材（问人 / 联网）→ 出片
-        registry.register(MaterialFunctions(assets, workspace))
+        material_fns = MaterialFunctions(assets, workspace)
+        registry.register(material_fns)
         short_video = ShortVideoFunctions(
             gateway, assets, registry, catalog, bus=bus, output=output_prefs, files=files,
             hosting=hosting,
@@ -293,6 +312,8 @@ class Agent:
             gateway, assets, registry, catalog, bus=bus, fmt=episode_fmt, hosting=hosting
         )
         drama.files = files  # drama_use_local_ref 登记本地图走同一套文件边界
+        # 重渲一段之前按段指纹找上次没等到的任务取回（含质检重生成的那次，2026-09-26）
+        drama.task_ledger = getattr(media_gw, "ledger", None)
         registry.register(drama)
         # 参考图门（2026-09-20 用户定的规则）：短剧镜头没带参考图不许直接用 gen_video 生成 ——
         # 真实事故：4 段渲染失败后模型自己改写用 gen_videos 无参考补生成，成片后半段人物全变脸
@@ -307,6 +328,10 @@ class Agent:
         pipeline = EpisodePipeline(
             registry, assets, bus, output_prefs, guard=guard, spec=episode_fmt.stamp
         )
+        # 两个停点（参考图看脸、第 1 集看片）的放行记录按项目键存盘，重启不用再点
+        pipeline.gates_path = workspace / "pipeline_gates.json"
+        # 没人可问时派发前的预算预检：按最坏情况（质检重生成）算、扣掉过了质检的段
+        pipeline.render_estimate = drama.render_need
         pipeline.attach()
         # M9：一个入口查历史内容 / 记忆 / 素材库。素材库来源走注册表里的 MCP 工具，
         # server 没连上就当没有这个来源
@@ -344,6 +369,9 @@ class Agent:
         gate = PermissionGate(bus, asker=asker, guard=guard)
         registry.gate = gate  # 公开 invoke() 从此过闸门
         dispatcher = ToolDispatcher(registry, gate, bus)
+        # 渲参考图 / 渲一集之前整批报价问人（2026-09-26 用户定的）：有人可问时流水线不再按额度
+        # 拦派发，由报价说清楚、人确认一次
+        pipeline.quotes = asker is not None
 
         # M10：子代理运行器。M8.2 的完整模式是它的第一个用例；
         # fan_out_candidates 用它并行出候选（P5）
@@ -373,20 +401,19 @@ class Agent:
         # 会话现场快照：同名 session 重启后接着上次聊。资产与长期记忆本来就
         # 落盘，会丢的只有滑窗原文。每个 LOOP_END 存一次，读写失败都不打断对话。
         # （订阅放在 loop 建好之后：挂起中的人审要一起存）
-        session_store = SessionSnapshot(workspace / "memory" / "sessions", session_id or "default")
+        # 同一份会话只给一个窗口：别的窗口占着就另起「名字~2」（设置从主会话抄，/auto 不开）
+        session_store, session_lock, second_window = open_session(
+            workspace / "memory" / "sessions", session_id or "default"
+        )
 
-        # 模型锁：会话记住的 > 短剧配置里用户指定的（media_models.yaml drama.video_model /
-        # image_model）。留空的 gen_video / gen_image 一律用它；要换的请求挂起问人，
-        # 人采纳（总线 CHECKPOINT_DECIDED）才换锁，换了写回会话快照，重启沿用。
-        media_fns.video_lock = session_store.video_model or str(
-            (catalog.drama or {}).get("video_model") or ""
-        )
-        media_fns.on_video_lock = session_store.set_video_model
-        media_fns.image_lock = session_store.image_model or str(
-            (catalog.drama or {}).get("image_model") or ""
-        )
-        media_fns.on_image_lock = session_store.set_image_model
+        # 模型锁（_apply_locks，agent 装好之后）：这个项目人定过的 > 按产线的默认。留空的
+        # gen_video / gen_image 一律用它；要换的请求挂起问人，人采纳（总线 CHECKPOINT_DECIDED）
+        # 才换锁，换了写回会话快照，重启沿用。
         bus.subscribe(media_fns.on_event)
+        # 出片确认只认人的采纳（2026-09-26）：confirm=true 要人在确认单上点过头才生效
+        bus.subscribe(short_video.on_event)
+        # 定音：人采纳了主角的独白段，才固定成音色锚点（2026-09-26）
+        bus.subscribe(drama.on_event)
 
         # 上下文预算 = 模型窗口 − 输出额度 − 余量。校准系数 1.4 是实测值
         # （Kimi 对「JSON 里的中文」低估四成），之后每次调用按真实 usage 自动修正。
@@ -413,15 +440,6 @@ class Agent:
             ),
         )
 
-        def _snapshot(ev: Any) -> None:
-            if ev.type is EventType.LOOP_END:
-                session_store.save(
-                    memory,
-                    pending_review=loop.pending_review,
-                    active_skills=list(getattr(allocator, "active", []) or []),
-                )
-
-        bus.subscribe(_snapshot)
         agent = cls(
             bus, config, gateway, registry, dispatcher, assembler, memory, loop, trace,
             assets, memories, skills, catalog, mem_agent, guard,
@@ -431,7 +449,13 @@ class Agent:
         agent.checker, agent.packager, agent.metrics = checker, packager, metrics
         agent.ledger = ledger
         agent.session_store = session_store
+        agent.session_lock, agent.second_window = session_lock, second_window
         agent.set_content_line(session_store.content_line, persist=False)
+        agent.drama_fns, agent.episode_fns = drama, episode_fns
+        agent.base_episode_fmt = episode_fmt
+        agent.set_episode_minutes(
+            session_store.episode_minutes or None, persist=False, auto=session_store.episode_auto
+        )
         agent.output_prefs = output_prefs
         agent.local_materials = local
         agent.media_fns = media_fns
@@ -441,7 +465,91 @@ class Agent:
         agent.project = project
         agent.recorder = recorder
         agent.memory_source = memory_source
+        agent.short_video_fns, agent.material_fns = short_video, material_fns
+        agent.set_aspect_ratio(session_store.aspect_ratio or None, persist=False)
+        agent.set_cut_block(session_store.cut_block, persist=False)
+        agent._apply_locks()
+        # 每个 LOOP_END 存一次快照。存的是 agent.session_store —— /out 换会话之后存到新的那份
+        bus.subscribe(agent._save_snapshot)
+        # 创作方案（剧本大节点）人采纳时，方案里写的每集时长就是这个项目的集长（2026-09-26）
+        bus.subscribe(agent._on_plan_review)
         return agent
+
+    def _save_snapshot(self, ev: Any) -> None:
+        if ev.type is EventType.LOOP_END and self.session_store is not None:
+            self._park_session()
+
+    def _park_session(self) -> None:
+        """把当前窗口、挂起的人审、加载过的 skill 存进当前会话快照。"""
+        if self.session_store is None:
+            return
+        self.session_store.save(
+            self.memory,
+            pending_review=self.loop.pending_review,
+            active_skills=list(getattr(self.allocator, "active", []) or []),
+        )
+
+    # ---------- 模型锁的默认值按产线取（2026-09-26 用户定的） ----------
+
+    def _default_lock(self, kind: str) -> str:
+        """没人定过锁时的默认：短剧 / 不限定用短剧配置里指定的模型（media_models.yaml drama）；
+        抖音 / 广告 / 设计不锁，交给配方的档位选 —— 之前默认锁对所有产线生效，新开广告文件夹，
+        product-ad 的 quality 档被锁成 seedance-2.0，海报也跟着用 gpt-image-2。"""
+        if self.content_line and self.content_line != "drama":
+            return ""
+        return str((getattr(self.catalog, "drama", None) or {}).get(f"{kind}_model") or "")
+
+    def _apply_locks(self) -> None:
+        """模型锁 = 这个项目人定过的（会话快照）> 按产线的默认。换锁回写到当前会话快照。"""
+        mf = self.media_fns
+        if mf is None:
+            return
+        store = self.session_store
+        mf.video_lock = (getattr(store, "video_model", "") or "") or self._default_lock("video")
+        mf.image_lock = (getattr(store, "image_model", "") or "") or self._default_lock("image")
+        if store is not None:
+            mf.on_video_lock = store.set_video_model
+            mf.on_image_lock = store.set_image_model
+
+    # ---------- 人采纳的创作方案里写的每集时长 → 项目集长（2026-09-26） ----------
+    # 之前集长有三个来源：/length、人审里问的「每集时长」（答了不生效）、drama_write 的 minutes
+    # （模型能自己传）。现在只有项目规格一个来源；人审问题里写明的时长，人采纳了就写进去 ——
+    # 人看过、点了头，才算数（/auto 自动采纳的不算；采纳附言里另写了时长以附言为准）。
+
+    def _on_plan_review(self, ev: Any) -> None:
+        data = getattr(ev, "data", None) or {}
+        if ev.type is EventType.CHECKPOINT_REACHED:
+            self._plan_review = dict(data)
+            return
+        if ev.type is not EventType.CHECKPOINT_DECIDED:
+            return
+        node = str(data.get("node") or "")
+        if node != "剧本" and "方案" not in node:
+            return
+        if data.get("decision") != "adopt" or str(data.get("decided_by") or "") == "auto":
+            return
+        asked = getattr(self, "_plan_review", None) or {}
+        question = str(asked.get("question") or "") if asked.get("stage") == node else ""
+        for text in (str(data.get("reason") or ""), question):
+            minutes, auto = plan_length(text)
+            if auto:
+                if not self.episode_fmt.follow_script:
+                    self.set_episode_minutes(None, auto=True)
+                    self._length_note("集长跟剧本走（你采纳的方案里写的）")
+                return
+            if minutes:
+                if self.episode_fmt.follow_script or minutes != self.episode_fmt.minutes:
+                    self.set_episode_minutes(minutes)
+                    self._length_note(f"每集 {minutes:g} 分钟（你采纳的方案里写的）")
+                return
+
+    def _length_note(self, what: str) -> None:
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().create_task(
+                self.bus.emit(
+                    EventType.WARNING, message=f"这个项目的集长设为{what}，/length 可改"
+                )
+            )
 
     # ---------- 项目（缺口 A：产物目录 = 项目） ----------
 
@@ -450,16 +558,26 @@ class Agent:
         """给人看的项目名：剧名（.drama-state.json）优先，否则文件夹名。"""
         return project_title(getattr(self.output_prefs, "root", None))
 
-    def switch_project(self, root: Path | str) -> str:
+    def switch_project(self, root: Path | str, session: bool = False) -> str:
         """换产物目录 = 换项目：资产库查询范围、台账的单项目累计、记忆一起换。返回新项目键。
 
+        session=True（/out 用）连会话一起换（2026-09-26 用户定的）：对话窗口、集长、画幅、产线、
+        模型锁都换成那个项目自己的（它文件夹的会话快照），当前的先存回本项目。之前 /out 只换
+        资产和记忆 —— 在《不渡》里 /out 到西游记，西游记按《不渡》的 20 分钟和模型锁跑，窗口里
+        还是《不渡》的对话，提示却说「本项目记住」。
+
         流水线还有活在跑时不换 —— 它们产出的资产会被打上新项目的键（抛 RuntimeError，
-        CLI 报给人：等跑完或 /auto off 之后再换）。
+        CLI 报给人：等跑完或 /auto stop 之后再换）。
         """
-        root = Path(root)
+        # 先 resolve：相对路径 / junction 写法派生出的项目键和直接在该目录启动的不一样，
+        # 而且相对串会被存进快照，换个目录启动就解析成另一个项目（2026-09-24 审查）
+        root = Path(root).expanduser().resolve()
         busy = getattr(self.pipeline, "busy", False)
         if busy and normalize_root(root) != normalize_root(self.output_prefs.root):
-            raise RuntimeError("流水线还有任务在跑：等它们跑完（或 /auto off）再换产物目录")
+            raise RuntimeError("流水线还有任务在跑：等它们跑完（或 /auto stop）再换产物目录")
+        if session:
+            # 先存：窗口里这些轮次属于旧项目。记忆提取按入队时的项目键记，排着的不会串到新项目
+            self._park_session()
         key = project_key(root)
         if self.output_prefs is not None:
             self.output_prefs.root = root
@@ -472,9 +590,68 @@ class Agent:
                 holder.project_id = key
         if self.pipeline is not None:
             self.pipeline.reset()
-        if self.session_store is not None:
+        if session:
+            self._enter_session(root)
+        elif self.session_store is not None:
             self.session_store.set_output_dir(str(root))
         return key
+
+    def _enter_session(self, root: Path) -> None:
+        """换到 root 这个文件夹的会话：装回它的窗口、挂起的人审、项目设置（集长 / 画幅 / 产线 /
+        模型锁）。和从这个文件夹启动 Agent 看到的是同一份。"""
+        old = self.session_store
+        if old is None or self.workspace is None:
+            return
+        name = _session_for(root, self.workspace)
+        if name == old.name or (self.second_window and old.name.startswith(f"{name}~")):
+            old.set_output_dir(str(root))
+            return
+        # 那个项目有别的窗口在用：另起「名字~2」，和开第二个窗口一样
+        new, lock, second = open_session(old.root, name)
+        if self.session_lock is not None:
+            self.session_lock.release()
+        self.session_lock, self.second_window = lock, second
+        self.memory.turns = []
+        self.memory._next_index = 0  # noqa: SLF001
+        self.memory.observed_prompt_tokens = 0
+        self.memory.unpin(ROLLBACK_PIN)  # 回退说明是旧项目的
+        self.loop.pending_review = None
+        self.loop._recalled = ""  # noqa: SLF001
+        self.session_store = new
+        new.load_into(self.memory)
+        pr = new.pending_review
+        if pr and any(t.index == pr.get("turn_index") for t in self.memory.turns):
+            self.loop.pending_review = dict(pr)
+        new.set_output_dir(str(root))
+        if self.media_fns is not None:
+            # 旧项目里挂着等人拍板的换模型请求、「只这一次」的放行，不带到新项目
+            self.media_fns._pending_switch.clear()  # noqa: SLF001
+            self.media_fns._once.clear()  # noqa: SLF001
+        self.set_content_line(new.content_line, persist=False)
+        self.set_episode_minutes(new.episode_minutes or None, persist=False, auto=new.episode_auto)
+        self.set_aspect_ratio(new.aspect_ratio or None, persist=False)
+        self.set_cut_block(new.cut_block, persist=False)
+        self._apply_locks()
+
+    async def restore_skills(self) -> list[str]:
+        """换会话之后：卸下旧会话加载的 skill，装上这个会话上次加载过的。返回装上的。"""
+        if self.allocator is None or self.session_store is None:
+            return []
+        wanted = list(self.session_store.active_skills)
+        for name in list(getattr(self.allocator, "active", {}) or {}):
+            if name not in wanted:
+                self.allocator.deactivate_skill(name)
+        loaded: list[str] = []
+        for name in wanted:
+            skill = self.skills.get(name)
+            if skill is None:
+                continue
+            try:
+                await self.allocator.activate_skill(skill)
+            except Exception:  # noqa: BLE001
+                continue
+            loaded.append(name)
+        return loaded
 
     async def setup(self, mcp: bool = True) -> None:
         """连 MCP server 并注册进同一个工具注册表，然后重建目录。
@@ -530,6 +707,8 @@ class Agent:
                 await self.mcp.close_all()
             except Exception:  # noqa: BLE001
                 pass
+        if self.session_lock is not None:
+            self.session_lock.release()  # 进程退出也会自动放；测试里同一进程开多个 Agent 要显式放
 
     # ---------- 会话恢复（2026-09-23 审查后补的三样） ----------
 
@@ -594,6 +773,7 @@ class Agent:
         if self.allocator is not None:
             await self.allocator.refresh()
         self._pin_line()
+        self._pin_aspect()
         if self.mem_agent is not None:
             text = self.mem_agent.brief(topic=user_input).pin_text()
             if text:
@@ -604,8 +784,9 @@ class Agent:
         #    约 500 token。关键词记忆对「继续」这种输入召不回任何东西，
         #    这些结构化事实直接摆在眼前才可靠。
         root = getattr(self.output_prefs, "root", None) if self.output_prefs else None
-        card = build_project_card(self.assets, root)
+        card = build_project_card(self.assets, root, self.episode_fmt)
         if card:
+            card += "\n" + self.episode_spec_line()
             self.memory.pin(CARD_PIN, card, position="pre_input")
         else:
             self.memory.unpin(CARD_PIN)
@@ -620,6 +801,107 @@ class Agent:
             self.memory.pin(LOCAL_PIN, summary, position="pre_input")
         else:
             self.memory.unpin(LOCAL_PIN)
+        # 5. 按集流水等人处理的事：停在停点、失败了要人定、额度刹车。之前只打在控制台，
+        #    人问「怎么不动了」模型不知道，还会自己去重跑（2026-09-26）
+        notices = ""
+        if self.pipeline is not None:
+            with contextlib.suppress(Exception):
+                notices = str(self.pipeline.notices() or "")
+        if notices:
+            self.memory.pin(PIPELINE_PIN, notices, position="pre_input")
+        else:
+            self.memory.unpin(PIPELINE_PIN)
+
+    # ---------- 一集的时长（2026-09-25 用户要的：按项目放宽） ----------
+
+    def set_episode_minutes(
+        self, minutes: float | None, persist: bool = True, auto: bool = False
+    ) -> EpisodeFormat:
+        """这个项目一集几分钟。None / 0 = 用 config/drama.yaml 的默认；auto=True = 集长跟剧本走
+        （/length auto，2026-09-26 用户定的：不查总时长，只查台词念不念得完、单镜 ≤3 秒、开场
+        高潮点 —— 之前集长只能是一个目标值，重拆一集会被要求加戏或压戏凑时长）。
+
+        只由人改（/length，或人采纳的创作方案里写的每集时长）：集长直接决定每集要生成多少段
+        视频（花多少钱），不能让模型为了让规格检查通过自己调。写剧本、拆分镜、写视频提示词
+        三步读的都是这里套好的规格 —— 这是集长唯一的来源。
+        """
+        base = self.base_episode_fmt
+        if auto:
+            fmt = replace(base, follow_script=True)
+        else:
+            fmt = replace(base, minutes=float(minutes)) if minutes else base
+        for holder in (self.drama_fns, self.episode_fns):
+            if holder is not None:
+                holder.fmt = fmt
+        self.episode_fmt = fmt
+        if persist and self.session_store is not None:
+            self.session_store.set_episode_minutes(float(minutes or 0.0), auto=auto)
+        return fmt
+
+    # ---------- 视频画幅（2026-09-25 用户要的：能出 16:9，比例按项目个性化选） ----------
+
+    def set_aspect_ratio(self, ratio: str | None, persist: bool = True) -> str:
+        """这个项目的视频画幅。None / 空 = 默认（短剧竖屏 9:16、短视频按配方）。返回生效的画幅。
+
+        短剧渲染、短视频出片、gen_video 没传比例时、素材站搜索方向、图片转镜头的尺寸都跟着它。
+        """
+        r = parse_aspect(ratio or "")
+        self.aspect_custom = bool(r)
+        self.aspect_ratio = r or DEFAULT_ASPECT
+        if self.drama_fns is not None:
+            self.drama_fns.aspect_ratio = self.aspect_ratio
+        if self.short_video_fns is not None:
+            self.short_video_fns.aspect_ratio = r
+        if self.media_fns is not None:
+            self.media_fns.default_aspect = r
+        if self.material_fns is not None:
+            self.material_fns.default_orientation = orientation_of(r) if r else ""
+        self._pin_aspect()
+        if persist and self.session_store is not None:
+            self.session_store.set_aspect_ratio(r)
+        return self.aspect_ratio
+
+    # ---------- 镜头超 3 秒拦不拦成片（2026-09-27 用户定的：先只标，第 1 集看过再定） ----------
+
+    @property
+    def cut_block(self) -> bool:
+        return bool(getattr(self.drama_fns, "cut_block", False))
+
+    def set_cut_block(self, on: bool, persist: bool = True) -> None:
+        """True = 镜头超 3 秒自动重生成、仍超不进成片（⛔）；False = 只标 ⚠。只由人改（/cut）。"""
+        if self.drama_fns is not None:
+            self.drama_fns.cut_block = bool(on)
+        if persist and self.session_store is not None:
+            self.session_store.set_cut_block(bool(on))
+
+    def _pin_aspect(self) -> None:
+        if not self.aspect_custom:
+            self.memory.unpin(ASPECT_PIN)
+            return
+        self.memory.pin(
+            ASPECT_PIN,
+            f"## 本项目视频画幅：{aspect_label(self.aspect_ratio)}（用户用 /ratio 设的）\n"
+            "短剧渲染、短视频出片、gen_video 没传比例时都按它；不要自己改成别的比例，"
+            "用户要换就提醒他 /ratio。",
+            position="pre_input",
+        )
+
+    def episode_spec_line(self) -> str:
+        """项目卡里的「规格」一行：这个项目一集几分钟、分镜总长要落在哪个区间。"""
+        fmt = self.episode_fmt
+        if fmt.follow_script:
+            return (
+                f"规格：{fmt.brief()}；画幅 {aspect_label(self.aspect_ratio)}（本项目用户用 "
+                "/length auto 设的：分镜总长按台词念完 + 必要的动作定，不按集长凑）。"
+                "集长只有用户能改，不要为了让检查通过去删台词、加戏或自己调集长"
+            )
+        lo, hi = fmt.duration_range
+        custom = fmt.minutes != self.base_episode_fmt.minutes
+        return (
+            f"规格：{fmt.brief()}；分镜总长 {lo}–{hi} 秒；画幅 {aspect_label(self.aspect_ratio)}"
+            + ("（本项目用户用 /length 设的）" if custom else "（默认值，用户可用 /length 改）")
+            + "。集长只有用户能改，不要为了让检查通过去删台词或自己调集长"
+        )
 
     # ---------- 产线标签（2026-09-23 用户要的：自己选这次做哪类内容） ----------
 
@@ -637,6 +919,7 @@ class Agent:
         self._pin_line()
         if persist and self.session_store is not None:
             self.session_store.set_content_line(self.content_line)
+        self._apply_locks()  # 没人定过锁的：默认锁跟着产线换
 
     def _pin_line(self) -> None:
         line = get_line(self.content_line)
