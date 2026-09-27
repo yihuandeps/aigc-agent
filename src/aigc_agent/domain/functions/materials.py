@@ -106,6 +106,8 @@ class MaterialFunctions:
         env: dict[str, str] | None = None,
     ) -> None:
         self.store = store
+        # 项目画幅（/ratio）对应的方向：没传 orientation 时用它；空 = 竖屏
+        self.default_orientation = ""
         self.root = Path(workspace) / "materials" / "online"
         self._get = http_get or _default_get
         self._download = downloader or ffmpeg.download
@@ -113,6 +115,27 @@ class MaterialFunctions:
         self._found: dict[str, dict[str, Any]] = {}  # 搜索结果句柄 → 下载信息
         self._specs: dict[str, ToolSpec] = {}
         self._build()
+
+    # ---------- 提权 ----------
+
+    def permission_for(
+        self, tool: str, args: dict[str, Any]
+    ) -> tuple[PermissionLevel, str] | None:
+        """注册表的提权钩子：给任意链接下来的素材填授权说明时，当场问人。
+
+        填了授权，版权状态就从 unknown 变成 licensed，机审放它进成片 —— 而 license 是模型
+        自己就能填的参数（2026-09-26 审查）。授权是真是假只有人知道。不填（记为 unknown）
+        不用问。"""
+        if tool != "fetch_media_url":
+            return None
+        lic = str(args.get("license") or "").strip()
+        if not lic or lic.lower().startswith("unknown") or "来源不明" in lic:
+            return None
+        return (
+            PermissionLevel.EXTERNAL,
+            f"把这条素材的授权记为「{lic[:50]}」：记上之后机审按已授权处理、可以进成片 —— "
+            "授权是不是真的只有你知道，需要你确认",
+        )
 
     # ---------- 声明 ----------
 
@@ -139,7 +162,7 @@ class MaterialFunctions:
                     "orientation": {
                         "type": "string",
                         "enum": ["portrait", "landscape", "square", "any"],
-                        "description": "竖屏短视频用 portrait（默认）",
+                        "description": "留空按项目画幅（用户用 /ratio 选的；默认竖屏 portrait）",
                     },
                     "source": {
                         "type": "string",
@@ -176,7 +199,11 @@ class MaterialFunctions:
                 "properties": {
                     "url": {"type": "string"},
                     "name": {"type": "string", "description": "文件名/资产摘要，可省略"},
-                    "license": {"type": "string", "description": "已知授权说明，可省略"},
+                    "license": {
+                        "type": "string",
+                        "description": "用户说明过的授权（如「用户自己拍的」「品牌方官方物料」），"
+                        "可省略 = 记为 unknown。填了会当场问用户确认",
+                    },
                 },
                 "required": ["url"],
             },
@@ -231,9 +258,10 @@ class MaterialFunctions:
         query: str,
         kind: str = "video",
         count: int = 5,
-        orientation: str = "portrait",
+        orientation: str = "",
         source: str = "auto",
     ) -> ToolResult:
+        orientation = orientation or self.default_orientation or "portrait"
         if not query.strip():
             return ToolResult(ok=False, error="query 是空的")
         kind = "image" if kind == "image" else "video"

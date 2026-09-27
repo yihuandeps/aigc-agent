@@ -286,10 +286,14 @@ async def concat_cuts(
     out: Path,
     target_size: tuple[int, int] | None = None,
     fill: bool = False,
+    keep_audio: bool = False,
 ) -> tuple[bool, str]:
     """按剪辑表拼接：同一段素材可以被切成多刀、在成片里出现多次。
 
     cuts 是 (素材下标, 起点秒, 时长秒)。
+    keep_audio：每一刀连同素材自己的声音一起切（和画面同一个起止点，音画对得上）；没音轨的
+    素材那一刀补等长静音。没有配音的成片靠它才有声音 —— 之前写死 a=0，产品广告（口播默认关）
+    和模型对带台词的片段显式快切时，成片一点声音都没有（2026-09-24 审查）。
 
     **每一刀单独 -i 一次同一个文件**，而不是用 split 滤镜分流：滤镜图里一个
     输入 pad 只能连一次，要复用就得 split，写起来啰嗦且漏一条就整条图报错。
@@ -306,6 +310,11 @@ async def concat_cuts(
         first = await probe(sources[0])
         w, h = first.width or 1080, first.height or 1920
 
+    has_audio: list[bool] = []
+    if keep_audio:
+        has_audio = [bool((await probe(s)).has_audio) for s in sources]
+        keep_audio = any(has_audio)
+
     work = out.parent / f".cuts-{uuid.uuid4().hex[:8]}"
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -319,12 +328,28 @@ async def concat_cuts(
             f"{fit},setsar=1,fps=30[v{i}]"
             for i, (_, start, dur) in enumerate(cuts)
         ]
-        streams = "".join(f"[v{i}]" for i in range(len(cuts)))
-        filt = ";".join(parts) + f";{streams}concat=n={len(cuts)}:v=1:a=0[outv]"
+        if keep_audio:
+            silent = len(cuts)
+            for i, (idx, start, dur) in enumerate(cuts):
+                if has_audio[idx]:
+                    # 和画面同一个起止点；素材的声音比画面短时补静音，保证每刀音画等长
+                    parts.append(
+                        f"[{i}:a]atrim=start={start:.3f}:duration={dur:.3f},"
+                        f"asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f},aresample=44100[a{i}]"
+                    )
+                else:
+                    cmd += ["-f", "lavfi", "-t", f"{dur:.3f}", "-i", "anullsrc=r=44100:cl=stereo"]
+                    parts.append(f"[{silent}:a]asetpts=PTS-STARTPTS[a{i}]")
+                    silent += 1
+            streams = "".join(f"[v{i}][a{i}]" for i in range(len(cuts)))
+            filt = ";".join(parts) + f";{streams}concat=n={len(cuts)}:v=1:a=1[outv][outa]"
+        else:
+            streams = "".join(f"[v{i}]" for i in range(len(cuts)))
+            filt = ";".join(parts) + f";{streams}concat=n={len(cuts)}:v=1:a=0[outv]"
+        cmd += [*_graph_args(filt, work), "-map", "[outv]"]
+        if keep_audio:
+            cmd += ["-map", "[outa]", "-c:a", "aac", "-b:a", "192k"]
         cmd += [
-            *_graph_args(filt, work),
-            "-map",
-            "[outv]",
             "-c:v",
             "libx264",
             "-preset",
@@ -420,11 +445,39 @@ async def burn_subtitle(video: Path, srt: Path, out: Path, font_size: int = 16) 
         proc.kill()
         await proc.wait()
         return False, "烧字幕超时"
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        raise
     finally:
         tmp_srt.unlink(missing_ok=True)
 
     if proc.returncode != 0 or not out.exists():
         return False, _tail(err.decode("utf-8", errors="replace"))
+    return True, ""
+
+
+async def burn_ass(video: Path, ass_text: str, out: Path, work: Path) -> tuple[bool, str]:
+    """把 ASS 字幕（上屏文字）烧进视频，音轨原样拷贝。
+
+    和 burn_subtitle 同一个路子：Windows 下 subtitles 滤镜对路径极挑剔（盘符冒号、反斜杠、
+    中文目录），所以 .ass 写进工作目录、在工作目录里用相对名调用。
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "_ov.ass").write_text(ass_text, encoding="utf-8")
+    code, err = await run(
+        [
+            "ffmpeg", "-y", "-i", str(video.resolve()),
+            "-vf", "subtitles=_ov.ass",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            str(out.resolve()),
+        ],
+        cwd=work,
+    )
+    if code != 0 or not out.exists():
+        return False, _tail(err)
     return True, ""
 
 

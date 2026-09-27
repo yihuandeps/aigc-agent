@@ -28,7 +28,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from ..assets.store import Asset, AssetStore, AssetType, local_copy
+from ..assets.store import Asset, AssetStore, AssetType, local_copy, rights_of
 from ..compliance import ComplianceReport, report_to_params
 
 
@@ -363,7 +363,9 @@ def _kind_of(media: list[Asset]) -> str:
 
 
 def _is_generated(a: Asset) -> bool:
-    return a.creator.startswith(("model:", "tool:", "pipeline:", "stub"))
+    """和 rights_of 同一口径：fetch_douyin / fetch_media_url 抓的别人的原片不是 AI 生成的，
+    不该写进隐式标识（2026-09-24 审查）。"""
+    return rights_of(a) == "generated"
 
 
 def _render_upload(

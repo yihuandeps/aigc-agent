@@ -353,14 +353,15 @@ def parse_material_reply(text: str, indices: list[int]) -> dict[int, tuple[str, 
         return {i: ("generate", "") for i in indices}
     # 逐镜：第3镜 xxx  /  3: xxx。一段到下一个「第N镜」为止 —— 之前只按换行和分号断，
     # 「第1镜 生成，第2镜 联网找」只认出第 1 镜；路径后面跟着逗号还会把后半句吞进路径
-    marks = list(_MARK.finditer(t))
+    marks = _marks(t)
     for k, m in enumerate(marks):
         i = int(m.group(1) or m.group(2))
         if i not in indices:
             continue
         end = marks[k + 1].start() if k + 1 < len(marks) else len(t)
         body = re.split(r"[\n；;]", t[m.end() : end], maxsplit=1)[0]
-        body = body.strip().strip("「」\"' ").rstrip("，,。、 ").strip("「」\"' ")
+        body = body.strip().lstrip("：:=").strip().strip("「」\"' ").rstrip("，,。、 ")
+        body = body.strip("「」\"' ")
         # 先认路径：目录名里可能带"生成""联网"这种词（如 E:\AI生成\...），不能先按关键词判
         if _looks_like_path(body):
             out[i] = ("file", body)
@@ -372,6 +373,21 @@ def parse_material_reply(text: str, indices: list[int]) -> dict[int, tuple[str, 
 
 
 _MARK = re.compile(r"第\s*(\d+)\s*镜|(?<![\d.\w])(\d+)\s*[:：、]")
+_SEP = " \t\r\n,，;；。、"
+
+
+def _marks(t: str) -> list[re.Match[str]]:
+    """段落标记（「第N镜」「N:」）。标记所在的词（前后到空白 / 分隔符为止）像路径、标记又不在
+    词首的，是文件名的一部分，不算：「第3镜 E:/素材/第2镜.mp4」之前被切成两个镜头；
+    「第1镜生成第2镜联网找」这种不带分隔符的照样认。"""
+    out: list[re.Match[str]] = []
+    for m in _MARK.finditer(t):
+        s = max(t.rfind(c, 0, m.start()) for c in _SEP) + 1
+        e = min((x for x in (t.find(c, m.end()) for c in _SEP) if x >= 0), default=len(t))
+        if s < m.start() and _looks_like_path(t[s:e]):
+            continue
+        out.append(m)
+    return out
 
 _PATH_HINT = re.compile(
     r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|~[\\/]|\./)|\.(?:mp4|mov|mkv|webm|avi|m4v|png|jpe?g|webp|gif)$",

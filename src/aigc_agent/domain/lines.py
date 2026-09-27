@@ -55,7 +55,8 @@ _AD_GUIDE = (
     "—— 两者是两个极端，先问用户要哪种，别混。\n"
     "产品图是身份锁：先 host_file 拿到链接，gen_image / gen_video 的 image 参数带上，"
     "正文里 @图片1 点名并写清只继承产品轮廓、材质、盖子、铭牌，不继承背景与构图。\n"
-    "上屏文字（slogan / 卖点）不让生成模型画：出图后用 make_poster 叠字，改字免费。\n"
+    "上屏文字（slogan / 卖点 / 片尾字卡）不让生成模型画：图片用 make_poster 叠，"
+    "视频成片用 overlay_text 叠（end_card 叠在英雄帧上），改字免费。\n"
     "方法论：seedance-prompting 的 03-商业与产品（含 UGC 口播测评带货）；"
     "配方在 config/recipes。投放级成片出来必须给用户审。"
 )

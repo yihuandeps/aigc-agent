@@ -165,10 +165,23 @@ class RpaFunctions:
         body = "\n".join(c.brief(i) for i, c in enumerate(caps, 1))
         links = [c.best_link for c in caps]
         site_cn = "抖音" if site == "douyin" else "小红书"
+        scope = ""
+        if site == "douyin" and keyword:
+            # 抖音侧只能点全站热榜（搜索页在自动化下不加载）。之前结果里不说，模型把无关的热榜
+            # 内容当成「和关键词相关的热点」写进简报（2026-09-24 审查）
+            related = [str(i) for i, c in enumerate(caps, 1) if _relevant(c.title, keyword)]
+            scope = "·全站热榜"
+            head = f"注意：抖音侧点的是全站热榜，没有按「{keyword}」搜索；" + (
+                f"和它相关的只有第 {'、'.join(related)} 条，其余别当出处"
+                if related
+                else "一条都不相关，别当出处 —— 按关键词找用 "
+                f"douyin_hot_list(keyword=\"{keyword}\")"
+            )
+            body = head + "\n" + body
         asset = self.store.create(
             body,
             type_=AssetType.TEXT,
-            summary=f"{site_cn}·真实点击·{len(caps)}条",
+            summary=f"{site_cn}·真实点击{scope}·{len(caps)}条",
             creator="tool:browse_and_copy",
             gen_params={"site": site, "keyword": keyword, "links": links},
         )

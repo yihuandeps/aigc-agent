@@ -23,7 +23,7 @@ from ...harness.tools.provider import (
 )
 from ..assets.store import AssetStore, AssetType, local_copy
 from ..drama.format import global_max_cut
-from ..media import ffmpeg
+from ..media import ffmpeg, overlay
 from ..media.naming import unique_path
 from ..pipeline.cutting import describe, plan_aroll_cuts, plan_cuts
 
@@ -142,6 +142,43 @@ class VideoEditFunctions:
                     },
                 },
                 "required": ["clips"],
+            },
+        )
+
+        self._specs["overlay_text"] = ToolSpec(
+            name="overlay_text",
+            summary="往成片上叠上屏文字（slogan / 卖点 / 片尾字卡 / 地点卡），本地叠、不花钱",
+            permission=PermissionLevel.COMPUTE,
+            timeout=1800,
+            description=(
+                "生成模型不许在画面里写字（中文画不对，改字要重生成）：上屏文字一律在成片出来后"
+                "用这个叠。items 每条 {text, start?, end?, position?, size?, box?}：时间单位秒，"
+                "end 省略 = 到片尾；position = top / center / bottom / lower_third；"
+                "size = s / m / l / xl；box=true 加半透明底框（画面花的时候用）。"
+                "end_card = {title, subtitle?, seconds?} 是片尾字卡的简写：叠在最后几秒"
+                "（产品广告的英雄帧就是给它留的）。输出一条新成片，原片不动；改字重跑即可。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "video": {"type": "string", "description": "成片（视频资产 id）"},
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": '[{"text": "一口入魂", "start": 0.5, "end": 3, '
+                        '"position": "center", "size": "xl"}]',
+                    },
+                    "end_card": {
+                        "type": "object",
+                        "description": '片尾字卡：{"title": "清爽一夏", "subtitle": "今夏新品", '
+                        '"seconds": 2.5}',
+                    },
+                    "out_dir": {
+                        "type": "string", "description": "导出目录，省略 = 产物目录 exports/",
+                    },
+                    "filename": {"type": "string", "description": "文件名，省略 = 原名加「_字」"},
+                },
+                "required": ["video"],
             },
         )
 
@@ -351,13 +388,18 @@ class VideoEditFunctions:
             )
             if not cuts:
                 return ToolResult(ok=False, error="素材时长探测不到，排不出剪辑表")
+            # 没有配音时保留每一刀自己的声音（生成片段的环境声 / 台词、实拍的现场声）——
+            # 之前一律丢掉，口播关掉的配方出的是无声成片（2026-09-24 审查）；有配音时混音
+            # 那步会整条换成配音，这里不用留
             ok, err = await ffmpeg.concat_cuts(
                 paths, [(c.clip, c.start, c.dur) for c in cuts], stage,
-                target_size=target, fill=target is not None,
+                target_size=target, fill=target is not None, keep_audio=apath is None,
             )
             if not ok:
                 return ToolResult(ok=False, error=f"快切拼接失败：{err}")
-            steps.append(f"{len(paths)} 段素材剪成 {describe(cuts)}")
+            steps.append(
+                f"{len(paths)} 段素材剪成 {describe(cuts)}" + ("" if apath else "，保留片段原声")
+            )
         else:
             ok, err = await ffmpeg.concat(paths, stage, target_size=target, fill=target is not None)
             if not ok:
@@ -422,6 +464,75 @@ class VideoEditFunctions:
                 f"{info.brief} · {final.stat().st_size / 1024 / 1024:.1f}MB\n"
                 f"步骤：{' → '.join(steps)}\n"
                 f"资产 {asset.id}"
+            ),
+            asset_ref=asset.id,
+        )
+
+
+    async def _fn_overlay_text(
+        self,
+        video: str,
+        items: list[dict[str, Any]] | None = None,
+        end_card: dict[str, Any] | None = None,
+        out_dir: str = "",
+        filename: str = "",
+    ) -> ToolResult:
+        if not ffmpeg.have_ffmpeg():
+            return ToolResult(ok=False, error="环境里没有 ffmpeg/ffprobe，叠不了字")
+        if not items and not end_card:
+            return ToolResult(ok=False, error="items 和 end_card 都是空的，没有要叠的字")
+        try:
+            src_asset = self.store.get(video)
+        except KeyError:
+            return ToolResult(ok=False, error=f"没有资产 {video}")
+        if src_asset.type is not AssetType.VIDEO:
+            return ToolResult(ok=False, error=f"{video} 是 {src_asset.type.value}，要视频")
+        src, err = await self._localize(video)
+        if not src:
+            return ToolResult(ok=False, error=err)
+        info = await ffmpeg.probe(src)
+        if info.duration <= 0 or not info.width or not info.height:
+            return ToolResult(ok=False, error=f"{video} 量不出片长 / 尺寸，没法排字")
+        texts, notes = overlay.parse_items(items, end_card, info.duration)
+        if not texts:
+            return ToolResult(ok=False, error="没有有效的文字（text 都是空的）")
+        ass = overlay.build_ass(texts, info.width, info.height)
+
+        work = self.workspace / "compose" / f"t{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        stage = work / "overlay.mp4"
+        ok, err = await ffmpeg.burn_ass(src, ass, stage, work)
+        if not ok:
+            return ToolResult(ok=False, error=f"叠字失败：{err}")
+
+        target_dir = self._export_dir(out_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        name = _safe_name(filename) or f"{src.stem}_字.mp4"
+        final = unique_path(target_dir, name)
+        final.write_bytes(stage.read_bytes())
+        asset = self.store.create(
+            "",
+            type_=AssetType.VIDEO,
+            summary=f"成片·{final.name}",
+            parents=[video],
+            creator="tool:overlay_text",
+            gen_params={
+                "local": str(final),
+                "overlay": [
+                    {"text": t.text, "start": round(t.start, 2), "end": round(t.end, 2),
+                     "position": t.position, "size": t.size}
+                    for t in texts
+                ],
+            },
+        )
+        asset.uri = str(final)
+        asset.mime = "video/mp4"
+        self.store.put(asset)
+        lines = [f"  · {t.start:.1f}–{t.end:.1f}s {t.position}/{t.size}：{t.text}" for t in texts]
+        return ToolResult(
+            content=(
+                f"已叠字 → {final}\n" + "\n".join(lines)
+                + ("\n" + "\n".join(f"  ⚠ {n}" for n in notes) if notes else "")
+                + f"\n资产 {asset.id}（原片 {video} 不动）。用 view_video 看一眼字的位置和大小。"
             ),
             asset_ref=asset.id,
         )

@@ -250,8 +250,9 @@ class ContentFunctions:
                         "type": "boolean",
                         "description": (
                             "是不是大节点：true = 即使 /auto 自动模式也停下来等人拍板一次"
-                            "（剧本方向定稿、开始生图/生视频之前）；false = /auto 下自动采纳。"
-                            "不填则按 stage 里的关键词猜。"
+                            "（剧本方向定稿、开始生图/生视频之前）。不填则按 stage 里的关键词判。"
+                            "false 只对关键词判不出大节点的环节有效：stage 是剧本 / 视频生成 / "
+                            "图片生成这类大节点时，传 false 也照样停下来问人。"
                         ),
                     },
                 },

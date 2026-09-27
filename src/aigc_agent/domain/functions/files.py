@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import mimetypes
+import os
 import re
 import shutil
 import time
@@ -81,6 +82,8 @@ _HARD_DENY = [
     # 临时文件和装在那里的程序（用户的 agent.cmd 就在 Programs 下）是正常要碰的
     "**/AppData/Roaming/**", "**/AppData/LocalLow/**", "**/User Data/**",
     "**/AppData/Local/Microsoft/**", "**/AppData/Local/Google/**", "**/AppData/Local/Packages/**",
+    # RPA 用的浏览器 profile（抖音登录态、Local State 里的加密主密钥）
+    "**/rpa/profile/**",
 ]
 # workspace 里 Agent 自己的状态（写它们 = 改 Agent 的账本/记忆/资产库）
 _STATE_DIRS = {
@@ -90,6 +93,8 @@ _STATE_DIRS = {
     "logs": "会话日志",
     "skills_history": "skill 版本记录",
     "trash": "回收站",
+    "blobs": "资产字节",
+    "rpa": "RPA 登录态与抓取数据",
 }
 # 写操作工具 → 哪些参数是「会被改动的路径」
 _WRITE_TARGETS: dict[str, tuple[str, ...]] = {
@@ -269,16 +274,27 @@ class FileFunctions:
             base = ws / sub
             if p == base or p.is_relative_to(base):
                 return f"Agent 的{label}"
+        if p.parent == ws and p.suffix:
+            # workspace 根下的文件（media_tasks.jsonl 付费任务台账等）也是 Agent 的状态
+            return "Agent 的状态文件"
         if (p == project or p.is_relative_to(project)) and not (p == ws or p.is_relative_to(ws)):
             return "Agent 的代码 / 配置 / skill"
         return ""
 
     def permission_for(self, tool: str, args: dict[str, Any]) -> tuple[PermissionLevel, str] | None:
-        """注册表的提权钩子：写操作落在 Agent 自己的文件上 → 这次按 L-external 过闸门。"""
+        """注册表的提权钩子：写 / 移 / 删落在产物目录以外 → 这次按 L-external 过闸门问人。
+
+        之前只有 Agent 自己的文件要问；白名单里有 `~` 和整个 `E:\\`，产物目录以外的写、移、删
+        都不用确认（2026-09-26 用户定的：产物目录以外要确认）。"""
         keys = _WRITE_TARGETS.get(tool)
         if not keys:
             return None
-        hits: list[str] = []
+        own: list[str] = []
+        outside: list[str] = []
+        try:
+            out = self.output_root.resolve()
+        except OSError:
+            out = self.output_root
         for k in keys:
             raw = str(args.get(k) or "").strip()
             if not raw:
@@ -288,13 +304,21 @@ class FileFunctions:
                 continue  # 越界 / 命中 deny 的由工具自己拒，这里不用提权
             what = self.protected(p)
             if what:
-                hits.append(f"{what}：{_norm(p)}")
-        if not hits:
-            return None
-        return (
-            PermissionLevel.EXTERNAL,
-            "要改动 " + "；".join(hits[:2]) + " —— 这是 Agent 自己的文件，需要你确认",
-        )
+                own.append(f"{what}：{_norm(p)}")
+            elif not (p == out or p.is_relative_to(out)):
+                outside.append(_norm(p))
+        if own:
+            return (
+                PermissionLevel.EXTERNAL,
+                "要改动 " + "；".join(own[:2]) + " —— 这是 Agent 自己的文件，需要你确认",
+            )
+        if outside:
+            return (
+                PermissionLevel.EXTERNAL,
+                "要改动产物目录（" + _norm(out) + "）以外的 " + "、".join(outside[:2])
+                + " —— 不是这个项目生成的东西，需要你确认",
+            )
+        return None
 
     def _trash_path(self, p: Path) -> Path:
         folder = self.trash / time.strftime("%Y%m%d-%H%M%S")
@@ -392,12 +416,15 @@ class FileFunctions:
         )
         self._add(
             "fs_search",
-            "在目录下的文本文件里搜关键词或正则，返回 文件:行号: 内容",
+            "在目录下的文本文件里（或单个文件里）搜关键词或正则，返回 文件:行号: 内容",
             PermissionLevel.READ,
             {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "搜索的目录（绝对路径）"},
+                    "path": {
+                        "type": "string",
+                        "description": "搜索的目录（递归搜）或单个文件（绝对路径）",
+                    },
                     "query": {"type": "string", "description": "关键词（不区分大小写）或正则"},
                     "glob": {
                         "type": "string",
@@ -740,8 +767,8 @@ class FileFunctions:
         p, err = self.resolve(path, must_exist=True)
         if err:
             return ToolResult(ok=False, error=err)
-        if not p.is_dir():
-            return ToolResult(ok=False, error=f"{_norm(p)} 不是目录")
+        if not p.is_dir() and not p.is_file():
+            return ToolResult(ok=False, error=f"{_norm(p)} 既不是目录也不是文件")
         if not query:
             return ToolResult(ok=False, error="query 是空的")
         try:
@@ -755,13 +782,16 @@ class FileFunctions:
         hits: list[str] = []
         scanned = 0
         started = time.perf_counter()
-        for f in p.rglob(glob):
+        # path 给的是单个文件：就搜它（之前只收目录，模型传文件路径报「不是目录」白跑一轮）
+        single = p.is_file()
+        base = p.parent if single else p
+        for f in [p] if single else p.rglob(glob):
             if scanned >= self.policy.max_search_files or time.perf_counter() - started > 20:
                 break
             if not f.is_file() or self.denied(f):
                 continue
             ext = f.suffix.lower()
-            if ext not in TEXT_EXT and ext not in DOC_EXT and glob == "*":
+            if ext not in TEXT_EXT and ext not in DOC_EXT and glob == "*" and not single:
                 continue
             try:
                 if f.stat().st_size > self.policy.max_read_bytes:
@@ -774,7 +804,7 @@ class FileFunctions:
                 continue
             for no, line in enumerate(decoded[0].splitlines(), 1):
                 if pat.search(line):
-                    hits.append(f"{_norm(f.relative_to(p))}:{no}: {line.strip()[:200]}")
+                    hits.append(f"{_norm(f.relative_to(base))}:{no}: {line.strip()[:200]}")
                     if len(hits) >= limit:
                         break
             if len(hits) >= limit:
@@ -918,9 +948,10 @@ class FileFunctions:
                 content=f"已登记为资产 {a.id}（{type_.value}，{len(decoded[0])} 字）",
                 asset_ref=a.id,
             )
+        creator, inherited = self._import_origin(p)
         a = self.store.create(
-            "", type_=type_, summary=label, creator="human:import",
-            gen_params={"source": str(p), "local": str(p)},
+            "", type_=type_, summary=label, creator=creator,
+            gen_params={"source": str(p), "local": str(p), **inherited},
         )
         a.uri = str(p)
         a.mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
@@ -929,6 +960,36 @@ class FileFunctions:
         return ToolResult(
             content=f"已登记为资产 {a.id}（{type_.value}，{size}，原文件不动）", asset_ref=a.id
         )
+
+    def _import_origin(self, p: Path) -> tuple[str, dict[str, Any]]:
+        """登记媒体文件时它算谁的：(creator, 要继承的来源字段)。
+
+        默认「人给的」（human:import）。但 Agent 自己从外面下回来的文件（别人的抖音原片、
+        任意链接下的素材）换个名义重新登记一遍，版权状态就从 unknown 洗成了 human
+        （2026-09-26 审查）。所以：这个文件已经登记过 → 继承原来的 creator 和授权（生成的
+        仍算生成、打 AIGC 标识；外面抓的仍是原来的授权）；在 Agent 自己的 workspace 里
+        （下载目录）又查不到来历 → 按来源不明记。
+        """
+        try:
+            target = p.resolve()
+        except OSError:
+            target = p
+        # 只做字符串比较（abspath 不碰磁盘）：库里上千份资产，逐个 resolve 太慢
+        want = os.path.normcase(os.path.abspath(target))
+        for a in self.store.all():
+            lc = str((a.gen_params or {}).get("local") or a.uri or "")
+            if not lc or lc.startswith(("http://", "https://")):
+                continue
+            if os.path.normcase(os.path.abspath(lc)) == want and a.creator:
+                keep = {k: a.gen_params[k] for k in ("license", "source_url", "author")
+                        if a.gen_params.get(k)}
+                return a.creator, {"imported_from": a.id, **keep}
+        ws = self.workspace.resolve()
+        if target == ws or target.is_relative_to(ws):
+            return "tool:fetch_media_url", {
+                "license": "unknown（从 Agent 的下载目录登记，来源要人确认）"
+            }
+        return "human:import", {}
 
     async def _fn_fs_export(self, asset_id: str, path: str, overwrite: bool = False) -> ToolResult:
         try:

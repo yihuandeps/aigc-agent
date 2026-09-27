@@ -32,6 +32,7 @@ from ...harness.tools.provider import (
     ToolResult,
     ToolSpec,
 )
+from ..aspect import DEFAULT_ASPECT, parse_aspect, still_size
 from ..assets.store import AssetStore, AssetType, local_copy
 from ..media import ffmpeg
 from ..media.naming import recipe_shot_name, safe_name
@@ -58,6 +59,9 @@ _REF_LOCK = (
     "一致；只继承产品本身，不继承参考图的背景、构图和光线。"
 )
 _MAX_SOURCE_CHARS = 20_000  # 喂给规划模型的热点材料总上限
+CONFIRM_STAGE = "出片确认"  # 花钱前的确认单（major：/auto 也停）
+REVIEW_STAGE = "成片审核"  # 配方 review.after_compose：成片出来先给人看
+SCRIPT_STAGE = "文案审核"  # 配方 review.after_script：文案和分镜出来先给人看
 
 
 class ShortVideoFunctions:
@@ -89,8 +93,66 @@ class ShortVideoFunctions:
         self.hosting = hosting
         # 会话锁定的视频模型（装配层接 MediaFunctions.video_lock）：锁着时 tier 不参与选型
         self.video_lock_source: Any = None
+        # 项目画幅（/ratio）：比配方的 output.aspect_ratio 优先；空 = 按配方
+        self.aspect_ratio = ""
+        # 出片确认只认人的决定（2026-09-26 审查）：confirm=true 是模型自己就能填的参数，
+        # 之前第一次就带上它，确认单根本不出现、直接花钱。现在挂起时记下这张确认单（按简报），
+        # 人采纳（总线 CHECKPOINT_DECIDED，/auto 自动采纳的不算）才转成已确认，用一次就收回；
+        # 这一轮结束（LOOP_END）没用掉的也收回。命令行 `agent video make` 在终端问完调 approve()
+        self._pending_confirm: dict[str, dict[str, Any]] = {}
+        self._confirmed: dict[str, dict[str, Any]] = {}
         self._specs: dict[str, ToolSpec] = {}
         self._build()
+
+    # ---------- 人的确认 ----------
+
+    def approve(self, brief_id: str) -> None:
+        """人在别处（终端）确认了这份简报的出片：下一次带 confirm=true 的调用放行一次。"""
+        self._confirmed[brief_id] = self._pending_confirm.pop(brief_id, None) or {"any": True}
+
+    def on_event(self, event: Any) -> None:
+        """总线回调：人在出片确认单上**采纳**才算确认；打回 / 退回、/auto 自动采纳都不算。"""
+        etype = getattr(event, "type", None)
+        data = getattr(event, "data", None) or {}
+        if etype is EventType.LOOP_END:
+            if data.get("stop_reason") != "awaiting_review":
+                self._confirmed.clear()
+            return
+        if etype is not EventType.CHECKPOINT_DECIDED or data.get("node") != CONFIRM_STAGE:
+            return
+        for bid in data.get("candidates") or []:
+            plan = self._pending_confirm.pop(str(bid), None)
+            if plan is None or data.get("decision") != "adopt":
+                continue
+            if str(data.get("decided_by") or "human") == "auto":
+                continue
+            self._confirmed[str(bid)] = plan
+
+    def _take_confirmation(self, brief_id: str, plan: dict[str, Any]) -> bool:
+        """这次要生成的是不是人确认过的那张单子（同样的生成条件、镜头只少不多）。用一次就收回。"""
+        ok = self._confirmed.pop(brief_id, None)
+        if ok is None:
+            return False
+        if ok.get("any"):
+            return True
+        return ok.get("gen") == plan.get("gen") and set(plan.get("shots") or []) <= set(
+            ok.get("shots") or []
+        )
+
+    def permission_for(
+        self, tool: str, args: dict[str, Any]
+    ) -> tuple[PermissionLevel, str] | None:
+        """注册表的提权钩子：skip_shots（缺着镜头出片）要当场问人 —— 丢哪几镜是内容决定。"""
+        if tool != "short_video_produce":
+            return None
+        skip = [s for s in (args.get("skip_shots") or []) if str(s).strip()]
+        if not skip:
+            return None
+        return (
+            PermissionLevel.EXTERNAL,
+            f"不要第 {'、'.join(str(s) for s in skip)} 镜、缺着它们出片 —— 成片会少这几个镜头，"
+            "需要你确认",
+        )
 
     # ---------- 声明 ----------
 
@@ -128,6 +190,11 @@ class ShortVideoFunctions:
                         "description": "热点资产 id 列表",
                     },
                     "notes": {"type": "string", "description": "用户的额外要求，可省略"},
+                    "grounding": {
+                        "type": "boolean",
+                        "description": "配方要求接热榜、又没传 sources 时，是否自动拉一次抖音热榜"
+                        "（默认按配方）。用户说不用热点才传 false",
+                    },
                 },
                 "required": ["keyword", "style"],
             },
@@ -186,8 +253,13 @@ class ShortVideoFunctions:
                 "口播出镜：用户的出镜视频传 aroll（它的原声当音轨、字幕从它转写，"
                 "B-roll 穿插）。广告：产品图传 ref_images（每个生成镜头都带上当身份锁），"
                 "个别镜头不同就用 shot_refs。"
-                "要新生成镜头时会先停下来报镜头数和秒数，人确认后带 confirm=true 再调。"
+                "要新生成镜头时会先停下来报镜头数和秒数，人在确认单上采纳后带 confirm=true "
+                "再调（没经过人确认的 confirm=true 不算数，会再出一次确认单）。"
+                "有镜头没生成出来（失败 / 画面有字）就**不合成成片**，结果里列出缺哪几镜："
+                "修好原因再调一次（成功的镜头复用、只补缺的）；用户说缺的不要了才传 skip_shots。"
                 "画面按简报顺序快切（每刀 ≤3s），长度以配音 / 出镜原声为准。"
+                "配方要求成片审核的（如产品广告）合成后会停下来请用户看。"
+                "上屏文字（slogan / 卖点 / 片尾字卡）不让模型画，成片出来后用 overlay_text 叠。"
                 "跑完用 view_video 看成片。"
             ),
             parameters={
@@ -226,7 +298,20 @@ class ShortVideoFunctions:
                     },
                     "confirm": {
                         "type": "boolean",
-                        "description": "人已经确认过这次要生成的镜头数和成本（第一次调不要传）",
+                        "description": "人已经在确认单上采纳了这次要生成的镜头数和成本（第一次调"
+                        "不要传）。只有人采纳过才生效；镜头数变多、档位 / 参考图 / 画幅变了"
+                        "要重新确认",
+                    },
+                    "skip_shots": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "这次不要的镜头序号（1 起），缺着它们出片。只在用户明确说"
+                        "某几镜不要了时传；会当场再问用户一次",
+                    },
+                    "aspect_ratio": {
+                        "type": "string",
+                        "description": "画幅，如 16:9 横屏 / 9:16 竖屏。留空用项目设置（/ratio），"
+                        "项目没设就按配方",
                     },
                 },
                 "required": ["brief_id"],
@@ -425,8 +510,39 @@ class ShortVideoFunctions:
                 break
         return "\n\n".join(parts), used, missing
 
+    async def _ground(self, recipe: Recipe) -> tuple[str, str]:
+        """配方要求接热榜（grounding.enabled）而模型没先抓热点：自动拉一次抖音热榜。
+        返回 (热榜资产 id, 没拉到的原因)。
+
+        之前 grounding 只有命令行 `agent video make` 在读，对话里模型跳过抓热点，简报就只
+        提醒一句「内容只能按常识写」照样出（2026-09-26 审查）—— 配方里写着「上一版效果差的
+        根因就是热点是编的」。拉不到不拦：热榜是加分项，但要明说降级了。"""
+        if self.registry is None:
+            return "", "没接工具注册表"
+        g = recipe.grounding
+        try:
+            args = {
+                "count": int(g.get("top") or 15),
+                "days": int(g.get("days") or 1),
+                "category": str(g.get("category") or ""),
+            }
+        except (TypeError, ValueError):
+            args = {"count": 15, "days": 1, "category": ""}
+        hot = await self.registry.invoke("douyin_hot_list", args)
+        if not hot.ok or not str(hot.content or "").strip():
+            return "", (hot.error or "热榜返回空")[:120]
+        if hot.asset_ref:
+            return str(hot.asset_ref), ""
+        a = self.store.create(hot.content, summary="抖音热榜", creator="tool:douyin_hot_list")
+        return a.id, ""
+
     async def _fn_short_video_brief(
-        self, keyword: str, style: str, sources: list[str] | None = None, notes: str = ""
+        self,
+        keyword: str,
+        style: str,
+        sources: list[str] | None = None,
+        notes: str = "",
+        grounding: bool | None = None,
     ) -> ToolResult:
         if not keyword.strip():
             return ToolResult(ok=False, error="keyword 是空的")
@@ -435,7 +551,23 @@ class ShortVideoFunctions:
             return ToolResult(ok=False, error=err)
         if self.gateway is None:
             return ToolResult(ok=False, error="没有文本网关，写不了简报")
-        text, used, missing = self._sources_text(sources or [])
+        sources = list(sources or [])
+        ground_note = ""
+        if not sources and recipe.grounded and grounding is not False:
+            hot_id, why = await self._ground(recipe)
+            if hot_id:
+                sources.append(hot_id)
+                ground_note = "配方要求接热榜，已自动拉了一次抖音热榜" + (
+                    f"（{recipe.grounding.get('category')} 类）"
+                    if recipe.grounding.get("category") else ""
+                )
+            else:
+                ground_note = f"配方要求接热榜，但热榜没拉到（{why}）"
+        text, used, missing = self._sources_text(sources)
+        pick_hint = str(recipe.grounding.get("pick_hint") or "").strip()
+        if used and pick_hint:
+            # 配方的选题要求（ugc-vlog「选一件小事」这种）：之前只有老链的选题那步在用
+            notes = f"{notes}\n选题要求：{pick_hint}".strip()
         lo, hi = recipe.duration_bounds
         voiceover = bool(recipe.voiceover.get("enabled"))
         prompt = brief_prompt(
@@ -455,12 +587,18 @@ class ShortVideoFunctions:
         if brief is None:
             return ToolResult(ok=False, error="简报解析失败：" + "；".join(warns))
         brief.sources = used
+        if ground_note and not used:
+            warns.insert(0, ground_note)
         if not used:
-            warns.append("没有热点材料，内容只能按常识写 —— 建议先抓热点再重跑")
+            warns.append(
+                "没有热点材料，内容只能按常识写 —— 数字和事实都没有出处，建议先抓热点再重跑"
+            )
         if missing:
             warns.append(f"这些来源资产不存在：{', '.join(missing)}")
         asset = self._save_brief(brief, parents=used)
         out = brief.render()
+        if ground_note and used:
+            out = f"（{ground_note}）\n\n{out}"
         if warns:
             out += "\n\n⚠ " + "\n⚠ ".join(warns)
         needs = brief.material_needs()
@@ -469,9 +607,24 @@ class ShortVideoFunctions:
             if needs
             else f"short_video_produce(brief_id=\"{asset.id}\") 出片"
         )
-        return ToolResult(
-            content=f"{out}\n\n简报资产 {asset.id}。下一步：{nxt}", asset_ref=asset.id
-        )
+        content = f"{out}\n\n简报资产 {asset.id}。下一步：{nxt}"
+        # 配方 review.after_script：文案和分镜出来先给人看（之前这个字段没有代码读）。
+        # 不算大节点：/auto 下自动过，花钱前的出片确认单照样会停
+        if recipe.review.get("after_script"):
+            return ToolResult(
+                content=content + "\n\n已暂停：这个风格要求文案和分镜先给用户看。用户采纳再往下走，"
+                "打回就按意见改（带 notes 重新 short_video_brief）。",
+                asset_ref=asset.id,
+                suspend=True,
+                suspend_payload={
+                    "question": f"「{brief.title}」的文案和分镜，看一下方向对不对：\n{out}",
+                    "stage": SCRIPT_STAGE,
+                    "target": SCRIPT_STAGE,
+                    "assets": [asset.id],
+                    "major": False,
+                },
+            )
+        return ToolResult(content=content, asset_ref=asset.id)
 
     # ---------- 素材：问人 / 读回复 ----------
 
@@ -592,6 +745,8 @@ class ShortVideoFunctions:
         ref_images: list[str] | None = None,
         shot_refs: dict[str, list[str]] | None = None,
         confirm: bool = False,
+        aspect_ratio: str = "",
+        skip_shots: list[int] | None = None,
     ) -> ToolResult:
         brief, _, err = self._brief(brief_id)
         if brief is None:
@@ -602,6 +757,12 @@ class ShortVideoFunctions:
         if recipe is None:
             return ToolResult(ok=False, error=err)
         vtier = tier or str(recipe.models.get("video_tier", "fast"))
+        # 画幅：这次指定的 > 项目设置（/ratio）> 配方（2026-09-25 用户要的：比例可以个性化选）
+        ratio = (
+            parse_aspect(aspect_ratio)
+            or self.aspect_ratio
+            or str(recipe.output.get("aspect_ratio") or DEFAULT_ASPECT)
+        )
         mapping = {**brief.materials, **{str(k): v for k, v in (materials or {}).items()}}
         notes: list[str] = []
         locked, tier_note = self._tier_note(vtier, explicit=bool(tier))
@@ -610,13 +771,23 @@ class ShortVideoFunctions:
 
         # ---- 出镜素材（口播出镜）：它的原声是主音轨，字幕从它转写，B-roll 穿插在它上面 ----
         if aroll:
-            why = self._aroll_problem(aroll)
+            why = await self._aroll_problem(aroll)
             if why:
                 return ToolResult(ok=False, error=why, meta={"charged": False})
 
         # ---- 镜头数不能多于刀数：多出来的镜头生成了也进不了成片（2026-09-23 审查：8 个镜头
         #      只切 6 刀，第 7、8 镜付了钱不出现）。出镜模式的时间线跟着出镜素材走，不在此列 ----
         shots = list(enumerate(brief.shots, 1))
+        # 用户明确不要的镜头（skip_shots 经闸门问过人）：这次不生成、不进成片
+        skipped: set[int] = set()
+        for s in skip_shots or []:
+            try:
+                skipped.add(int(s))
+            except (TypeError, ValueError):
+                continue
+        if skipped:
+            shots = [(i, s) for i, s in shots if i not in skipped]
+            notes.append(f"按用户要求去掉第 {'、'.join(map(str, sorted(skipped)))} 镜")
         cut_min = max(0.5, float(recipe.cut_min or 1.2))
         room = max(1, math.floor(brief.duration / cut_min + 1e-9))
         if not aroll and len(shots) > room:
@@ -628,19 +799,39 @@ class ShortVideoFunctions:
             shots = shots[:room]
 
         # ---- 每个镜头：用户/素材站的素材 → 复用上次生成的 → 现在生成 ----
-        prev = self._previous_clips(brief_id) if reuse else {}
+        # 复用只认同样的生成条件：参考图（产品身份锁）、档位一样才复用 —— 之前第一次没带
+        # 产品图、第二次带上再调，旧的无产品片段全部复用，连确认单都不弹（2026-09-24 审查）
+        gen_cond = {
+            # 锁着视频模型时档位不起作用（镜头都用锁定的模型）：按实际用的模型比，别因为换了个
+            # 不生效的档位就把能复用的片段重新付费生成
+            "model": locked,
+            "tier": "" if locked else vtier,
+            "aspect": ratio,  # 画幅不同的旧片段不复用
+            "refs": sorted(str(x).strip() for x in (ref_images or []) if str(x).strip()),
+            "shot_refs": {
+                str(k): sorted(str(x).strip() for x in v if str(x).strip())
+                for k, v in (shot_refs or {}).items() if v
+            },
+        }
+        prev = self._previous_clips(brief_id, gen_cond) if reuse else {}
+        if reuse and not prev and self._previous_clips(brief_id):
+            notes.append("上次出片的生成条件不同（参考图 / 档位），旧片段没有复用")
         clips: dict[int, str] = {}
         to_generate: list[int] = []
+        by_aroll: set[int] = set()  # 出镜素材本身就是这些镜头，不算缺
         for i, shot in shots:
             mat = mapping.get(str(i))
             if mat:
-                cid, why = await self._material_clip(mat, shot.seconds or recipe.seconds_each, i)
+                cid, why = await self._material_clip(
+                    mat, shot.seconds or recipe.seconds_each, i, size=still_size(ratio)
+                )
                 if cid:
                     clips[i] = cid
                     continue
                 notes.append(f"第{i}镜素材 {mat} 用不了（{why}），改用 AI 生成")
             elif shot.source == "real":
                 if aroll:
+                    by_aroll.add(i)
                     continue  # 真人出镜的镜头就是出镜素材本身，不另生成
                 need = shot.real_need or shot.desc
                 notes.append(f"第{i}镜需要实拍素材但没提供（{need}），已改用 AI 生成")
@@ -661,28 +852,45 @@ class ShortVideoFunctions:
             per_shot[str(k)] = urls
 
         # ---- 出片前报成本，人点头了再花钱（2026-09-23 审查：之前不报镜头数也不预估调用次数）----
-        if to_generate and not confirm:
+        # confirm=true 只认人在确认单上的采纳（2026-09-26 审查：之前模型第一次就带上它，
+        # 确认单根本不出现）；生成条件变了、镜头变多了也要重新确认
+        plan = {
+            "shots": sorted(to_generate),
+            "gen": json.dumps(gen_cond, sort_keys=True, ensure_ascii=False),
+        }
+        if to_generate and not (confirm and self._take_confirmation(brief_id, plan)):
             secs = len(to_generate) * recipe.seconds_each
             q = (
                 f"「{brief.title}」要新生成 {len(to_generate)} 段视频"
-                f"（每段 {recipe.seconds_each}s，共约 {secs}s，"
+                f"（第 {'、'.join(map(str, sorted(to_generate)))} 镜，"
+                f"每段 {recipe.seconds_each}s，共约 {secs}s，画幅 {ratio}，"
                 + (f"模型 {locked}（会话锁定）" if locked else f"档位 {vtier}")
                 + "），"
                 f"复用 / 用素材 {len(clips)} 段"
                 + ("，并出一次配音" if recipe.voiceover.get("enabled") else "")
                 + "。确认就开始生成。"
             )
+            if brief.script:
+                head = " ".join(brief.script.split())
+                q += f"\n口播：{head[:120]}{'…' if len(head) > 120 else ''}"
+            self._pending_confirm[brief_id] = plan
+            unconfirmed = (
+                "\n（这次带了 confirm=true，但用户还没在这张确认单上采纳过 —— 没经过人确认的 "
+                "confirm 不算数。）"
+                if confirm else ""
+            )
             return ToolResult(
                 content=(
                     f"{q}\n已暂停等人确认。人采纳后用同样的参数加 confirm=true 再调一次 "
                     "short_video_produce；打回就按人的意见改简报。"
+                    + unconfirmed
                     + ("\n" + "\n".join(f"  · {n}" for n in notes) if notes else "")
                 ),
                 suspend=True,
                 suspend_payload={
                     "question": q,
-                    "stage": "出片确认",
-                    "target": "出片确认",
+                    "stage": CONFIRM_STAGE,
+                    "target": CONFIRM_STAGE,
                     "assets": [brief_id],
                     "major": True,
                 },
@@ -713,7 +921,7 @@ class ShortVideoFunctions:
                 args: dict[str, Any] = {
                     "prompt": prompt,
                     "prefer": vtier,
-                    "aspect_ratio": recipe.output.get("aspect_ratio", "9:16"),
+                    "aspect_ratio": ratio,
                     "duration": recipe.seconds_each,
                     "resolution": recipe.output.get("resolution", "720p"),
                     "summary": f"{brief.title}·第{i}镜",
@@ -732,6 +940,7 @@ class ShortVideoFunctions:
                 # 画面里不许有字：抽帧查，有字就带着「上一版出了字」重生成；还有就不进成片
                 if sub_gate and r is not None and r.ok and r.asset_ref:
                     found, where = await self._burned_text(r.asset_ref)
+                    regen_err = ""
                     for _ in range(sub_retries):
                         if not found:
                             break
@@ -739,6 +948,7 @@ class ShortVideoFunctions:
                             "gen_video", {**args, "prompt": no_text_retry(args["prompt"])}
                         )
                         if not again.ok or not again.asset_ref:
+                            regen_err = (again.error or "未知原因")[:80]
                             break
                         r = again
                         found, where = await self._burned_text(r.asset_ref)
@@ -747,7 +957,10 @@ class ShortVideoFunctions:
                     elif found:
                         done += 1
                         await self._progress("生成短视频素材", done, len(to_generate), f"第{i}镜")
-                        return i, "", f"画面里有字（{where or '位置不明'}），重生成后仍有，没进成片"
+                        # 重生成没成功时如实说（之前一律报「重生成后仍有」）；有字的那版留在
+                        # 资产库里给人看，但不进成片
+                        why = f"重生成失败（{regen_err}）" if regen_err else "重生成后仍有"
+                        return i, "", f"画面里有字（{where or '位置不明'}），{why}，没进成片"
                 done += 1
                 await self._progress("生成短视频素材", done, len(to_generate), f"第{i}镜")
                 return i, (r.asset_ref if r.ok else ""), ("" if r.ok else (r.error or ""))
@@ -764,6 +977,43 @@ class ShortVideoFunctions:
                 )
         if not clips and not aroll:
             return ToolResult(ok=False, error="一个镜头都没有：\n" + "\n".join(failed))
+
+        # ---- 缺镜头不合成（2026-09-26 审查，和短剧「缺段不成片」同一条规则）：之前失败的、
+        #      画面有字的镜头直接跳过，剩下的镜头拉长了照样拼成片 —— 口播讲到的画面没了，
+        #      广告缺了英雄帧，看起来却像做完了。成功的镜头记进出片记录，下次复用只补缺的 ----
+        lost = sorted({i for i, _ in shots} - set(clips) - by_aroll)
+        if lost:
+            order = sorted(clips)
+            record = self.store.create(
+                json.dumps(
+                    {"clips": {str(i): clips[i] for i in order}, "audio": "", "subtitle": "",
+                     "aroll": aroll, "composed": "", "gen": gen_cond, "missing": lost},
+                    ensure_ascii=False, indent=2,
+                ),
+                type_=AssetType.STORYBOARD,
+                summary=f"短视频出片记录·{brief.title}（未成片）",
+                parents=[brief_id],
+                creator="tool:short_video_produce",
+                gen_params={"clips": len(clips), "generated": len(to_generate),
+                            "failed": len(failed), "missing": lost},
+            )
+            miss = "、".join(map(str, lost))
+            body = "\n".join(f"  · {n}" for n in notes)
+            return ToolResult(
+                content=(
+                    f"「{brief.title}」⚠ 未成片：第 {miss} 镜没生成出来，没有合成 —— "
+                    "缺镜头拼出来的成片会让人以为做完了。\n"
+                    + ("失败：\n  " + "\n  ".join(failed) + "\n" if failed else "")
+                    + (f"{body}\n" if body else "")
+                    + f"下一步：修好原因后再调一次 short_video_produce（已生成的 {len(clips)} 镜"
+                    "复用、只补缺的，会再出一张确认单）；用户明确说缺的不要了，才传 "
+                    f"skip_shots=[{', '.join(map(str, lost))}] 缺着出片。"
+                    "不要自己改写提示词用 gen_video 补。\n"
+                    f"出片记录 {record.id}"
+                ),
+                asset_ref=record.id,
+                meta={"complete": False, "missing": len(lost)},
+            )
 
         # ---- 配音：配方开了才配；「实拍为主」的配方没给出镜素材时用 TTS 兜底，不然成片没声音 ----
         audio_id = ""
@@ -837,13 +1087,14 @@ class ShortVideoFunctions:
                 "aroll_id": aroll,
                 "cut_order": "brief",
                 "weights": [float(brief.shots[i - 1].seconds or 1.0) for i in order],
-                "aspect_ratio": str(recipe.output.get("aspect_ratio", "9:16")),
+                "aspect_ratio": ratio,
             },
         )
         record = self.store.create(
             json.dumps(
                 {"clips": {str(i): clips[i] for i in order}, "audio": audio_id,
-                 "subtitle": sub_id, "aroll": aroll, "composed": r.asset_ref if r.ok else ""},
+                 "subtitle": sub_id, "aroll": aroll, "composed": r.asset_ref if r.ok else "",
+                 "gen": gen_cond},
                 ensure_ascii=False, indent=2,
             ),
             type_=AssetType.STORYBOARD,
@@ -865,22 +1116,49 @@ class ShortVideoFunctions:
                 content=f"{head}\n{body}{warn}\n\n⚠ 合成失败：{r.error}\n出片记录 {record.id}",
                 asset_ref=record.id,
             )
-        return ToolResult(
-            content=f"{head}\n{body}{warn}\n\n{r.content}\n\n出片记录 {record.id}。"
-            f"建议 view_video(source=\"{r.asset_ref}\") 看一遍：字幕、变脸、穿帮。",
-            asset_ref=r.asset_ref,
+        done_text = (
+            f"{head}\n{body}{warn}\n\n{r.content}\n\n出片记录 {record.id}。"
+            f"建议 view_video(source=\"{r.asset_ref}\") 看一遍：字幕、变脸、穿帮。"
         )
+        # 配方 review.after_compose（产品广告 / 口播出镜）：成片出来先给人看（之前这个字段
+        # 没有代码读，「投放级成片必须给用户审」只写在指引里）。major：/auto 也停
+        if recipe.review.get("after_compose"):
+            return ToolResult(
+                content=done_text + "\n\n已暂停：这个风格要求成片先给用户审。用户采纳才算交付；"
+                "要叠上屏文字用 overlay_text，打回就按意见改。",
+                asset_ref=r.asset_ref,
+                suspend=True,
+                suspend_payload={
+                    "question": f"「{brief.title}」成片出来了，请看一遍（画面、口型、产品细节、"
+                    "穿帮）：\n" + r.content.splitlines()[0],
+                    "stage": REVIEW_STAGE,
+                    "target": REVIEW_STAGE,
+                    "assets": [r.asset_ref],
+                    "major": True,
+                },
+            )
+        return ToolResult(content=done_text, asset_ref=r.asset_ref)
 
-    def _aroll_problem(self, asset_id: str) -> str:
-        """出镜素材能不能用：要是视频、本地有文件（剪辑和转写都要读它）。能用返回空串。"""
+    async def _aroll_problem(self, asset_id: str) -> str:
+        """出镜素材能不能用：要是视频、本地有文件（剪辑和转写都要读它）、有音轨（它的原声
+        是整条音轨）。能用返回空串。"""
         try:
             a = self.store.get(asset_id)
         except KeyError:
             return f"出镜素材 {asset_id} 不存在"
         if a.type is not AssetType.VIDEO:
             return f"出镜素材 {asset_id} 是 {a.type.value}，要视频"
-        if local_copy(a) is None:
+        lc = local_copy(a)
+        if lc is None:
             return f"出镜素材 {asset_id} 本地没有文件（先 fs_import 登记用户给的视频）"
+        # 没音轨的出镜素材：B-roll 生成付了钱才在混音处报错（2026-09-24 审查）。
+        # ffprobe 读不出（没装 / 假文件）不拦，交给后面的步骤
+        info = await ffmpeg.probe(Path(lc))
+        if info.duration > 0 and not info.has_audio:
+            return (
+                f"出镜素材 {asset_id} 没有音轨 —— 口播出镜要用它的原声当整条音轨。"
+                "没声音的实拍片段请当普通素材传 materials，不要传 aroll"
+            )
         return ""
 
     async def _ref_urls(self, ids: list[str]) -> tuple[list[str], str]:
@@ -899,7 +1177,9 @@ class ShortVideoFunctions:
                 return [], f"参考图 {x} 不存在"
             if self.hosting is not None and getattr(self.hosting, "enabled", False):
                 url, err = await self.hosting.ensure_asset(self.store, a, 20)
-                if url and not err:
+                if url:
+                    # err 只是「链接可能过期」的提醒（有远端链接、没本地副本时）：链接照用，
+                    # 之前整次拒绝（2026-09-24 审查）
                     out.append(url)
                     continue
                 return [], f"参考图 {x} 托管失败：{err}"
@@ -931,8 +1211,12 @@ class ShortVideoFunctions:
         pick = parse_voice(resp.text, [n for n, _ in voices], fallback, speed)
         return pick.voice, pick.speed, pick.why
 
-    def _previous_clips(self, brief_id: str) -> dict[int, str]:
-        """这份简报上次出片时成功的镜头：序号 → 片段资产 id（能拼的才算）。"""
+    def _previous_clips(
+        self, brief_id: str, cond: dict[str, Any] | None = None
+    ) -> dict[int, str]:
+        """这份简报上次出片时成功的镜头：序号 → 片段资产 id（能拼的才算）。
+        cond：只认同样生成条件（参考图 / 档位）的出片记录；老记录没记条件，只在这次
+        也没带参考图时才算同样。"""
         out: dict[int, str] = {}
         # resolve_materials 用 revise 出新版简报（新 id）：之前只认 parent_ids[0] == brief_id，
         # 只改了一个镜头的素材，所有 AI 镜头都重新生成（2026-09-23 审查）
@@ -941,9 +1225,20 @@ class ShortVideoFunctions:
             if not a.parent_ids or a.parent_ids[0] not in lineage:
                 continue
             try:
-                rows = json.loads(self.store.content(a.id)).get("clips") or {}
+                data = json.loads(self.store.content(a.id))
+                rows = data.get("clips") or {}
             except (KeyError, json.JSONDecodeError, AttributeError):
                 continue
+            if cond is not None:
+                gen = data.get("gen") if isinstance(data, dict) else None
+                if gen is None:
+                    # 老记录没记条件：都是配方默认的竖屏、没带参考图
+                    if cond.get("refs") or cond.get("shot_refs") or (
+                        cond.get("aspect", DEFAULT_ASPECT) != DEFAULT_ASPECT
+                    ):
+                        continue
+                elif gen != cond:
+                    continue
             for k, cid in rows.items():
                 try:
                     i = int(k)
@@ -977,7 +1272,9 @@ class ShortVideoFunctions:
             return True
         return (a.uri or "").startswith(("http://", "https://"))
 
-    async def _material_clip(self, asset_id: str, seconds: float, shot_no: int) -> tuple[str, str]:
+    async def _material_clip(
+        self, asset_id: str, seconds: float, shot_no: int, size: tuple[int, int] = (720, 1280)
+    ) -> tuple[str, str]:
         """素材资产 → 可拼的视频片段 id。视频直接用；图片做成静止镜头。"""
         try:
             a = self.store.get(asset_id)
@@ -997,7 +1294,9 @@ class ShortVideoFunctions:
             else (self.store.root or Path(".")) / "blobs"
         )
         out = Path(out_dir) / f"{safe_name(a.summary or asset_id)}_镜{shot_no:02d}.mp4"
-        ok, why = await ffmpeg.still_to_clip(Path(src), out, max(2.0, seconds))
+        # 多做 3 秒（全局快切上限）：排刀在素材里错开取，素材刚好等长时取不满、成片缩水、
+        # 配音结尾被截（2026-09-24 审查）；静帧多做几秒不花钱
+        ok, why = await ffmpeg.still_to_clip(Path(src), out, max(2.0, seconds) + 3.0, size=size)
         if not ok:
             return "", f"图片转镜头失败：{why}"
         clip = self.store.create(

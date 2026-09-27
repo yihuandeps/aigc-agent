@@ -61,10 +61,11 @@ def plan_cuts(
     if total <= max_seconds:
         return [Cut(0, 0.0, min(total, clip_seconds[0]))]
     if ordered:
-        return _plan_ordered(clip_seconds, total, max_seconds, min_seconds, seed, weights)
-
-    lens = _lengths(total, max_seconds, min_seconds, seed)
-    return _assign(lens, clip_seconds)
+        cuts = _plan_ordered(clip_seconds, total, max_seconds, min_seconds, seed, weights)
+    else:
+        lens = _lengths(total, max_seconds, min_seconds, seed)
+        cuts = _assign(lens, clip_seconds)
+    return _fill_deficit(cuts, clip_seconds, total, max_seconds)
 
 
 def _plan_ordered(
@@ -124,6 +125,45 @@ def _windows(clip: int, durs: list[float], avail: float) -> list[Cut]:
         start = min(t, max(avail - d, 0.0))
         out.append(Cut(clip, round(start, 3), round(d, 3)))
         t = start + d + gap
+    return out
+
+
+def _fill_deficit(
+    cuts: list[Cut], clip_seconds: list[float], total: float, max_s: float
+) -> list[Cut]:
+    """素材比计划的刀短时（每刀取 min(计划, 素材长)），总长会缩水 —— 有配音时混音按画面长度
+    截音频，口播结尾被剪掉（2026-09-24 审查：静帧 / 短素材 [8, 2, 8] 排 30 秒只剪出 29.2 秒）。
+    把差额摊回还有余量的刀：先只在同一段素材相邻两刀之间的空隙里长（保住跳切），还不够再允许
+    和同一段素材的别的刀重叠。每刀仍不超过 max_s；素材总量不够就只能短一点（物理限制）。"""
+    remain = total - sum(c.dur for c in cuts)
+    if remain <= 1e-3 or not cuts:
+        return cuts
+    out = list(cuts)
+    for overlap in (False, True):
+        for i, c in enumerate(out):
+            if remain <= 1e-3:
+                break
+            avail = clip_seconds[c.clip] if c.clip < len(clip_seconds) else 0.0
+            room = max_s - c.dur
+            if room <= 1e-3:
+                continue
+            lo, hi = 0.0, avail
+            if not overlap:
+                for k, o in enumerate(out):
+                    if k == i or o.clip != c.clip:
+                        continue
+                    if o.start >= c.end - 1e-6:
+                        hi = min(hi, o.start)
+                    elif o.end <= c.start + 1e-6:
+                        lo = max(lo, o.end)
+            fwd = max(0.0, hi - c.end)
+            back = max(0.0, c.start - lo)
+            grow = min(room, remain, fwd + back)
+            if grow <= 1e-3:
+                continue
+            ahead = min(grow, fwd)
+            out[i] = Cut(c.clip, round(c.start - (grow - ahead), 3), round(c.dur + grow, 3))
+            remain -= grow
     return out
 
 

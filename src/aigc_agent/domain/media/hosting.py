@@ -468,7 +468,9 @@ class Hosting:
     def local_file(asset: Any) -> Path | None:
         gp = asset.gen_params if isinstance(asset.gen_params, dict) else {}
         local = str(gp.get("local") or "")
-        for cand in (local, asset.uri or ""):
+        # 产物目录里那份被整理掉了，还有 Agent 在 blobs/ 自留的那份（2026-09-27）
+        blob = str(gp.get("blob") or "")
+        for cand in (local, blob, asset.uri or ""):
             if cand and not cand.startswith(("http://", "https://")) and Path(cand).exists():
                 return Path(cand)
         return None

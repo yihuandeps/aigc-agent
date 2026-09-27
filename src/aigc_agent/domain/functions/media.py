@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from ...harness.events.bus import EventType
@@ -113,6 +115,8 @@ class MediaFunctions:
         # on_*_lock 把换锁写回会话快照；_pending_switch 按环节名记着正在等人拍板的那个
         self.video_lock = ""
         self.on_video_lock = None
+        # 项目画幅（/ratio）：gen_video 没传 aspect_ratio 时用它；空 = 交给模型默认
+        self.default_aspect = ""
         self.image_lock = ""
         self.on_image_lock = None
         self._pending_switch: dict[str, str] = {}
@@ -206,7 +210,10 @@ class MediaFunctions:
                         "会**暂停问用户**，用户同意后才换；不要为了省钱或绕过失败自己换模型",
                     },
                     "prefer": {"type": "string", "enum": ["quality", "balanced", "fast"]},
-                    "aspect_ratio": {"type": "string", "description": "短视频用 9:16"},
+                    "aspect_ratio": {
+                        "type": "string",
+                        "description": "画幅，如 16:9 / 9:16；留空用项目设置（用户用 /ratio 选的）",
+                    },
                     "duration": {"type": "integer", "description": "秒，受模型上限约束"},
                     "resolution": {
                         "type": "string",
@@ -248,7 +255,9 @@ class MediaFunctions:
                     "allow_text": {
                         "type": "boolean",
                         "description": "允许画面出现文字。默认 false：提示词会带最高优先级的"
-                        "禁字幕/禁文字约束（成片字幕由后期压，不能让模型烧进画面）",
+                        "禁字幕/禁文字约束（成片字幕由后期压，不能让模型烧进画面）。"
+                        "传 true 会当场问用户，用户不同意就不生成；"
+                        "上屏文字请用 overlay_text 后期叠",
                     },
                 },
                 "required": ["prompt"],
@@ -285,7 +294,10 @@ class MediaFunctions:
                         "传不同的模型会暂停问用户",
                     },
                     "prefer": {"type": "string", "enum": ["quality", "balanced", "fast"]},
-                    "aspect_ratio": {"type": "string", "description": "公共比例，短视频用 9:16"},
+                    "aspect_ratio": {
+                        "type": "string",
+                        "description": "公共画幅，如 16:9 / 9:16；留空用项目设置（/ratio）",
+                    },
                     "resolution": {
                         "type": "string",
                         "enum": ["480p", "720p", "1080p", "4k"],
@@ -296,7 +308,11 @@ class MediaFunctions:
                     },
                     "duration": {"type": "integer", "description": "公共时长秒，可被单项覆盖"},
                     "parent_id": {"type": "string"},
-                    "allow_text": {"type": "boolean"},
+                    "allow_text": {
+                        "type": "boolean",
+                        "description": "允许画面出现文字（默认 false）。传 true 会当场问用户；"
+                        "上屏文字请用 overlay_text 后期叠",
+                    },
                     "allow_no_refs": {
                         "type": "boolean",
                         "description": (
@@ -388,6 +404,29 @@ class MediaFunctions:
         n_i, n_v = len(self.catalog.image), len(self.catalog.video)
         return ProviderHealth(ok=True, detail=f"图 {n_i} 个 / 视频 {n_v} 个模型")
 
+    def permission_for(
+        self, tool: str, args: dict[str, Any]
+    ) -> tuple[PermissionLevel, str] | None:
+        """注册表的提权钩子：要放开「画面不许有字」时，这次调用按 L-external 过闸门、当场问人。
+
+        画面禁字是用户 2026-09-18 定的最高优先级规则，allow_text 却是模型自己就能填的参数
+        （2026-09-26 审查）。放开它得人点头：闸门在终端里问（/auto 也问、默认不放行），
+        模型没法替人答。批量版单项里写的 allow_text 同样算。
+        """
+        if tool not in ("gen_video", "gen_videos"):
+            return None
+        jobs = args.get("jobs") if tool == "gen_videos" else None
+        wanted = bool(args.get("allow_text")) or any(
+            isinstance(j, dict) and bool(j.get("allow_text")) for j in (jobs or [])
+        )
+        if not wanted:
+            return None
+        return (
+            PermissionLevel.EXTERNAL,
+            "要放开「视频画面不许有字幕 / 文字」这条你定的最高优先级规则（allow_text=true），"
+            "这次生成的画面允许出现文字 —— 需要你确认",
+        )
+
     def estimate_cost(self, tool: str, args: dict[str, Any]) -> dict[str, Any] | None:
         """这次调用要花多少（给闸门事前拦用）：{"units", "seconds", "money"}。
 
@@ -440,10 +479,21 @@ class MediaFunctions:
 
     async def invoke(self, tool: str, args: dict[str, Any]) -> ToolResult:
         started = time.perf_counter()
+        fn = getattr(self, f"_fn_{tool}", None)
         try:
-            result = await getattr(self, f"_fn_{tool}")(**args)
-        except Exception as e:  # noqa: BLE001
-            result = ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
+            if fn is None:
+                raise TypeError(f"没有工具 {tool}")
+            inspect.signature(fn).bind(**args)
+        except TypeError as e:
+            # 参数对不上（模型多传 / 漏传了参数）：根本没提交，闸门按整批记的账要退回来
+            # （2026-09-24 审查：之前照样计次计秒）
+            result = ToolResult(ok=False, error=f"参数不对：{e}", meta={"charged": False})
+        else:
+            try:
+                result = await fn(**args)
+            except Exception as e:  # noqa: BLE001
+                # 执行中途出错：可能已经提交、付了钱，不退额度
+                result = ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
         result.duration_ms = int((time.perf_counter() - started) * 1000)
         return result
 
@@ -461,9 +511,12 @@ class MediaFunctions:
         drama_render_shots 里，手搓链路享受不到。所以把并发下沉到这一层。
         """
         if not jobs:
-            return ToolResult(ok=False, error="jobs 是空的")
+            return ToolResult(ok=False, error="jobs 是空的", meta={"charged": False})
         if len(jobs) > 40:
-            return ToolResult(ok=False, error=f"一次最多 40 个，收到 {len(jobs)} 个；分批调用")
+            return ToolResult(
+                ok=False, error=f"一次最多 40 个，收到 {len(jobs)} 个；分批调用",
+                meta={"charged": False},
+            )
         label = "视频" if kind is MediaKind.VIDEO else "图片"
         fn = self._fn_gen_video if kind is MediaKind.VIDEO else self._fn_gen_image
         limit = self.catalog.max_concurrency("video" if kind is MediaKind.VIDEO else "image")
@@ -492,21 +545,24 @@ class MediaFunctions:
                 continue
             i, r = item
             name = jobs[i].get("summary") or f"{label} {i + 1}"
+            unpaid = (r.meta or {}).get("charged") is False
             if r.ok and r.asset_ref:
                 ok_ids.append(r.asset_ref)
-                lines.append(f"  ✓ {name} → {r.asset_ref}")
+                tail = "（取回上次的任务，没重新付费）" if unpaid else ""
+                lines.append(f"  ✓ {name} → {r.asset_ref}{tail}")
             else:
                 failed += 1
                 lines.append(f"  ✗ {name}：{(r.error or '未知原因')[:100]}")
-                if (r.meta or {}).get("charged") is False:
-                    # 这一项没提交出去（被拦 / 被拒收），闸门按整批记的账要退回这部分
-                    job = {**shared, **jobs[i]}
-                    if kind is MediaKind.VIDEO:
-                        refund["refund_units"] += 1
-                        model = str(job.get("model") or self.video_lock or "")
-                        refund["refund_seconds"] += self.catalog.seconds_of(model, job)
-                    else:
-                        refund["refund_units"] += max(1, min(int(job.get("n") or 1), 4))
+            if unpaid:
+                # 这一项没花钱（被拦 / 被拒收 / 取回了之前付过费的任务），闸门按整批记的账
+                # 要退回这部分（2026-09-24 审查：取回的照样计次计秒，同一段算两次）
+                job = {**shared, **jobs[i]}
+                if kind is MediaKind.VIDEO:
+                    refund["refund_units"] += 1
+                    model = str(job.get("model") or self.video_lock or "")
+                    refund["refund_seconds"] += self.catalog.seconds_of(model, job)
+                else:
+                    refund["refund_units"] += max(1, min(int(job.get("n") or 1), 4))
         dt = time.perf_counter() - started
         head = (
             f"批量生成{label} {len(jobs)} 个：成功 {len(ok_ids)}，失败 {failed}"
@@ -630,7 +686,7 @@ class MediaFunctions:
         if lock and model and model != lock:
             chosen, why = self.catalog.choose(kind, model, prefer)
             if not chosen:
-                return "", "", ToolResult(ok=False, error=why)
+                return "", "", ToolResult(ok=False, error=why, meta={"charged": False})
             self._pending_switch[stage] = chosen
             question = (
                 f"要把{label}模型从 {lock} 换成 {chosen} 吗？（本次生成：{summary or '未命名'}）\n"
@@ -660,7 +716,7 @@ class MediaFunctions:
             return lock, self._prefer_note(kind, lock, prefer), None
         chosen, why = self.catalog.choose(kind, model, prefer)
         if not chosen:
-            return "", "", ToolResult(ok=False, error=why)
+            return "", "", ToolResult(ok=False, error=why, meta={"charged": False})
         if not lock:
             self._set_lock(kind, chosen)
             note = f"{label}模型已锁定为 {chosen}（{why}）：之后都用它，要换会先问用户。"
@@ -824,6 +880,19 @@ class MediaFunctions:
             return gate
         model = chosen
         spec = self.catalog.get(MediaKind.VIDEO, chosen)
+        # 画幅：没传就用项目设置（/ratio）；这个模型不支持的在提交前拦下（2026-09-25）
+        aspect_ratio = aspect_ratio or self.default_aspect
+        listed_ar = [str(x) for x in (getattr(spec, "aspect_ratios", None) or [])] if spec else []
+        if aspect_ratio and listed_ar and aspect_ratio not in listed_ar:
+            return ToolResult(
+                ok=False,
+                meta={"charged": False},
+                error=(
+                    f"{chosen} 不支持画幅 {aspect_ratio}"
+                    f"（支持 {' / '.join(listed_ar)}），没有提交。"
+                    "换一个画幅，或先征得用户同意换视频模型"
+                ),
+            )
         res_note = ""
         listed = list(getattr(spec, "resolutions", None) or []) if spec else []
         if resolution and listed and resolution not in listed:
@@ -1019,6 +1088,11 @@ class MediaFunctions:
                     base += f"-{i + 1}"
                 target = unique_path(folder, base + ext)
                 p = await self.prefs.download(url, folder, target.name)
+                if p and kind is MediaKind.IMAGE:
+                    # 生图接口回的不一定是 PNG（jpg / webp 都有）：按文件头改成真实扩展名 ——
+                    # 之前一律存 .png，按扩展名认格式的看图软件、图床会出错（2026-09-24 审查）
+                    p = _fix_image_ext(p)
+                    a.mime = _IMAGE_MIME.get(p.suffix.lower(), a.mime)
                 if p:
                     a.gen_params["local"] = str(p)
                     # Agent 自己留一份（同盘硬链接不占空间）：产物目录是用户的，
@@ -1047,10 +1121,14 @@ class MediaFunctions:
                 f"取回了之前没拿到结果的任务 {task.task_id}（没有重新付费），"
                 f"{chosen} 共 {len(assets)} 个：\n"
             )
+        recovered = bool(getattr(task, "recovered", False))
+        meta: dict[str, Any] = {"task_id": task.task_id, "recovered": recovered}
+        if recovered:
+            meta["charged"] = False  # 取回的没重新付费：闸门记的这次额度退回
         return ToolResult(
             content=head + "\n".join(lines) + local_note,
             asset_ref=assets[0].id,
-            meta={"task_id": task.task_id, "recovered": bool(getattr(task, "recovered", False))},
+            meta=meta,
         )
 
     # ---------- 任务台账：钱花了没拿到结果的，能取回 ----------
@@ -1160,3 +1238,43 @@ def keep_blob(store: Any, src: Any, asset_id: str) -> Any:
         return dest
     except OSError:
         return None
+
+
+# ---------------------------------------------------------------- 图片格式
+
+
+_IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif",
+}
+
+
+def _sniff_image_ext(head: bytes) -> str:
+    """按文件头认图片格式。认不出返回空串。"""
+    if head.startswith(b"\x89PNG"):
+        return ".png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    if head[:4] == b"GIF8":
+        return ".gif"
+    return ""
+
+
+def _fix_image_ext(p: Path) -> Path:
+    """扩展名和真实格式对不上就改名（同名已存在加 -v2）。改不了原样返回。"""
+    try:
+        with p.open("rb") as f:
+            head = f.read(12)
+    except OSError:
+        return p
+    ext = _sniff_image_ext(head)
+    have = p.suffix.lower()
+    if not ext or have == ext or (ext == ".jpg" and have == ".jpeg"):
+        return p
+    target = unique_path(p.parent, p.stem + ext)
+    try:
+        p.rename(target)
+    except OSError:
+        return p
+    return target

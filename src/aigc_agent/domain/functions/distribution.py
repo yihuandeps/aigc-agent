@@ -79,7 +79,9 @@ class DistributionFunctions:
                         "override_reason": {
                             "type": "string",
                             "description": (
-                                "机审有 block 仍要打包时，人给出的放行理由（会记进 manifest）"
+                                "机审有 block 仍要打包时，人给出的放行理由（会记进 manifest）。"
+                                "只在用户明确说了要带着问题发、并给了理由时才填；填了会当场"
+                                "再问用户一次，用户不同意就不打包"
                             ),
                         },
                     },
@@ -106,6 +108,25 @@ class DistributionFunctions:
                 parameters={"type": "object", "properties": {}},
             ),
         }
+
+    def permission_for(
+        self, tool: str, args: dict[str, Any]
+    ) -> tuple[PermissionLevel, str] | None:
+        """注册表的提权钩子：带着 override_reason 打包 = 机审 / 格式有 block 也要打，当场问人。
+
+        override_reason 写的是「人给出的放行理由」，但它是模型自己就能填的参数（2026-09-26
+        审查）：之前模型写一句理由，block 级问题就带进了待发布包。现在闸门在终端里问人，
+        人不同意就不打包。"""
+        if tool != "build_release_package":
+            return None
+        reason = str(args.get("override_reason") or "").strip()
+        if not reason:
+            return None
+        return (
+            PermissionLevel.EXTERNAL,
+            f"机审或格式有 block 级问题仍要打包，放行理由「{reason[:60]}」—— "
+            "带病发布需要你确认（理由会记进 manifest）",
+        )
 
     async def list_tools(self) -> list[ToolMeta]:
         return [s.meta(self.name) for s in self._specs.values()]
