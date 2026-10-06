@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import sys
@@ -273,6 +274,14 @@ class DouyinFunctions:
         md = self.store.content(report_id)
         if not md.strip():
             return ToolResult(ok=False, error=f"{report_id} 是空的")
+        # 渲染脚本用同一个解释器跑，它 import 的 Python-Markdown 不在核心依赖里：没装时
+        # 子进程只会留下一段 ImportError 堆栈，这里先说清楚怎么装
+        if importlib.util.find_spec("markdown") is None:
+            return ToolResult(
+                ok=False,
+                error="导出 PDF 需要 Python-Markdown：pip install markdown"
+                "（或安装 .[douyin] 依赖组），本机还要有 Chrome 或 Edge",
+            )
 
         reports = self.workspace / "reports"
         reports.mkdir(parents=True, exist_ok=True)

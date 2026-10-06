@@ -13,6 +13,14 @@
 
 评论端点 `fetch_video_comments` 上游写法正确，未改。
 
+## render_pdf.py
+
+### 2026-10-06 · 样式文件放到脚本找的位置（脚本本身未改）
+- 脚本按「脚本目录的上一级 / assets / report.css」找样式（照搬上游 skill 的目录布局），
+  找不到就静默用空样式
+- 之前样式文件放在仓库根的 `assets/report.css`，脚本读不到，PDF 报告一直没有样式（2026-09-29 审查）
+- 处理：挪到 `vendor/assets/report.css`；以后从上游同步时，把上游的 `assets/report.css` 放到这里
+
 ## 没有移植的文件
 
 - `dy_transcribe.py` —— agent 已有 `transcribe` function（whisper-1，可直出 srt），

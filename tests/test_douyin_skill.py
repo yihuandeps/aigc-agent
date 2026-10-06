@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
@@ -14,7 +15,7 @@ import pytest
 import yaml
 
 from aigc_agent.domain.assets.store import AssetStore
-from aigc_agent.domain.functions.douyin import DouyinFunctions, _slug
+from aigc_agent.domain.functions.douyin import RENDER_SCRIPT, DouyinFunctions, _slug
 from aigc_agent.harness.events.bus import EventBus
 from aigc_agent.harness.tools.registry import ToolRegistry
 
@@ -211,6 +212,28 @@ async def test_渲染空报告被拦(tmp_path: Path):
     empty = store.create("   ")
     r = await registry.invoke("render_douyin_report", {"report_id": empty.id})
     assert not r.ok and "空的" in r.error
+
+
+def test_PDF样式文件在渲染脚本找的位置():
+    """render_pdf.py 按「脚本目录的上一级/assets/report.css」找样式，找不到就静默用空样式 ——
+    之前样式放在仓库根的 assets/，脚本读不到，PDF 一直没有样式（2026-09-29 审查）。"""
+    src = RENDER_SCRIPT.read_text(encoding="utf-8")
+    assert "SKILL_DIR = Path(__file__).resolve().parent.parent" in src
+    assert 'CSS_PATH = SKILL_DIR / "assets" / "report.css"' in src
+    assert (RENDER_SCRIPT.resolve().parent.parent / "assets" / "report.css").is_file()
+
+
+async def test_没装markdown时给出安装提示(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Python-Markdown 不在核心依赖里；没装时不能只甩给用户一段子进程的 ImportError。"""
+    registry, store, _ = await _funcs(tmp_path)
+    report = store.create("# 报告\n\n正文")
+    real = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util, "find_spec",
+        lambda name, *a, **k: None if name == "markdown" else real(name, *a, **k),
+    )
+    r = await registry.invoke("render_douyin_report", {"report_id": report.id})
+    assert not r.ok and "pip install markdown" in r.error
 
 
 def test_文件名清洗防止越出工作目录():

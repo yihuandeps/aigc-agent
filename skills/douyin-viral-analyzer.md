@@ -245,7 +245,7 @@ status: active
 ## 📄 输出 PDF 报告（最终交付物）
 
 Markdown 是工作格式，**交付给用户的最终产物是 PDF**。用 `render_douyin_report` function：
-传报告 markdown 的资产 id，它套用 `assets/report.css`（A4、红色 accent、表格条纹、
+传报告 markdown 的资产 id，它套用内置的报告样式（A4、红色 accent、表格条纹、
 阴影图片、页码）渲染成 PDF 并落成资产。
 
 文件名建议 `<账号>_<视频简称>_<日期>.pdf`。渲染完把路径告诉用户。

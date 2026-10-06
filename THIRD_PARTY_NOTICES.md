@@ -8,7 +8,7 @@
 |---|---|---|
 | [0xsline/short-drama](https://github.com/0xsline/short-drama) | MIT | `skills/drama-script/` |
 | [LearnPrompt/awesome-seedance](https://github.com/LearnPrompt/awesome-seedance) | 代码 MIT · 策划内容 CC BY 4.0 · 案例原文归原作者 | `skills/seedance-prompting/`、`scripts/build_seedance_skill.py` 生成的参考文档、`config/recipes/ugc-vlog.yaml`、`config/recipes/product-ad.yaml` |
-| [procmeans/rainwell-douyin-viral-analyzer](https://github.com/procmeans/rainwell-douyin-viral-analyzer) | **上游未声明许可证** | `src/aigc_agent/domain/functions/vendor/douyin/`、`assets/report.css`、`skills/douyin-viral-analyzer.md`、`skills/data-fetching.md` |
+| [procmeans/rainwell-douyin-viral-analyzer](https://github.com/procmeans/rainwell-douyin-viral-analyzer) | **上游未声明许可证** | `src/aigc_agent/domain/functions/vendor/douyin/`、`src/aigc_agent/domain/functions/vendor/assets/report.css`、`skills/douyin-viral-analyzer.md`、`skills/data-fetching.md` |
 | [yaohaoliang141-max/ai-character-passport](https://github.com/yaohaoliang141-max/ai-character-passport) | 仅借鉴思路，未复制代码 | `src/aigc_agent/domain/storyboard/` |
 
 ---
@@ -40,7 +40,7 @@
 - 本仓库中的位置：
   - `src/aigc_agent/domain/functions/vendor/douyin/dy_fetch.py`：上游脚本，修过一处接口名，记录在同目录的 `PATCHES.md`；
   - `src/aigc_agent/domain/functions/vendor/douyin/render_pdf.py`：上游脚本，未修改；
-  - `assets/report.css`：上游 PDF 报告样式，未修改；
+  - `src/aigc_agent/domain/functions/vendor/assets/report.css`：上游 PDF 报告样式，未修改（放在渲染脚本查找的位置）；
   - `skills/douyin-viral-analyzer.md`：在上游 `SKILL.md` 基础上加了本 Agent 的 frontmatter 和工具对接说明；
   - `skills/data-fetching.md`：在上游 `references/data-fetching.md` 基础上修改（当前是 `draft` 状态，Agent 不会加载）。
 - 许可：**上游仓库没有声明开源许可证**。这些文件的著作权归原作者所有，**不适用本仓库的 MIT 许可**，这里只注明出处。
