@@ -14,9 +14,14 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# thinking.effort 的合法取值（强制思考的模型）。写错了服务端一律 400，而且很快就回、
+# 重试也没用 —— 抖音线简报角色配了 medium，6 次调用 6 次 400（2026-09-29 审查）。
+# 所以在加载配置时就拦住，启动即报错，而不是等到调用时才失败。
+THINKING_EFFORTS = ("low", "high", "max")
 
 # yaml 里未填写的项统一写成 TODO，解析时视为 None
 _PLACEHOLDERS = {"TODO", "todo", "TBD", None, ""}
@@ -118,6 +123,18 @@ class TextConfig(BaseModel):
     roles: dict[str, str]
     role_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
     fallback_chain: list[str] = Field(default_factory=list)
+
+    @field_validator("role_params")
+    @classmethod
+    def _check_thinking_effort(cls, v: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        for role, params in v.items():
+            effort = (params or {}).get("thinking_effort")
+            if effort and effort not in THINKING_EFFORTS:
+                raise ValueError(
+                    f"role_params.{role}.thinking_effort = {effort!r} 不是合法值，"
+                    f"只能是 {' / '.join(THINKING_EFFORTS)}（写错了服务端会直接返回 400）"
+                )
+        return v
 
     def resolve(self, role: str) -> tuple[ProviderConfig, dict[str, Any]]:
         """角色 → (provider 配置, 该角色的参数覆盖)。"""

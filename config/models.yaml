@@ -182,7 +182,8 @@ text:
       max_output_tokens: 3000    # 一段视频八帧的分镜级描述要写不少字
     short_video_planner:
       temperature: 0.6
-      thinking_effort: medium    # 要交叉比对热点、判断时长，比写描述多想一步
+      # 原来写的 medium 不是合法值，这个角色 6 次调用 6 次 400，抖音线从没跑通（2026-09-29 审查）
+      thinking_effort: low       # 和其他 json 角色一样；现在加载配置时会校验取值
       response_format: json
       max_output_tokens: 6000    # 简报 + 口播 + 分镜一起出
     voice_select:
