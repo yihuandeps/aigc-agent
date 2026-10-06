@@ -336,7 +336,7 @@ audio:
 
   # ---------- MiniMax 音色 ----------
   # ⚠️ **这批 id 还没用真 key 核对过**。之前猜 qwen-audio-3.0-tts-* 猜错过，
-  #    所以这里只作候选：拿到 key 后跑 `agent models --voices` 对一遍，
+  #    所以这里只作候选：拿到 key 后跑 `agent story voices` 对一遍，
   #    不对就照 platform.minimaxi.com 的音色列表改。
   #    MiniMax 的 voice_id 是字符串，也支持你自己克隆的音色 id。
   # ---------- MiniMax 音色（国内站）----------

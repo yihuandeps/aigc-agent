@@ -2,9 +2,9 @@
 # 短视频配方 —— 数据不是代码，改这里就能迭代
 # ============================================================
 #
-# 跑：  agent video "你的主题"
-# 换配方：agent video "主题" --recipe 别的配方名
-# 临时覆盖：agent video "主题" --duration 45 --tier quality
+# 跑：  agent video make "你的主题"
+# 换配方：agent video make "主题" --recipe 别的配方名
+# 临时覆盖：agent video make "主题" --duration 45 --tier quality
 #
 # 想调效果，优先动这个文件，不要改 Python：
 #   · 镜头多了/少了       → shots.count
@@ -87,7 +87,7 @@ voiceover:
   # auto = 让模型看着文案的语气挑音色和语速。
   # 同一个音色配所有内容是"听着假"的隐性来源：用新闻女声念生活种草，
   # 语气和内容对不上，哪怕音色本身很自然也别扭。
-  # 想固定就把 auto 换成具体音色名（agent models --voices 看全部）。
+  # 想固定就把 auto 换成具体音色名（agent story voices 看全部）。
   voice: auto
   speed: 1.0 # 0.25~4.0。实测这是唯一真正有效的节奏旋钮
   # ⚠️ instruct 实测经 APIMart 转发**不生效**（下"每句停顿三秒"时长毫无变化）。
