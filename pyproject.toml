@@ -5,10 +5,13 @@ description = "AIGC 内容创作 Agent —— Loop + Graph 双执行引擎的半
 requires-python = ">=3.11"
 
 # P0 依赖：跑通最小 Loop 所需
+# ffmpeg / ffprobe 是外部二进制，不走 pip：
+#   Windows: winget install Gyan.FFmpeg  或  choco install ffmpeg
+#   验证:    ffmpeg -version
 dependencies = [
-    "openai>=1.40",             # Kimi 走 OpenAI 兼容协议，AsyncOpenAI
+    "openai>=3.0",              # Kimi 走 OpenAI 兼容协议，AsyncOpenAI；3.0 起底层是 httpx2，网关直接传 httpx2.AsyncClient
+    "httpx2>=2.7",              # 网关 / 媒体 / 托管 / 下载等模块直接 import（2026-10-06 补声明，之前靠 openai 顺带装上）
     "pydantic>=2.7",            # 全部 schema
-    "pydantic-settings>=2.3",   # .env 注入
     "pyyaml>=6.0",              # 配置与图定义
     "structlog>=24.1",          # M6 结构化事件
     "typer>=0.12",              # CLI
@@ -19,22 +22,25 @@ dependencies = [
 
 [project.optional-dependencies]
 
-# P1：持久化 + MCP
+# P1：MCP（自带的本地素材库 server 要用）
+# 需要 2.x：FastMCP 在 2.x 改名成了 MCPServer。持久化全是 JSON / JSONL 文件，没有用 SQLite
 p1 = [
-    "aiosqlite>=0.20",          # Memory Store / GraphState 快照 / 事件流
-    "mcp>=1.0",                 # M20 MCP Hub，官方 SDK
+    "mcp>=2.0",                 # M20 MCP Hub，官方 SDK
 ]
 
-# P2：媒体处理 + Web API
-p2 = [
-    "pillow>=10.3",             # 图像精修 / 抠图 / 封面裁剪
-    "fastapi>=0.111",           # 人审台后端
-    "uvicorn[standard]>=0.30",
-    "sse-starlette>=2.1",       # 事件流推送到前端
-    # ffmpeg 是外部二进制，不走 pip：
-    #   Windows: winget install Gyan.FFmpeg  或  choco install ffmpeg
-    #   验证:    ffmpeg -version
+# 浏览器采集（小红书搜索、抖音热榜 RPA）：优先用系统里的 Chrome / Edge
+rpa = [
+    "playwright>=1.40",
 ]
+
+# 抖音爆款拆解：报告转 PDF（Python-Markdown + 本机 Chrome / Edge）；没有 TikHub 时 yt-dlp 回退下载
+douyin = [
+    "markdown>=3.4",
+    "yt-dlp",
+]
+
+# 原来的 p2 组（fastapi / uvicorn / sse-starlette，Web 人审台用）和 pydantic-settings、aiosqlite
+# 在这份代码里都没有被 import，2026-10-06 删掉（2026-09-29 审查 4.6）
 
 dev = [
     "pytest>=8.2",
