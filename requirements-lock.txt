@@ -1,7 +1,9 @@
-# 作者本机实测可用的依赖版本（Python 3.11.9，Windows 11，2026-10，全量测试 1401 个通过）。
-# 用作「约束文件」：只锁定版本，不会额外安装没用到的包。
-#   pip install -e ".[p1,dev]" -c requirements-lock.txt
-# 其中 playwright（RPA 采集）不在 pyproject 里，需要时手动装：pip install playwright -c requirements-lock.txt
+# Known-good dependency versions (Python 3.11.9, Windows 11, 2026-10; full test suite passing).
+# Use it as a constraints file: it only pins versions and never installs extra packages.
+#   pip install -e ".[p1]" -c requirements-lock.txt
+# playwright (RPA) is not declared in pyproject; install it on demand:
+#   pip install playwright -c requirements-lock.txt
+# Keep this file ASCII-only: pip reads it with the locale encoding (GBK on Chinese Windows).
 
 annotated-doc==0.0.5
 annotated-types==0.8.0
