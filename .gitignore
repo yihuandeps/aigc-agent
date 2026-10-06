@@ -1,8 +1,18 @@
-# 密钥
+# 密钥（真密钥只放 .env；模板 .env.example 才提交）
 .env
 .env.local
+.env.*
+!.env.example
 *.key
 *.pem
+*.p12
+*.pfx
+secrets/
+# 抖音抓取用的浏览器 cookies（dy_fetch.py --cookies / DY_COOKIES）
+cookies*.txt
+*.cookies
+# Claude Code 本机设置
+.claude/settings.local.json
 
 # 运行时产物
 /workspace/
@@ -18,6 +28,10 @@ node_modules/
 .import_linter_cache/
 *.egg-info/
 /blobs/
+/build/
+/dist/
+.coverage
+htmlcov/
 
 # 编辑器
 .vscode/
