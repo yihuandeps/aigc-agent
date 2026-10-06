@@ -2183,7 +2183,9 @@ class DramaFunctions:
         if not base.local and not base.url:
             return FaceAudit(character=who, keeper=base, why=why,
                              skipped="基准图既没有本地副本也没有链接，比不了")
-        refs = [(f"角色「{who}」本人", base.local or base.url)]
+        # 有本地副本就传资产 id，_ref_payload 才会转成 data URL；之前传的是本地路径，原样当
+        # 图片链接发给视觉模型必然失败，每张都记成「比不了」，审查从没真正比过（2026-09-29 审查）
+        refs = [(f"角色「{who}」本人", base.asset_id if base.local else base.url)]
         verdicts: dict[str, tuple[bool, int, list[str]]] = {}
         notes: list[str] = []
         for c in cands:

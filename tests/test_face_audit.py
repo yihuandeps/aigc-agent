@@ -257,6 +257,39 @@ async def test_渲完参考图自动查_可以关掉(tmp_path: Path):
     assert lib
 
 
+async def test_基准图有本地副本时_发给视觉模型的是data_URL(tmp_path: Path):
+    """2026-09-29 审查：基准图传的是本地路径，原样当图片链接发出去必然失败，每张都记成
+    「比不了」，审查从没真正比过。上面几条把 _image_payload 换成了假的所以测不出来 ——
+    这条不替换它，直接看发给视觉模型的消息里是什么。"""
+    store = AssetStore(tmp_path / "assets")
+    lib = store.create(json.dumps(LIB, ensure_ascii=False), summary="资产库",
+                       creator="tool:drama_assets")
+    keep = _img(store, "角色·阿蛛", tmp_path, "keep")
+    other = _img(store, "阿蛛·模型试探·qwen", tmp_path, "other")
+    pack = {"阿蛛": {"asset": keep, "url": "https://img/keep.png", "kind": "角色"}}
+    store.create(json.dumps(pack), type_=AssetType.STORYBOARD, summary="包", parents=[lib.id],
+                 creator="tool:drama_render_assets")
+    sent: list[list[str]] = []
+
+    async def chat(role: str, messages: list[dict[str, Any]], **_: Any) -> Any:
+        sent.append([p["image_url"]["url"] for m in messages for p in m["content"]
+                     if isinstance(p, dict) and p.get("type") == "image_url"])
+        return SimpleNamespace(text=json.dumps({"score": 9}))
+
+    fns = DramaFunctions(SimpleNamespace(chat=chat), store, registry=_Reg(), catalog=None)
+    fns.catalog = SimpleNamespace(drama={"identity_pass_score": "7"}, max_concurrency=lambda k: 0)
+    fns.files = SimpleNamespace(trash=tmp_path / "trash")
+    r = await fns.invoke("drama_audit_faces", {"assets_id": lib.id, "apply": False})
+    assert r.ok, r.error
+    assert len(sent) == 1, "两张脸应当真的比对一次"
+    refs_and_target = sent[0]
+    assert len(refs_and_target) == 2, refs_and_target
+    assert all(u.startswith("data:image/png;base64,") for u in refs_and_target), (
+        "参考图和被比的图都要转成 data URL，不能把本地路径当链接发出去"
+    )
+    assert other
+
+
 async def test_默认不查服装图_deep才查(tmp_path: Path):
     """服装图生成时已经过了一道一致性门，默认再查一遍就是重复花视觉模型的钱。"""
     store = AssetStore(tmp_path / "assets")
