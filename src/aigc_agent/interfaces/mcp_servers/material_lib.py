@@ -4,7 +4,8 @@
 现成 server；而且它正好把 M20 的四个难点都过一遍 —— 命名空间、默认 L-external
 + 逐工具降级、描述包裹、stdio 生命周期与熔断。
 
-**独立进程，不 import 本包任何东西。** 通过
+**独立进程，本包里只 import domain/sensitive_paths.py**（拒绝表，只用标准库；
+和主进程 fs_* 共用一份，免得两边各抄各的漏规则）。通过
 
     python -m aigc_agent.interfaces.mcp_servers.material_lib
 
@@ -36,6 +37,9 @@ from mcp.server.mcpserver import MCPServer
 # 预期内的失败（越界、不存在）要抛 ToolError：mcp 2.x 把其它异常一律包成
 # "Error executing tool xxx" 并吞掉原文，客户端只会看到一句没有信息量的话。
 from mcp.server.mcpserver.exceptions import ToolError
+
+# 本包里唯一引的模块：拒绝表（只用标准库，不会把主进程那一串依赖带进来）
+from ...domain.sensitive_paths import HARD_DENY, denied
 
 KIND_EXT: dict[str, set[str]] = {
     "image": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"},
@@ -69,27 +73,18 @@ def _workspace() -> Path:
     return Path(__file__).resolve().parents[4] / "workspace"
 
 
-# 导入源的拒绝模式：和主进程 fs_* 的 _HARD_DENY 同一批（这里是独立进程，不引主包）
-_SENSITIVE = (
-    "*/.env", "*/.env.*", "*.pem", "*.key", "*.pfx", "*.p12", "*.ppk", "*.kdbx",
-    "*/id_rsa*", "*/id_ed25519*", "*/id_ecdsa*", "*/id_dsa*",
-    "*/.ssh/*", "*/.gnupg/*", "*/.aws/*", "*/.azure/*", "*/.kube/*", "*/.docker/*",
-    "*/.claude/*", "*credential*", "*/.git-credentials", "*/.netrc", "*/_netrc",
-    "*/.npmrc", "*/.pypirc", "*/appdata/roaming/*", "*/appdata/locallow/*", "*/user data/*",
-    "*/appdata/local/microsoft/*", "*/appdata/local/google/*", "*/appdata/local/packages/*",
-    "*/.venv/*", "*/.git/*",
-    "c:/windows/*", "c:/program files/*", "c:/program files (x86)/*",
-)
+# 导入源的拒绝规则：和主进程 fs_* 是同一份表、同一个匹配函数。
+# 2026-09-29 审查 1.5：这里之前手抄了一份，漏了 rpa/profile 和 .config/gcloud ——
+# 抖音、小红书的浏览器登录态能拷进素材库，主进程 fs_read 再从素材库读出来发给模型
+_SENSITIVE = HARD_DENY
 
 
 def _sensitive(p: Path) -> bool:
-    import fnmatch
-
     try:
-        s = str(p.resolve()).replace("\\", "/").lower()
+        resolved = p.resolve()
     except OSError:
         return True
-    return any(fnmatch.fnmatch(s, pat) for pat in _SENSITIVE)
+    return denied(resolved, _SENSITIVE)
 
 
 def root() -> Path:

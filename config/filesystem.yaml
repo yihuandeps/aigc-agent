@@ -19,7 +19,7 @@ material_dirs: []
 
 # 永远不读不写：凭据、虚拟环境、版本库、系统目录。通配符按完整路径匹配。
 # 这里只能**往上加**：凭据类规则（.ssh / .aws / *credential* / 浏览器数据 / AppData\Roaming …）
-# 写死在代码里（files.py 的 _HARD_DENY），这个列表删掉什么都不会放开它们。
+# 写死在代码里（domain/sensitive_paths.py，fs 工具和素材库共用），这个列表删掉什么都不会放开它们。
 #
 # 另：写 Agent 自己的文件（项目下的代码 / config / skills，workspace 里的资产库、台账、记忆、
 # 日志）不是禁止，而是每次都要你确认 —— 否则模型能自己改预算、改规则（2026-09-23 审查）。

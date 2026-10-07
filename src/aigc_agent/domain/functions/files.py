@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import mimetypes
 import os
 import re
@@ -44,6 +43,8 @@ from ..assets.store import AssetStore, AssetType, local_copy
 from ..documents import DOC_EXT, UNSUPPORTED_EXT, extract_text
 from ..local_materials import ranges as index_ranges
 from ..media import ffmpeg
+from ..sensitive_paths import HARD_DENY
+from ..sensitive_paths import denied as path_denied
 
 TEXT_EXT = {
     ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".csv", ".tsv", ".srt", ".vtt",
@@ -63,28 +64,12 @@ _ASSET_EXT: dict[AssetType, str] = {
     AssetType.AUDIO: ".mp3",
     AssetType.SUBTITLE: ".srt",
 }
-_DEFAULT_DENY = [
-    "**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/*.pfx",
-    "**/.venv/**", "**/.git/**", "**/__pycache__/**", "**/node_modules/**",
-    "C:/Windows/**", "C:/Program Files/**", "C:/Program Files (x86)/**",
-]
-# 永远生效、配置删不掉的拒绝规则（2026-09-23 审查）：配置里写了 deny 列表时，
-# 上面的默认值会被整个替换掉 —— 凭据不能靠配置记得写。fs_read 读到的东西会原样
+# 永远生效、配置删不掉的拒绝规则（2026-09-23 审查）：之前配置里写了 deny 列表时，
+# 默认值会被整个替换掉 —— 凭据不能靠配置记得写。fs_read 读到的东西会原样
 # 发给文本模型（第三方），私钥、登录凭据、浏览器数据一旦读出来就收不回。
-_HARD_DENY = [
-    *_DEFAULT_DENY,
-    "**/.ssh/**", "**/.gnupg/**", "**/.aws/**", "**/.azure/**", "**/.kube/**",
-    "**/.docker/**", "**/.config/gcloud/**", "**/.claude/**",
-    "**/.git-credentials", "**/.netrc", "**/_netrc", "**/.npmrc", "**/.pypirc",
-    "**/*credential*", "**/*.kdbx", "**/*.p12", "**/*.ppk",
-    "**/id_ed25519*", "**/id_ecdsa*", "**/id_dsa*",
-    # 应用配置与浏览器数据（登录态、Cookie、保存的密码）。AppData/Local/Temp 与 Programs 不拦 ——
-    # 临时文件和装在那里的程序（用户的 agent.cmd 就在 Programs 下）是正常要碰的
-    "**/AppData/Roaming/**", "**/AppData/LocalLow/**", "**/User Data/**",
-    "**/AppData/Local/Microsoft/**", "**/AppData/Local/Google/**", "**/AppData/Local/Packages/**",
-    # RPA 用的浏览器 profile（抖音登录态、Local State 里的加密主密钥）
-    "**/rpa/profile/**",
-]
+# 规则表在 domain/sensitive_paths.py，和素材库 MCP server 共用一份（2026-09-29 审查 1.5：
+# 那边之前手抄了一份，漏了 rpa/profile 和 .config/gcloud）
+_HARD_DENY = list(HARD_DENY)
 # workspace 里 Agent 自己的状态（写它们 = 改 Agent 的账本/记忆/资产库）
 _STATE_DIRS = {
     "assets": "资产库",
@@ -246,13 +231,8 @@ class FileFunctions:
         return p, ""
 
     def denied(self, p: Path) -> bool:
-        s = _norm(p).lower()
         extra = [d for d in _HARD_DENY if d not in self.policy.deny]  # 手搓的 FsPolicy 也兜住
-        for pat in list(self.policy.deny) + extra:
-            q = pat.replace("\\", "/").lower()
-            if fnmatch.fnmatch(s, q) or fnmatch.fnmatch(s, q.removeprefix("**/")):
-                return True
-        return False
+        return path_denied(p, list(self.policy.deny) + extra)
 
     def protected(self, p: Path) -> str:
         """写到这里等于改 Agent 自己？是就返回是什么（给人看的），否则空串。
