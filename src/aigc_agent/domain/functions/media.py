@@ -23,6 +23,7 @@ from typing import Any
 
 from ...harness.events.bus import EventType
 from ...harness.model.media import MediaGateway, MediaKind
+from ...harness.model.quota import is_quota_error
 from ...harness.tools.provider import (
     PermissionLevel,
     ProviderHealth,
@@ -521,14 +522,28 @@ class MediaFunctions:
         fn = self._fn_gen_video if kind is MediaKind.VIDEO else self._fn_gen_image
         limit = self.catalog.max_concurrency("video" if kind is MediaKind.VIDEO else "image")
         sem = asyncio.Semaphore(limit) if limit > 0 else None
+        # 余额 / 额度用完（2026-09-29 审查 1.1）：第一个撞上之后，还在排队的不再发 —— 之前一批
+        # 8 段并发全部 402，后面排队的照样一个个去撞
+        quota: dict[str, str] = {}
+
+        async def run(args: dict[str, Any]) -> ToolResult:
+            if quota:
+                return ToolResult(
+                    ok=False, error="没发：前面已经撞上余额 / 额度用完",
+                    meta={"charged": False, "quota": True},
+                )
+            r = await fn(**args)
+            if not r.ok and (r.meta or {}).get("quota") and not quota:
+                quota["why"] = (r.error or "")[:200]
+            return r
 
         async def one(i: int, job: dict[str, Any]) -> tuple[int, ToolResult]:
             args = {**shared, **{k: v for k, v in job.items() if v is not None}}
             args.setdefault("summary", f"{label} {i + 1}")
             if sem is None:
-                return i, await fn(**args)
+                return i, await run(args)
             async with sem:
-                return i, await fn(**args)
+                return i, await run(args)
 
         started = time.perf_counter()
         results = await asyncio.gather(
@@ -568,6 +583,14 @@ class MediaFunctions:
             f"批量生成{label} {len(jobs)} 个：成功 {len(ok_ids)}，失败 {failed}"
             f"（并发上限 {limit or '不限'}，耗时 {dt / 60:.1f} 分钟）"
         )
+        if quota:
+            # 原因写在最前面：后面一串 ✗ 都是同一个原因，别让模型挨个去查
+            head = (
+                f"⛔ 余额 / 额度用完了，这一批停在这里（{quota['why']}）。"
+                "重试、换模型、拆小批都没用：告诉用户去充值（或等额度窗口恢复）；"
+                "出好的（✓）都留着，恢复后只把 ✗ 的几项再发一次\n"
+                + head
+            )
         if not ok_ids:
             return ToolResult(ok=False, error=head + "\n" + "\n".join(lines), meta=refund)
         tail = f"\n\n按顺序的资产 id：{' '.join(ok_ids)}"
@@ -993,6 +1016,7 @@ class MediaFunctions:
         )
 
         if not task.ok:
+            quota = is_quota_error(task.http_status, task.error or "")
             return ToolResult(
                 ok=False,
                 error=(
@@ -1002,7 +1026,7 @@ class MediaFunctions:
                 # 给调用方程序看：能不能原样重提（2026-09-23 审查：之前靠错误文本猜，
                 # 把「轮询失败」也当网络抖动重提，同一个镜头付两份钱）
                 meta={
-                    "retryable": task.retryable,
+                    "retryable": task.retryable and not quota,
                     "task_id": task.task_id,
                     "stage": task.stage,
                     "status": task.status.value,
@@ -1011,6 +1035,8 @@ class MediaFunctions:
                         task.stage == "submit"
                         and (task.retryable or 400 <= task.http_status < 500)
                     ),
+                    # 余额 / 额度用完：调用方据此停下整批，不再一段段撞（2026-09-29 审查 1.1）
+                    "quota": quota,
                 },
             )
 

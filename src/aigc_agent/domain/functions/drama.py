@@ -5094,6 +5094,14 @@ class DramaFunctions:
                 )
                 if got_note:
                     clip_notes = [got_note, *clip_notes]
+                if not r.ok and (r.meta or {}).get("quota") and not halt["why"]:
+                    # 余额 / 额度用完（2026-09-29 审查 1.1）：后面的段一段都别发，原因写在最前面
+                    halt["why"] = (
+                        f"余额 / 额度用完了（{(r.error or '')[:160]}），这一批后面的段没发。"
+                        "重试、换模型、拆小批都没用：告诉用户去充值（或等额度窗口恢复），"
+                        "渲好的段都留着，恢复后原样再跑一次只补没渲的"
+                    )
+                    halt["quota"] = True
                 blocked = False
                 if r.ok and r.asset_ref:
                     blocked = not self._mark_clip(r.asset_ref, clip_notes)
@@ -5165,8 +5173,12 @@ class DramaFunctions:
                             rolled_from=old.asset if old else "",
                         )
 
+        # 余额 / 额度用完停下的：原因放最前面，后面一串失败都是它（2026-09-29 审查 1.1）
+        quota_head = f"⛔ {halt['why']}\n\n" if halt.get("quota") else ""
         if not done:
-            return ToolResult(ok=False, error="一段视频都没生成：\n" + "\n".join(failed))
+            return ToolResult(
+                ok=False, error=quota_head + "一段视频都没生成：\n" + "\n".join(failed)
+            )
 
         anchors_id = ""
         keep_new = {n: a for n, a in new_anchors.items() if n not in held}
@@ -5278,7 +5290,7 @@ class DramaFunctions:
                 "去掉 limit 再跑会复用这几段、只补其余的"
             )
         fresh = len(ordered) - len(reused)
-        head = f"生成 {len(ordered)} 段视频"
+        head = quota_head + f"生成 {len(ordered)} 段视频"
         if reused:
             head += f"（复用 {len(reused)}，新生成 {fresh}）"
         head += "：\n" + "\n".join(lines) + notes + warn

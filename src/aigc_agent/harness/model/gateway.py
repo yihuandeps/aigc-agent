@@ -33,6 +33,7 @@ from openai import (
 from ..events.bus import EventBus, EventType
 from .config import ModelsConfig, ProviderConfig
 from .media import default_proxy
+from .quota import QuotaExhaustedError, is_quota_error
 
 
 @dataclass
@@ -238,6 +239,11 @@ class ModelGateway:
             # 工具层会把它原样报给主模型 —— 之前报的是原始 400，主模型绕了 11 轮去改自己的配置
             if classify_model_error(e)[0] == "model_unavailable":
                 raise ModelUnavailableError(role, provider.key, provider.model, str(e)) from e
+            # 余额 / 额度用完：同理，说清是哪家、该充值还是等窗口（2026-09-29 审查 1.1：之前原始
+            # 402 直接甩给主模型，它当成模型的问题换了两次模型）
+            status = getattr(e, "status_code", None)
+            if is_quota_error(status, str(e)):
+                raise QuotaExhaustedError(provider.key, status, str(e), role=role) from e
             raise
         resp.duration_ms = int((time.perf_counter() - started) * 1000)
         resp.model = provider.model
@@ -314,12 +320,19 @@ class ModelGateway:
                 budget = min(cfg.max_attempts, 2)
             except (APIConnectionError, RateLimitError) as e:
                 last = e
-                retryable = True
+                # 429 要是额度用完（不是限流），等多久都没用
+                retryable = not (
+                    isinstance(e, RateLimitError) and is_quota_error(e.status_code, str(e))
+                )
                 # 纯网络问题：服务端没收到请求，重发无副作用 —— 值得多等一会儿
                 budget = cfg.attempts_for(isinstance(e, APIConnectionError))
             except APIStatusError as e:
                 last = e
-                retryable = e.status_code in cfg.retry_status
+                # 余额不足：APIMart 先回 500 再回 402，500 在 retry_on 里，之前照样重试（9-27
+                # 两次 drama_shots 共重试 12 次）。钱没了重发多少次都一样（2026-09-29 审查 1.1）
+                retryable = e.status_code in cfg.retry_status and not is_quota_error(
+                    e.status_code, str(e)
+                )
             except _STREAM_BROKEN as e:
                 # 流式输出中途被服务端断开（incomplete chunked read）：这次的输出已经丢了，只能整包
                 # 重发。2026-09-25 实测：拆视频提示词时 40 秒左右断过两次，之前直接判失败，主模型
@@ -436,7 +449,6 @@ _CONTEXT_OVERFLOW = re.compile(
     r"context|too long|maximum.*tokens|tokens.*(exceed|limit)|supports only \d+\s*k",
     re.I,
 )
-_QUOTA = re.compile(r"usage limit|quota|insufficient|额度|余额|balance", re.I)
 # 流式输出被服务端中途断开（httpx 和 httpcore 各有一套异常类，互不继承）
 _STREAM_BROKEN: tuple[type[BaseException], ...] = (
     httpx.RemoteProtocolError,
@@ -481,6 +493,8 @@ def classify_model_error(exc: BaseException) -> tuple[str, str]:
     """
     if isinstance(exc, ModelUnavailableError):
         return "model_unavailable", ""  # 消息本身已经写清楚怎么办
+    if isinstance(exc, QuotaExhaustedError):
+        return "quota", ""  # 同上
     if isinstance(exc, APITimeoutError):
         return "timeout", "模型响应超时，多半是上下文太大或服务端拥堵；发「继续」会重试。"
     if isinstance(exc, APIConnectionError):
@@ -492,7 +506,7 @@ def classify_model_error(exc: BaseException) -> tuple[str, str]:
     status = getattr(exc, "status_code", None)
     if _CONTEXT_OVERFLOW.search(msg) and status in (None, 400, 401, 413, 422):
         return "context_overflow", "请求超过模型上下文上限。"
-    if status in (402, 403, 429) and _QUOTA.search(msg):
+    if is_quota_error(status, msg):
         return "quota", "模型额度用尽（订阅窗口或余额）。等额度恢复后发「继续」即可，进度不会丢。"
     if status in (400, 403, 404, 503) and _MODEL_UNAVAILABLE.search(msg):
         return "model_unavailable", (

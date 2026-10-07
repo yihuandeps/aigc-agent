@@ -24,6 +24,7 @@ from typing import Any, Protocol
 import httpx2 as httpx
 
 from ..events.bus import EventBus, EventType
+from .quota import is_quota_error
 
 
 def default_proxy() -> str | None:
@@ -241,20 +242,21 @@ class ApiMartProvider:
 
         if resp.status_code >= 400:
             code = resp.status_code
+            error = f"HTTP {code}：{_err_text(payload) or resp.text[:200]}"
             return MediaTask(
                 task_id="",
                 kind=kind,
                 model=model,
                 status=TaskStatus.FAILED,
-                error=f"HTTP {code}：{_err_text(payload) or resp.text[:200]}",
+                error=error,
                 raw=payload,
                 stage="submit",
                 http_status=code,
                 # 429 是被拒收（没建任务、不扣费）；503 是服务不可用（没转到后端）。
                 # 502/504 是上游没及时回 —— 和 ReadTimeout 一样，上游可能已经建了任务，
                 # 原样重提可能付两份（2026-09-24 审查）。400/401/403/500 等说明请求本身或
-                # 服务端有问题，重提没意义或有风险
-                retryable=code in (429, 503),
+                # 服务端有问题，重提没意义或有风险。429 要是额度用完（不是限流），重提也没用
+                retryable=code in (429, 503) and not is_quota_error(code, error),
             )
 
         urls = extract_urls(payload)
@@ -677,6 +679,8 @@ class MediaGateway:
                 task.status is TaskStatus.FAILED
                 and task.http_status == 429
                 and limited < self.rate_limit_retries
+                # 额度用完的 429 退避多久都没用（2026-09-29 审查 1.1）
+                and not is_quota_error(429, task.error or "")
             ):
                 limited += 1
                 await asyncio.sleep(min(5.0 * (2 ** (limited - 1)), 60.0))
