@@ -84,7 +84,9 @@ async def test_按产线收窄全披露_紧凑目录只列要展开的():
 
 def test_产线的工具范围():
     drama = line_providers(get_line("drama"))
-    assert {"drama", "content", "files", "media"} <= drama and "short_video" not in drama
+    assert {"drama", "content", "files"} <= drama and "short_video" not in drama
+    # 短剧线的生图生视频由 drama_* 在内部调，不随请求发全量定义（2026-09-29 审查 2.5）
+    assert not {"media", "edit", "audio", "distribution", "fanout"} & drama
     design = line_providers(get_line("design"))
     assert "poster" in design and "drama" not in design
 

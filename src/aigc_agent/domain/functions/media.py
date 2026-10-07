@@ -198,7 +198,7 @@ class MediaFunctions:
                 "生成**一段**视频。**很慢也很贵**，调之前先确认脚本/分镜已经定稿、"
                 "最好已经过人审。可以先用 fast 档验证方向，定了再用 quality 档出成片。\n"
                 "⚠️ **要生成两段以上一律改用 gen_videos 批量并发**：一次工具调用就是一个迭代，"
-                "逐段调必然串行 —— 实测 19 段串行 2.3 小时，并发约 20 分钟。"
+                "逐段调必然串行，比并发慢好几倍。"
                 "整集短剧优先用 drama_render_shots，它自带依赖排队与失败复用。"
             ),
             parameters={
@@ -221,8 +221,8 @@ class MediaFunctions:
                         "enum": ["480p", "720p", "1080p", "4k"],
                         # 480p 是 2026-09-22 对着 seedance-2.0-fast 实测过的：
                         # 出 496×864，最省钱，验证分镜方向用它
-                        "description": "验证方向用 480p 最省（seedance-2.0-fast 实测支持，"
-                        "各模型支持哪些看 list_media_models），成片再上 720p",
+                        "description": "验证方向用 480p 最省"
+                        "（各模型支持哪些看 list_media_models），成片再上 720p",
                     },
                     "image_urls": {
                         "type": "array",
@@ -274,8 +274,7 @@ class MediaFunctions:
             timeout=7200,
             description=(
                 "**要生成两段以上视频时一律用这个，不要一段一段调 gen_video。**"
-                "逐段调会一段跑完才发下一段（一次工具调用就是一个迭代），"
-                "实测 19 段串行跑了 2.3 小时；并发跑同样的量约 20 分钟。\n"
+                "逐段调会一段跑完才发下一段（一次工具调用就是一个迭代），比并发慢好几倍。\n"
                 "jobs 是任务数组，每项至少有 prompt，可覆盖 image / duration / summary / "
                 "local_name 等；公共参数（模型、比例、分辨率）写在外层。"
                 "返回按顺序的资产 id，可直接喂给 compose_video。"
@@ -304,8 +303,8 @@ class MediaFunctions:
                         "enum": ["480p", "720p", "1080p", "4k"],
                         # 480p 是 2026-09-22 对着 seedance-2.0-fast 实测过的：
                         # 出 496×864，最省钱，验证分镜方向用它
-                        "description": "验证方向用 480p 最省（seedance-2.0-fast 实测支持，"
-                        "各模型支持哪些看 list_media_models），成片再上 720p",
+                        "description": "验证方向用 480p 最省"
+                        "（各模型支持哪些看 list_media_models），成片再上 720p",
                     },
                     "duration": {"type": "integer", "description": "公共时长秒，可被单项覆盖"},
                     "parent_id": {"type": "string"},

@@ -109,8 +109,10 @@ _COMMON_PROVIDERS = (
     "builtin", "meta", "skill", "content", "files", "retrieval", "vision", "compliance",
 )
 _LINE_PROVIDERS: dict[str, tuple[str, ...]] = {
-    "drama": ("drama", "episodes", "media", "hosting", "edit", "audio", "distribution",
-              "fanout"),
+    # 短剧线：生图、生视频、拼接都由 drama_* 工具在内部调，模型用不着直接拿 gen_video 这些（短剧
+    # 本来就不许用 gen_video 补镜头）。media / edit / audio / distribution / fanout 只上目录、
+    # 要用时再展开 —— 每次请求少发约 5.5K token 的工具定义（2026-09-29 审查 2.5）
+    "drama": ("drama", "episodes", "hosting"),
     "douyin": ("short_video", "hotspot", "rpa", "douyin", "materials", "media", "hosting",
                "edit", "audio", "distribution", "analytics"),
     "ad": ("short_video", "materials", "media", "hosting", "edit", "audio", "poster",

@@ -33,7 +33,10 @@ class ToolRegistry:
         # 不做这个的话，接 5 个 MCP server（60-80 个工具）光工具定义就吃掉
         # 30-50K token —— 占 256K 窗口的 20%，一行活还没干。
         self._digest_only: set[str] = set()  # 最终名
-        self._expanded: set[str] = set()  # 已展开全 schema 的
+        # 已展开全 schema 的 → 最近一次用到的序号（展开、调用都算）。dict 保持展开的先后：
+        # 随请求发的 schema 按这个顺序追加在末尾，满额时收回最久没用的（2026-09-29 审查 2.5）
+        self._expanded: dict[str, int] = {}
+        self._tick = 0
         self.max_expanded = 8
         # 按产线收窄：不在这里的 provider 的工具也只上目录、按需展开。None = 不收窄。
         # 2026-09-23 审查：两级披露对内置工具没生效 —— 89 份 schema 每次请求全量发送
@@ -140,13 +143,22 @@ class ToolRegistry:
             hint = f"。你是想找：{', '.join(near)}？" if near else ""
             return False, f"没有名为 {name!r} 的工具{hint}"
         if name in self._expanded:
+            self._touch(name)
             return True, f"{name} 的完整定义已在上下文里，直接调用即可"
         if len(self._expanded) >= self.max_expanded:
-            dropped = self._expanded.pop()
-            self._expanded.add(name)
-            return True, f"已展开 {name}（达上限，收回了 {dropped}）"
-        self._expanded.add(name)
+            # 收回最久没用的：之前 set.pop() 收回的是随便哪一个，可能正是刚在用的
+            dropped = min(self._expanded, key=self._expanded.__getitem__)
+            del self._expanded[dropped]
+            self._touch(name)
+            return True, f"已展开 {name}（达上限，收回了最久没用的 {dropped}）"
+        self._touch(name)
         return True, f"已展开 {name}，现在可以调用它了"
+
+    def _touch(self, name: str) -> None:
+        """记一次「用到了」。已展开的只更新序号、不挪位置 —— 位置一变，请求里它后面的
+        工具定义就和上一次对不上，前缀缓存失效。"""
+        self._tick += 1
+        self._expanded[name] = self._tick
 
     async def schemas_for_context(
         self, names: Iterable[str] | None = None
@@ -156,19 +168,24 @@ class ToolRegistry:
         = 全披露 provider 的全部工具 + 已展开的 digest 工具。
         未展开的 digest 工具只出现在目录里，不占 schema 预算。
         names 给了就只取这个子集。
+
+        展开的工具按展开先后**追加在末尾**（2026-09-29 审查 2.5）：之前按目录顺序插在中间，
+        展开一个，请求里它后面的工具定义整段错位，前缀缓存从那里起全部失效。
         """
         allow = set(names) if names is not None else None
-        picked = [
-            n
-            for n in self._catalog
-            if (allow is None or n in allow) and (not self._is_digest(n) or n in self._expanded)
+        full = [
+            n for n in self._catalog if (allow is None or n in allow) and not self._is_digest(n)
         ]
-        return await self.schemas(picked)
+        more = [
+            n for n in self._expanded
+            if n in self._catalog and (allow is None or n in allow) and self._is_digest(n)
+        ]
+        return await self.schemas(full + more)
 
     def collapse(self, name: str) -> bool:
         """收回一个已展开的 digest 工具（能力预算降级用）。"""
         if name in self._expanded:
-            self._expanded.discard(name)
+            del self._expanded[name]
             return True
         return False
 
@@ -314,6 +331,8 @@ class ToolRegistry:
         pname, orig = self._origin[name]
         if pname in self._down:
             return ToolResult(ok=False, error=f"provider {pname!r} 当前不可用，该工具已临时摘除")
+        if name in self._expanded:
+            self._touch(name)  # 调用也算用到：满额收回时不收正在用的
         return await self._providers[pname].invoke(orig, args)
 
     async def health(self) -> dict[str, ProviderHealth]:
