@@ -6,6 +6,9 @@ Cost Guard 的单任务口径只活在进程里，进程一退就归零。项目
 
 不做数据库：单机内部工具，一天几百行，一年也就十几万行，读一遍很快。
 真到了要看趋势的时候再挪进 SQLite，接口不变。
+
+文本 provider 没配单价的那几行，cost 是按保守估价算的（estimated=true），照样计入单日 / 单项目
+金额；输入、输出 token 分开记，以后补了真实单价能回算（2026-10-07，09-29 审查 2.1）。
 """
 
 from __future__ import annotations
@@ -30,10 +33,19 @@ class LedgerEntry(BaseModel):
     project: str = "default"
     session: str = ""
     kind: str = "text"  # text | image | video | audio
-    cost: float | None = None  # 元；没单价就 None
+    # 元。文本 provider 没配单价时是按保守估价算的（estimated=True），照样计入单日 / 单项目金额；
+    # 连估价都没有（媒体目录没填单价）就是 None
+    cost: float | None = None
+    estimated: bool = False
     calls: int = 1
-    tokens: int = 0
+    tokens: int = 0  # 输入 + 输出
+    # 输入（含命中缓存）、输出、其中命中缓存的 token 分开记：以后补了真实单价，估算的那几笔
+    # 能按 token 回算（2026-10-07，09-29 审查 2.1）。这之前的行只有 tokens 合计
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
     role: str = ""
+    provider: str = ""  # 文本：config/models.yaml 的 provider 键（单价按它配）
     model: str = ""
     seconds: float = 0.0  # 生成的视频秒数（退还时为负）
 
@@ -55,6 +67,9 @@ class CostLedger:
     def _reset(self) -> None:
         self._money_by_day: dict[str, float] = defaultdict(float)
         self._money_by_project: dict[str, float] = defaultdict(float)
+        # 金额里按保守估价算的那部分（已经含在上面两项里，单独记是为了展示时说清）
+        self._est_by_day: dict[str, float] = defaultdict(float)
+        self._est_by_project: dict[str, float] = defaultdict(float)
         self._calls_by_day: dict[tuple[str, str], int] = defaultdict(int)
         self._calls_by_project: dict[tuple[str, str], int] = defaultdict(int)
         self._seconds_by_day: dict[str, float] = defaultdict(float)
@@ -96,6 +111,9 @@ class CostLedger:
         if e.cost is not None:
             self._money_by_day[e.day] += e.cost
             self._money_by_project[e.project] += e.cost
+            if e.estimated:
+                self._est_by_day[e.day] += e.cost
+                self._est_by_project[e.project] += e.cost
         self._calls_by_day[(e.day, e.kind)] += e.calls
         self._calls_by_project[(e.project, e.kind)] += e.calls
         if e.seconds:
@@ -121,12 +139,22 @@ class CostLedger:
     # ---------- 查询 ----------
 
     def money(self, day: str = "", project: str = "") -> float:
+        """花了多少（元），含按估价算的部分 —— 单日 / 单项目上限要看得见没配单价的模型。"""
         self._load()
         if day:
             return self._money_by_day.get(day, 0.0)
         if project:
             return self._money_by_project.get(project, 0.0)
         return sum(self._money_by_day.values())
+
+    def estimated(self, day: str = "", project: str = "") -> float:
+        """money() 里按保守估价算的那部分（元）。展示金额时说清楚多少是估算。"""
+        self._load()
+        if day:
+            return self._est_by_day.get(day, 0.0)
+        if project:
+            return self._est_by_project.get(project, 0.0)
+        return sum(self._est_by_day.values())
 
     def calls(self, kind: str, day: str = "", project: str = "") -> int:
         self._load()
@@ -154,8 +182,10 @@ class CostLedger:
         return {
             "today": d,
             "today_money": round(self.money(day=d), 4),
+            "today_estimated": round(self.estimated(day=d), 4),  # 已含在 today_money 里
             "today_calls": {k: self.calls(k, day=d) for k in kinds if self.calls(k, day=d)},
             "project": project,
             "project_money": round(self.money(project=project), 4) if project else 0.0,
+            "project_estimated": round(self.estimated(project=project), 4) if project else 0.0,
             "entries": self.entries,
         }

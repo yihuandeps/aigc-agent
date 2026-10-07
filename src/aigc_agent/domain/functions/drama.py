@@ -3996,7 +3996,10 @@ class DramaFunctions:
                 parts.append(f"{room['seconds']:.0f} 秒")
                 over = over or worst_s > room["seconds"]
             if room.get("money") is not None:
-                parts.append(f"¥{room['money']:.2f}")
+                # 已花的钱里有按估价计的（没配单价的文本模型，09-29 审查 2.1）：剩多少也跟着是估的
+                usage = getattr(guard, "usage", None)
+                est = getattr(usage, "estimate_note", None)
+                parts.append(f"¥{room['money']:.2f}" + (est() if callable(est) else ""))
                 over = over or bool(worst_m and worst_m > room["money"])
             if parts:
                 lines.append(

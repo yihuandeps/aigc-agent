@@ -47,7 +47,10 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
-    cost: float | None = None
+    cost: float | None = None  # 按真实单价（provider 的 pricing）算的，元；没配单价是 None
+    # 没配单价时按 text.pricing_estimate 的保守估价算的，元（这时 cost 仍是 None）。
+    # 金额护栏和台账照样计入，展示时标「估算」（2026-10-07，09-29 审查 2.1）
+    est_cost: float | None = None
 
 
 @dataclass
@@ -239,27 +242,40 @@ class ModelGateway:
         resp.duration_ms = int((time.perf_counter() - started) * 1000)
         resp.model = provider.model
 
-        resp.usage.cost = provider.pricing.cost(
-            resp.usage.prompt_tokens, resp.usage.completion_tokens, resp.usage.cached_tokens
-        )
-        if resp.usage.cost is None and provider.key not in self._pricing_warned:
+        u = resp.usage
+        u.cost = provider.pricing.cost(u.prompt_tokens, u.completion_tokens, u.cached_tokens)
+        # 没配单价：按保守估价另算一份 est_cost，金额护栏和台账照样计入、标「估算」。之前按 0 记，
+        # gemini 三天约 ¥90–100 护栏看不见（09-29 审查 2.1）。cost 仍是 None —— 它只放真实单价
+        # 算出来的钱，只认 cost 的看板照旧标「无单价」，不会把估算当成真账
+        estimate = self.config.text.pricing_estimate if u.cost is None else None
+        if estimate is not None:
+            u.est_cost = estimate.cost(u.prompt_tokens, u.completion_tokens, u.cached_tokens)
+        if u.cost is None and provider.key not in self._pricing_warned:
             self._pricing_warned.add(provider.key)
-            await self.bus.emit(
-                EventType.WARNING,
-                message=(
+            if estimate is not None and u.est_cost is not None:
+                message = (
+                    f"provider {provider.key!r} 没配 pricing：金额按保守估价计入"
+                    f"（{estimate.brief()}），各处标「估算」。查到真实单价后填进 "
+                    "config/models.yaml 这个 provider 的 pricing.input_per_mtok / "
+                    "output_per_mtok，就改按真价算。"
+                )
+            else:
+                message = (
                     f"provider {provider.key!r} 未配置 pricing，成本无法核算。"
                     f"在 config/models.yaml 填 pricing.input_per_mtok / output_per_mtok。"
-                ),
-            )
+                )
+            await self.bus.emit(EventType.WARNING, message=message)
 
         await self.bus.emit(
             EventType.COST,
             role=role,
+            provider=provider.key,
             model=provider.model,
-            prompt_tokens=resp.usage.prompt_tokens,
-            completion_tokens=resp.usage.completion_tokens,
-            cached_tokens=resp.usage.cached_tokens,
-            cost=resp.usage.cost,
+            prompt_tokens=u.prompt_tokens,
+            completion_tokens=u.completion_tokens,
+            cached_tokens=u.cached_tokens,
+            cost=u.cost,
+            est_cost=u.est_cost,
             duration_ms=resp.duration_ms,
         )
         await self.bus.emit(

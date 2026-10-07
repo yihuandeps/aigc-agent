@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
+
+from rich.markup import escape
 
 # 认哪些说法（精确词优先，其次按包含的字判）
 _EXACT: dict[str, str] = {
@@ -48,20 +51,33 @@ def parse_budget(text: str) -> dict[str, float]:
     return out
 
 
-def render_budget(limits: dict[str, Any], priced: bool) -> str:
-    """给人看的额度清单（CLI 面板里的正文）。"""
+def render_budget(limits: dict[str, Any], priced: bool, estimated: Sequence[str] = ()) -> str:
+    """给人看的额度清单（CLI 面板里的正文）。
+
+    estimated：没配单价、金额按保守估价计入的文本 provider（TextConfig.estimated_providers()，
+    如「gemini（gemini-3.8-flash，按输入 ¥6.48 / 输出 ¥21.6 每百万 token 估）」）。之前它们按 0 记，
+    面板却写「含文本模型」—— 9-25 到 9-27 gemini 约 ¥90–100 金额上限没看见（09-29 审查 2.1）。
+    现在照样计入金额上限，面板上点名、标「估算」。
+    """
 
     def num(v: Any, unit: str, money: bool = False) -> str:
         if v is None:
             return "不限"
         return f"¥{float(v):.0f}" if money else f"{float(v):.0f} {unit}"
 
+    part = "，部分按估价" if estimated else ""
     lines = [
-        f"金额   {num(limits.get('money'), '', money=True)}（本次开工，含文本模型）",
+        f"金额   {num(limits.get('money'), '', money=True)}（本次开工，含文本模型{part}）",
         f"视频   ≤ {num(limits.get('video_calls'), '段')} · "
         f"≤ {num(limits.get('video_seconds'), '秒')}",
         f"图片   ≤ {num(limits.get('image_calls'), '张')}",
     ]
+    if estimated:
+        lines.append(
+            "[yellow]⚠ 这几家文本模型没配单价，金额按保守估价计入（各处标「估算」）："
+            f"{escape('、'.join(estimated))}。查到真实单价后填进 config/models.yaml "
+            "对应 provider 的 pricing，就改按真价算[/]"
+        )
     if not priced:
         lines.append(
             "[yellow]⚠ 媒体模型没配单价（config/media_models.yaml 的 price / price_per_second）："

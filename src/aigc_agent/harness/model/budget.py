@@ -11,7 +11,9 @@
 
 所以这里按两套口径同时拦：
 
-  · 金额  —— 有 pricing 就按钱算，这是最准的
+  · 金额  —— 有 pricing 就按钱算，这是最准的。文本 provider 没配 pricing 的按保守估价
+             计入（text.pricing_estimate），各处标「估算」—— 之前按 0 记，gemini 三天约
+             ¥90–100 金额上限看不见（2026-10-07，09-29 审查 2.1）
   · 次数  —— 没 pricing 也能拦。媒体生成本来就是**按次计费**不是按 token，
              次数才是它的自然单位；而且次数口径在不知道单价时依然有效，
              这让防线不依赖"运营有没有把价格填对"
@@ -67,8 +69,12 @@ DEFAULT_CALL_LIMITS: dict[str, int] = {
 class Usage:
     """一次任务内的累计用量。"""
 
-    money: float = 0.0  # 已知单价的部分，元
-    unpriced: int = 0  # 算不出钱的调用次数（文本没 pricing，或媒体目录没填单价）
+    money: float = 0.0  # 算得出钱的部分，元（含下面按估价算的）
+    # money 里按保守估价算的部分：文本 provider 没配单价（2026-10-07）。照样计入、照样拦，
+    # 只是展示时要说清多少是估算、是哪几家。estimated_by：provider -> 估算金额
+    estimated: float = 0.0
+    estimated_by: dict[str, float] = field(default_factory=dict)
+    unpriced: int = 0  # 连估价都算不出钱的调用次数（文本没 pricing 又关了估价）
     calls: dict[str, int] = field(default_factory=dict)
     # 生成的视频总秒数。**不依赖单价**的视频刹车：媒体目录没填价格时金额口径看不见视频，
     # 段数又不反映长短，秒数才是视频花费的自然单位（2026-09-23 审查）
@@ -77,24 +83,41 @@ class Usage:
     def add_call(self, kind: str) -> None:
         self.calls[kind] = self.calls.get(kind, 0) + 1
 
-    def add_cost(self, cost: float | None) -> None:
-        if cost is None:
-            self.unpriced += 1
-        else:
+    def add_cost(
+        self, cost: float | None, estimate: float | None = None, source: str = ""
+    ) -> None:
+        """记一次调用的金额。cost 按真实单价算；没有时用 estimate（按保守估价算的，source 是
+        哪家 provider），两样都没有才记一次「无单价」。"""
+        if cost is not None:
             self.money += cost
+        elif estimate is not None:
+            self.money += estimate
+            self.estimated += estimate
+            key = source or "?"
+            self.estimated_by[key] = self.estimated_by.get(key, 0.0) + estimate
+        else:
+            self.unpriced += 1
 
     def add(self, kind: str, cost: float | None = None) -> None:
         """一次调用：计次 + 记金额。"""
         self.add_call(kind)
         self.add_cost(cost)
 
+    def estimate_note(self) -> str:
+        """「（其中估算 ¥3.2000：gemini 没配单价）」；金额里没有估算的部分返回空串。"""
+        if not self.estimated_by:
+            return ""
+        who = "、".join(sorted(self.estimated_by))
+        return f"（其中估算 ¥{self.estimated:.4f}：{who} 没配单价）"
+
     def brief(self) -> str:
         parts = [f"{k} {n} 次" for k, n in sorted(self.calls.items()) if n]
         if self.seconds:
             parts.append(f"视频 {self.seconds:.0f} 秒")
-        head = f"¥{self.money:.4f}" if self.money else "金额未知"
+        head = f"¥{self.money:.4f}" if self.money or self.estimated_by else "金额未知"
         tail = f"（{self.unpriced} 次调用无单价）" if self.unpriced else ""
-        return f"{head} · {' / '.join(parts) if parts else '无调用'}{tail}"
+        parts_text = " / ".join(parts) if parts else "无调用"
+        return f"{head}{self.estimate_note()} · {parts_text}{tail}"
 
 
 @dataclass
@@ -115,8 +138,9 @@ class Verdict:
 class CostGuard:
     """按金额和次数两套口径、任务/项目/日三级拦。
 
-    两套是**或**的关系：任一超限就拦。金额口径在 pricing 缺失时自动失效，
-    次数口径始终有效 —— 这是有意的，防线不该依赖配置填得全不全。
+    两套是**或**的关系：任一超限就拦。次数口径始终有效 —— 这是有意的，防线不该依赖
+    配置填得全不全。金额口径：文本 provider 没配 pricing 的按保守估价计入（标「估算」，
+    2026-10-07），不再因此失效；媒体目录没填单价的看不见，靠次数 / 秒数口径管。
     """
 
     money_limit: float | None = None
@@ -179,20 +203,33 @@ class CostGuard:
     def _on_event(self, ev: Event) -> None:
         if ev.type is not EventType.COST:
             return
-        kind = str(ev.data.get("modality") or Kind.TEXT)
-        cost = ev.data.get("cost")
+        d = ev.data
+        kind = str(d.get("modality") or Kind.TEXT)
+        cost = d.get("cost")
+        # 没配单价的文本 provider：网关按保守估价另给一份 est_cost（cost 仍是 None）。
+        # 照样计入金额、照样进台账，只是标「估算」（2026-10-07，09-29 审查 2.1）
+        est = d.get("est_cost") if cost is None else None
+        estimate = None if est is None else float(est)
+        provider = str(d.get("provider") or "")
         # 媒体调用已经在闸门处计过次，这里只补金额；文本调用两样都在这记。
         if kind == Kind.TEXT:
             self.usage.add_call(kind)
-        self.usage.add_cost(cost)
+        self.usage.add_cost(cost, estimate, source=provider or str(d.get("model") or ""))
+        prompt = int(d.get("prompt_tokens") or 0)
+        completion = int(d.get("completion_tokens") or 0)
         self._ledger(
             kind,
-            cost,
+            cost if cost is not None else estimate,
             calls=1 if kind == Kind.TEXT else 0,
-            tokens=int(ev.data.get("prompt_tokens") or 0)
-            + int(ev.data.get("completion_tokens") or 0),
-            role=str(ev.data.get("role") or ""),
-            model=str(ev.data.get("model") or ""),
+            estimated=cost is None and estimate is not None,
+            tokens=prompt + completion,
+            # 输入、输出分开记：以后补了真实单价，估算的那几笔能按 token 回算
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            cached_tokens=int(d.get("cached_tokens") or 0),
+            role=str(d.get("role") or ""),
+            provider=provider,
+            model=str(d.get("model") or ""),
         )
 
     def _ledger(self, kind: str, cost: float | None, calls: int, **extra: Any) -> None:
@@ -266,10 +303,11 @@ class CostGuard:
         bonus = self.extra_money
         this = f"（这次预估 ¥{money:.2f}）" if money else ""
         cap = (self.money_limit or 0.0) + bonus
+        # 已花的钱里有按估价算的就说清楚（多少、哪几家）：人决定追不追加时要知道这部分不是真账
         if self.money_limit is not None and _over(self.usage.money, money, cap):
             return Verdict(
                 False,
-                f"本次开工已花 ¥{self.usage.money:.4f}{this}，"
+                f"本次开工已花 ¥{self.usage.money:.4f}{self.usage.estimate_note()}{this}，"
                 f"超过上限 ¥{self.money_limit + bonus:.2f}",
                 money=True, dimension="money", level="task",
             )
@@ -297,9 +335,10 @@ class CostGuard:
             day = today()
             spent_today = self.ledger.money(day=day)
             if self.daily_limit is not None and _over(spent_today, money, self.daily_limit + bonus):
+                est = _paren(_of_which(self.ledger.estimated(day=day)))
                 return Verdict(
                     False,
-                    f"今日已花 ¥{spent_today:.4f}{this}，达到单日上限 "
+                    f"今日已花 ¥{spent_today:.4f}{est}{this}，达到单日上限 "
                     f"¥{self.daily_limit + bonus:.2f}",
                     money=True, dimension="money", level="day",
                 )
@@ -307,9 +346,10 @@ class CostGuard:
             if self.project_limit is not None and _over(
                 spent_project, money, self.project_limit + bonus
             ):
+                est = _paren(_of_which(self.ledger.estimated(project=self.project_id)))
                 return Verdict(
                     False,
-                    f"项目「{self.project_id}」已花 ¥{spent_project:.4f}{this}，"
+                    f"项目「{self.project_id}」已花 ¥{spent_project:.4f}{est}{this}，"
                     f"达到单项目上限 ¥{self.project_limit + bonus:.2f}",
                     money=True, dimension="money", level="project",
                 )
@@ -433,7 +473,12 @@ class CostGuard:
 
     @property
     def blind(self) -> bool:
-        """金额口径是否失效（pricing 没配）。用来提醒运营。"""
+        """金额口径是否失效：没设金额上限，或有文本调用连估价都算不出钱。用来提醒运营。
+
+        文本 provider 没配 pricing 时按保守估价计入（2026-10-07），不再算失效 —— 金额照样
+        作数、照样拦，只是其中一部分是估算：多少、哪几家见 usage.estimate_note() 和 brief()。
+        媒体目录没填单价的金额口径看不见，靠次数 / 秒数口径管，不在这里判。
+        """
         return self.money_limit is None or self.usage.unpriced > 0
 
     def brief(self) -> str:
@@ -452,9 +497,13 @@ class CostGuard:
             daily = f"¥{self.daily_limit:.2f}" if self.daily_limit is not None else "未设"
             proj = f"¥{self.project_limit:.2f}" if self.project_limit is not None else "未设"
             calls = " / ".join(f"{k} {n}" for k, n in sorted(s["today_calls"].items())) or "无"
+            # 金额里有按估价算的就写在括号里（「其中估算 ¥x；上限 ¥y」），没有时和原来一样
+            day_est = _of_which(float(s["today_estimated"]))
+            proj_est = _of_which(float(s["project_estimated"]))
             text += (
-                f"\n今日 ¥{s['today_money']:.4f}（上限 {daily}）· 媒体 {calls} · "
-                f"项目 {self.project_id} ¥{s['project_money']:.4f}（上限 {proj}）"
+                f"\n今日 ¥{s['today_money']:.4f}（{day_est + '；' if day_est else ''}上限 {daily}）"
+                f"· 媒体 {calls} · 项目 {self.project_id} ¥{s['project_money']:.4f}"
+                f"（{proj_est + '；' if proj_est else ''}上限 {proj}）"
             )
         return text
 
@@ -465,3 +514,12 @@ _KIND_LABEL = {"image": "生图", "video": "视频", "audio": "配音/转写", "
 def _over(spent: float, this: float, cap: float) -> bool:
     """已经花到上限（不管这次多少都拦），或者这次的预估会把它推过上限。"""
     return spent >= cap or (this > 0 and spent + this > cap)
+
+
+def _of_which(estimated: float) -> str:
+    """金额里按估价算的那部分：「其中估算 ¥x」；没有返回空串。"""
+    return f"其中估算 ¥{estimated:.4f}" if estimated > 0 else ""
+
+
+def _paren(text: str) -> str:
+    return f"（{text}）" if text else ""

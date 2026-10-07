@@ -70,7 +70,8 @@ class RetryConfig(BaseModel):
 
 
 class Pricing(BaseModel):
-    """单位：元 / 百万 token。未填写则为 None，成本计算跳过并告警一次。"""
+    """单位：元 / 百万 token。未填写则为 None —— 网关改按 text.pricing_estimate 的保守估价
+    另算一份「估算」金额（2026-10-07），估价也关了才是「无单价」，成本计算跳过并告警一次。"""
 
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
@@ -93,6 +94,46 @@ class Pricing(BaseModel):
             c += cached_tokens / 1e6 * self.input_per_mtok
         c += completion_tokens / 1e6 * self.output_per_mtok
         return c
+
+    def brief(self) -> str:
+        """「输入 ¥6.48 / 输出 ¥21.6 每百万 token」，给告警和开工面板看。"""
+        if not self.known:
+            return "未配单价"
+        parts = [f"输入 ¥{self.input_per_mtok:g}"]
+        if self.cached_input_per_mtok is not None:
+            parts.append(f"命中缓存 ¥{self.cached_input_per_mtok:g}")
+        parts.append(f"输出 ¥{self.output_per_mtok:g}")
+        return " / ".join(parts) + " 每百万 token"
+
+
+# 没配 pricing 的文本 provider 按这组**保守估价**算金额，照样计入金额护栏和台账，各处标「估算」
+# （2026-10-07，09-29 审查 2.1：gemini 没配单价，9-25 到 9-27 三天约 ¥90–100 按 0 记了）。
+# 来源：用 APIMart 余额两次见底之间的变化和 402 预扣金额反推 gemini-3.8-flash，输入约 $0.6–0.9、
+# 输出约 $2.8–3.0 每百万 token；取上沿，按 1 美元 = 7.2 元换算：0.9 × 7.2 = 6.48，3.0 × 7.2 = 21.6。
+# 命中缓存不打折（cached_input_per_mtok 留空 = 按输入价算）：估价宁高勿低。
+# 它不是真实单价：查到后填进那个 provider 的 pricing，那一家就改按真价算。
+# models.yaml 的 text.pricing_estimate 能改这组数；那一段没写也按这组估 ——
+# 金额护栏不该因为少填一项配置就看不见一家模型
+DEFAULT_PRICING_ESTIMATE = Pricing(input_per_mtok=6.48, output_per_mtok=21.6)
+
+
+def _pricing_estimate(raw: Any) -> Pricing | None:
+    """text.pricing_estimate：没写、写成 TODO 的项用默认估价；整段写 false 才是不估
+    （不建议：没配单价的那家又会按 0 记）。"""
+    if raw is False:
+        return None
+    raw = raw if isinstance(raw, dict) else {}
+    d = DEFAULT_PRICING_ESTIMATE
+
+    def pick(key: str) -> float | None:
+        v = _num_or_none(raw.get(key))
+        return getattr(d, key) if v is None else v
+
+    return Pricing(
+        input_per_mtok=pick("input_per_mtok"),
+        output_per_mtok=pick("output_per_mtok"),
+        cached_input_per_mtok=pick("cached_input_per_mtok"),
+    )
 
 
 class ProviderConfig(BaseModel):
@@ -123,6 +164,11 @@ class TextConfig(BaseModel):
     roles: dict[str, str]
     role_params: dict[str, dict[str, Any]] = Field(default_factory=dict)
     fallback_chain: list[str] = Field(default_factory=list)
+    # providers 里没配 pricing 的按这组保守估价算「估算」金额（见 DEFAULT_PRICING_ESTIMATE）。
+    # None = 不估，那些调用照旧记「无单价」、金额按 0
+    pricing_estimate: Pricing | None = Field(
+        default_factory=lambda: DEFAULT_PRICING_ESTIMATE.model_copy()
+    )
 
     @field_validator("role_params")
     @classmethod
@@ -147,6 +193,20 @@ class TextConfig(BaseModel):
         if provider_key not in self.providers:
             raise KeyError(f"角色 {role!r} 指向的 provider {provider_key!r} 未定义")
         return self.providers[provider_key], dict(self.role_params.get(role, {}))
+
+    def estimated_providers(self) -> list[str]:
+        """没配 pricing、金额按 pricing_estimate 估算的 provider（只列有角色在用的），
+        给开工面板点名，如「gemini（gemini-3.8-flash，按输入 ¥6.48 / 输出 ¥21.6
+        每百万 token 估）」。估价关了返回空。"""
+        est = self.pricing_estimate
+        if est is None or not est.known:
+            return []
+        used = set(self.roles.values())
+        return [
+            f"{key}（{p.model}，按{est.brief()} 估）"
+            for key, p in self.providers.items()
+            if key in used and not p.pricing.known
+        ]
 
 
 class CacheConfig(BaseModel):
@@ -219,6 +279,7 @@ class ModelsConfig(BaseModel):
                 roles=text_raw.get("roles") or {},
                 role_params=text_raw.get("role_params") or {},
                 fallback_chain=text_raw.get("fallback_chain") or [],
+                pricing_estimate=_pricing_estimate(text_raw.get("pricing_estimate")),
             ),
             cache=CacheConfig(
                 mode=None if mode in _PLACEHOLDERS else mode,

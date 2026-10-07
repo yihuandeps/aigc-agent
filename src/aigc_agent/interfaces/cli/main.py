@@ -368,7 +368,7 @@ async def _confirm_budget(agent: Agent, hub: InputHub) -> None:
     current = agent.budget_defaults()
     console.print(
         Panel(
-            render_budget(current, agent.media_priced),
+            render_budget(current, agent.media_priced, agent.config.text.estimated_providers()),
             title="开工额度（这次开工最多花这些，超了会停下来问你）",
             border_style="yellow",
         )

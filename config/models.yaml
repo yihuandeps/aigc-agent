@@ -94,6 +94,22 @@ text:
       api_key: ${APIMART_API_KEY}
       model: gemini-3.8-flash
       timeout_seconds: 300          # 拆整集剧本输出很长，180 会超时
+      # ⚠️ 还没配 pricing（APIMart 上的真实单价待查）：金额按下面 text.pricing_estimate 的保守估价
+      #    计入，各处标「估算」。查到后在这里加一段 pricing，单位同 kimi_k3（元 / 百万 token）。
+
+  # ---------- 没配单价时的估价 ----------
+  # providers 里没写 pricing 的（现在是 gemini），金额不再按 0 记：按这组**保守估价**计入金额护栏
+  # 和台账，各处标「估算」，开工面板点名是哪几家。之前按 0 记，9-25 到 9-27 三天 gemini 约 ¥90–100
+  # 没进账，金额上限看不见它（docs/优化-2026-09-29.md 2.1）。
+  # 这**不是真实单价**：查到后填进对应 provider 的 pricing，那一家就改按真价算；台账分开记了
+  # 输入 / 输出 token，之前估的几笔能按真价回算。
+  # 来源：用 APIMart 余额两次见底之间的变化和 402 预扣金额反推 gemini-3.8-flash，输入约 $0.6–0.9、
+  #   输出约 $2.8–3.0 每百万 token；取上沿，按 1 美元 = 7.2 元换算：0.9 × 7.2 = 6.48，3.0 × 7.2 = 21.6。
+  #   命中缓存不打折（没填 cached_input_per_mtok 就按输入价算）—— 估价宁高勿低。
+  # 这一段删掉也照样按这组数估（代码里的默认值）：金额护栏不该因为少填一项配置就看不见一家模型。
+  pricing_estimate:
+    input_per_mtok: 6.48       # 元 / 百万 token，和 providers 的 pricing 同一单位
+    output_per_mtok: 21.6
 
 
   # 降级链：**代码里没有实现，配了也不会自动换模型**。换模型要人拍板（用户 2026-09-20 定的规则）。
@@ -280,7 +296,8 @@ cache:
 # ---------- 成本护栏 ----------
 # 对应 ARCHITECTURE.md 的 Cost Guard 横切模块
 # 两套口径同时拦（见 harness/model/budget.py）：
-#   金额 —— 按上面的参考价累计文本花费 + media_models.yaml 里填了 price 的媒体调用
+#   金额 —— 按上面的参考价累计文本花费（没配 pricing 的按 text.pricing_estimate 估、标「估算」）
+#           + media_models.yaml 里填了 price 的媒体调用
 #   次数 —— 媒体生成按次计费不按 token，目录没填单价也拦得住
 # 接线点：媒体调用在权限闸门（M5）处计次；文本从 COST 事件记；Loop 每轮问一次累计。
 cost_guard:
