@@ -134,6 +134,7 @@ from ..media.naming import (
     unique_path,
 )
 from ..media.no_text import no_text_retry, parse_subtitle_verdict, subtitle_check_messages
+from ..media.vision_input import image_data_url
 from ..realism import (
     REALISM_ROLE,
     is_minor,
@@ -1621,13 +1622,23 @@ class DramaFunctions:
         return None
 
     def _ref_payload(self, ref: str) -> str:
-        """参考图 → 给视觉模型看的 data URL：优先本地副本（远端链接会过期），没有就原样给链接。"""
+        """参考图 → 给视觉模型看的 data URL：优先本地副本（远端链接会过期），没有就原样给链接
+        （由 _vision_ref 下载转换，不直接发）。"""
         if ref.startswith("as_"):
             return self._image_payload(ref, "")
         a = self._asset_by_uri(ref)
         if a is not None:
             return self._image_payload(a.id, ref)
         return ref
+
+    async def _vision_ref(self, ref: str) -> tuple[str, str]:
+        """参考图 → (data URL, 拿不到的原因)。链接和本地路径都在这里转成 data URL：远端链接
+        视觉模型多半拉不到，路径更不能当链接发（2026-09-29 审查 1.2）。"""
+        return await image_data_url(self._ref_payload(ref))
+
+    async def _vision_image(self, asset_id: str, url: str) -> tuple[str, str]:
+        """要校验的图 → (data URL, 拿不到的原因)。本地副本优先，没有就把链接下载下来再转。"""
+        return await image_data_url(self._image_payload(asset_id, url))
 
     async def _check_identity(
         self, target: str, refs: list[tuple[str, str]], is_video: bool, pass_score: int
@@ -1641,10 +1652,17 @@ class DramaFunctions:
 
         if self.gateway is None:
             return IdentityVerdict(note="没有文本网关，跳过一致性校验")
-        ref_parts = [(label, self._ref_payload(u)) for label, u in refs]
-        ref_parts = [(lb, u) for lb, u in ref_parts if u]
+        ref_parts: list[tuple[str, str]] = []
+        missing: list[str] = []
+        for label, u in refs:
+            payload, why = await self._vision_ref(u)
+            if payload:
+                ref_parts.append((label, payload))
+            else:
+                missing.append(why)
         if not ref_parts:
-            return IdentityVerdict(note="参考图拿不到（没本地副本也没链接）", unchecked=True)
+            why = missing[0] if missing else "没有参考图"
+            return IdentityVerdict(note=f"参考图拿不到（{why}）", unchecked=True)
         if is_video:
             local = self._local_video(target)
             if local is None:
@@ -1655,9 +1673,9 @@ class DramaFunctions:
                 return IdentityVerdict(note="抽不出画面帧（检查 ffmpeg）", unchecked=True)
             targets = ["data:image/jpeg;base64," + base64.b64encode(b).decode() for b in frames]
         else:
-            payload = self._image_payload(target, "")
+            payload, why = await self._vision_image(target, "")
             if not payload:
-                return IdentityVerdict(note="生成图没有本地副本", unchecked=True)
+                return IdentityVerdict(note=f"生成图拿不到（{why}）", unchecked=True)
             targets = [payload]
         try:
             resp = await self.gateway.chat(
@@ -3779,12 +3797,17 @@ class DramaFunctions:
         best = (aid, url)
         best_score = -1
         for attempt in range(retries + 1):
-            passed, score, issues, note, direction = await self._check_realism(
+            passed, score, issues, note, direction, unchecked = await self._check_realism(
                 aid, url, level, minor=minor
             )
             entry.update({"checked": True, "pass": passed, "score": score, "issues": issues})
             if note:
                 entry["note"] = note
+            # 没查成照旧按通过放行（拦不拦待用户拍板），但报告里单列，不算「一次通过」
+            if unchecked:
+                entry["unchecked"] = True
+            else:
+                entry.pop("unchecked", None)
             if passed:
                 return aid, url
             if score > best_score:
@@ -3830,6 +3853,9 @@ class DramaFunctions:
             }
             if v.note:
                 entry["identity"]["note"] = v.note
+            if getattr(v, "unchecked", False):
+                # 图片没查成照旧按通过（拦不拦待用户拍板），报告里单列「没查成」，不写成「一致」
+                entry["identity"]["unchecked"] = True
             if v.passed:
                 return aid, url
             if v.score > best_score:
@@ -3875,11 +3901,13 @@ class DramaFunctions:
             return 1
 
     def _image_payload(self, asset_id: str, url: str) -> str:
-        """给视觉模型看的图：本地副本转 data URL（不依赖对方能不能拉外链），没有就给 url。"""
+        """给视觉模型看的图：本地副本转 data URL（不依赖对方能不能拉外链），没有就给 url
+        （没传 url 就用资产自己的链接）。链接由 _vision_image 下载转换，不直接发。"""
         try:
-            local = local_copy(self.store.get(asset_id))
+            asset = self.store.get(asset_id)
         except KeyError:
-            local = None
+            asset = None
+        local = local_copy(asset) if asset is not None else None
         if local:
             try:
                 data = Path(str(local)).read_bytes()
@@ -3887,6 +3915,8 @@ class DramaFunctions:
                 return f"data:{mime};base64," + base64.b64encode(data).decode()
             except OSError:
                 pass
+        if not url and asset is not None and (asset.uri or "").startswith(("http://", "https://")):
+            return asset.uri
         return url
 
     def _realism_level(self) -> str:
@@ -3899,27 +3929,29 @@ class DramaFunctions:
 
     async def _check_realism(
         self, asset_id: str, url: str, level: str = "", minor: bool = False
-    ) -> tuple[bool, int, list[str], str, str]:
-        """视觉模型判一张人物图的皮肤质感是否达标。返回 (通过, 分数, 问题, 备注, 不合格方向)。
+    ) -> tuple[bool, int, list[str], str, str, bool]:
+        """视觉模型判一张人物图的皮肤质感是否达标。
+        返回 (通过, 分数, 问题, 备注, 不合格方向, 没查成)。
 
         不合格方向：smooth 磨皮了 / heavy 做旧过头 / light 光太柔 —— 决定重生成往哪边改。
         校验本身失败（角色没配、调用异常、输出不是 JSON）按通过处理但写备注 ——
-        校验是保险，不能把生图链路一起挂掉。
+        校验是保险，不能把生图链路一起挂掉。图拿不到、调用失败、输出读不出来记「没查成」，
+        报告里单独列出来，不和「查过、通过」混在一起（2026-09-29 审查 1.2；拦不拦待用户拍板）。
         """
-        image = self._image_payload(asset_id, url)
+        image, why = await self._vision_image(asset_id, url)
         if not image:
-            return True, -1, [], "没有可校验的图片", ""
+            return True, -1, [], f"没查成：{why}", "", True
         try:
             resp = await self.gateway.chat(
                 REALISM_ROLE, realism_check_messages(image, level, minor=minor)
             )
         except KeyError:
-            return True, -1, [], f"models.yaml 没配 {REALISM_ROLE} 角色，跳过校验", ""
+            return True, -1, [], f"models.yaml 没配 {REALISM_ROLE} 角色，跳过校验", "", False
         except Exception as e:  # noqa: BLE001
-            return True, -1, [], f"校验调用失败：{type(e).__name__}: {e}", ""
+            return True, -1, [], f"校验调用失败：{type(e).__name__}: {e}", "", True
         v = parse_realism_report(resp.text)
         note = "；".join(i for i in v.issues if "不是" in i and "JSON" in i)
-        return v.passed, v.score, v.issues, note, v.direction
+        return v.passed, v.score, v.issues, note, v.direction, bool(note)
 
     # ---------- 整批报价（2026-09-26 用户定的） ----------
     # 之前超出开工额度后，每张参考图、每段视频各问一次 y/N（《不渡》一套参考图 174 张、额度
@@ -4307,6 +4339,15 @@ class DramaFunctions:
                     "score": rec.get("score", -1),
                     "attempts": rec.get("attempts", 1),
                 }
+                if rec.get("unchecked"):
+                    entry["realism"]["unchecked"] = True
+        # 人物一致没查成的服装图：包里记一笔，别让人以为比对过（2026-09-29 审查 1.2）
+        for x in gate_log:
+            ident = x.get("identity") if isinstance(x, dict) else None
+            if isinstance(ident, dict) and ident.get("unchecked"):
+                for entry in merged.values():
+                    if entry.get("asset") == x.get("asset"):
+                        entry["identity"] = {"unchecked": True, "note": ident.get("note", "")}
 
         asset = self.store.create(
             json.dumps(merged, ensure_ascii=False, indent=2),
@@ -5986,23 +6027,43 @@ def _realism_note(gate_log: list[dict[str, Any]]) -> str:
         return "".join(lines)
     ident = [e for e in gate_log if isinstance(e.get("identity"), dict)]
     if ident:
-        ok = [e for e in ident if e["identity"].get("pass")]
-        bad = [e for e in ident if not e["identity"].get("pass")]
+        # 没查成的（视觉模型没拿到图 / 没给出结论）单列：之前按通过算进「一致」，包里、报告里
+        # 都写一致，其实从没比过（2026-09-29 审查 1.2）
+        id_unchecked = [e for e in ident if e["identity"].get("unchecked")]
+        id_graded = [e for e in ident if not e["identity"].get("unchecked")]
+        ok = [e for e in id_graded if e["identity"].get("pass")]
+        bad = [e for e in id_graded if not e["identity"].get("pass")]
         lines.append(f"；人物一致性：{len(ok)} 张与主形象一致")
+        if id_unchecked:
+            lines.append(
+                f"，{len(id_unchecked)} 张没查成（按一致放行了，请自己看一眼）："
+                + "、".join(e["name"] for e in id_unchecked[:6])
+                + (" 等" if len(id_unchecked) > 6 else "")
+                + f"（{id_unchecked[0]['identity'].get('note') or '没给出结论'}）"
+            )
         if bad:
             lines.append(f"，{len(bad)} 张仍不像同一个人：")
             for e in bad:
                 why = "；".join(e["identity"].get("issues") or [])[:80]
                 lines.append(f"\n  ⚠ {e['name']}（{e['identity'].get('score', -1)}/10）{why}")
-    first = [e for e in checked if e.get("pass") and e.get("attempts", 1) == 1]
-    retried_ok = [e for e in checked if e.get("pass") and e.get("attempts", 1) > 1]
-    failed = [e for e in checked if not e.get("pass")]
+    unchecked = [e for e in checked if e.get("unchecked")]
+    graded = [e for e in checked if not e.get("unchecked")]
+    first = [e for e in graded if e.get("pass") and e.get("attempts", 1) == 1]
+    retried_ok = [e for e in graded if e.get("pass") and e.get("attempts", 1) > 1]
+    failed = [e for e in graded if not e.get("pass")]
     lines.append(
         f"；校验：一次通过 {len(first)} · 重生成后通过 {len(retried_ok)} · 仍不达标 {len(failed)}"
+        + (f" · 没查成 {len(unchecked)}" if unchecked else "")
     )
     for e in failed:
         issues = "；".join(e.get("issues") or [])[:120]
         lines.append(f"\n  ⚠ {e['name']}（{e.get('score', -1)} 分）{issues}")
+    if unchecked:
+        lines.append(
+            f"\n  ⚠ 没查成 {len(unchecked)} 张（按通过放行了，请自己看一眼 images/）："
+            + "、".join(e["name"] for e in unchecked[:6])
+            + (" 等" if len(unchecked) > 6 else "")
+        )
     notes = [f"{e['name']}：{e['note']}" for e in checked if e.get("note")]
     if notes:
         lines.append("\n  校验备注：" + "；".join(notes[:4]))

@@ -30,7 +30,7 @@ from ...harness.tools.provider import (
     ToolSpec,
 )
 from ..assets.store import AssetStore, AssetType, local_copy
-from ..media import ffmpeg
+from ..media import ffmpeg, vision_input
 
 VISION_ROLE = "vision"
 MAX_FRAMES = 24
@@ -218,8 +218,12 @@ class VisionFunctions:
             if path.suffix.lower() in _VIDEO_EXT:
                 return ToolResult(ok=False, error=f"{path.name} 是视频，用 view_video")
             url, err = await self._image_data_url(path)
-            if err:
-                return ToolResult(ok=False, error=err)
+        else:
+            # 远端链接先下载再转 data URL：直接发链接，视觉模型多半拉不到（9-21 一个会话就
+            # 报了 8 次 unsupported image url，2026-09-29 审查 1.2）
+            url, err = await self._remote_data_url(url)
+        if err:
+            return ToolResult(ok=False, error=err)
         text = IMAGE_PROMPT + (f"\n\n另外请回答：{question}" if question else "")
         messages = [
             {"role": "system", "content": SYSTEM},
@@ -250,6 +254,24 @@ class VisionFunctions:
         if not data:
             return "", f"{path.name} 是空文件"
         return f"data:{mime};base64," + base64.b64encode(data).decode(), ""
+
+    async def _remote_data_url(self, url: str) -> tuple[str, str]:
+        """远端图片 → data URL。大图落到临时文件，和本地图一样先缩再传。"""
+        data, mime, why = await vision_input.fetch_image(url)
+        if why:
+            return "", (
+                f"图片链接下载不下来（{why}），视觉模型拿不到这张图。链接可能过期了："
+                "有本地文件就传本地路径或资产 id"
+            )
+        if len(data) <= _SHRINK_OVER:
+            return vision_input.data_url(data, mime), ""
+        tmp = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="view_"))
+        try:
+            src = tmp / ("src" + (mimetypes.guess_extension(mime) or ".jpg"))
+            await asyncio.to_thread(src.write_bytes, data)
+            return await self._image_data_url(src)
+        finally:
+            await asyncio.to_thread(shutil.rmtree, tmp, True)
 
     async def _shrink(self, path: Path, width: int = 1600) -> bytes:
         """大图用 ffmpeg 缩一下再传，缩不了就原样传。"""

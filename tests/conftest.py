@@ -33,3 +33,17 @@ def _cwd_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     Agent.create 的默认产物目录取当前目录（default_root），所以装配层测试的产物也落在这里。
     """
     monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _no_net_vision_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试不连网：视觉检查前下载远端图片的那一步换成假的，给一张很小的 PNG（2026-09-29
+    审查 1.2）。之前没有本地副本的图把链接原样发给（假的）视觉模型，现在先下载再转 data URL ——
+    不换掉的话，用假链接的测试会真去连网。要测下载失败的，在用例里自己再 monkeypatch。
+    """
+    from aigc_agent.domain.media import vision_input
+
+    async def fake(url: str) -> tuple[bytes, str, str]:
+        return b"\x89PNG\r\n\x1a\n" + b"\0" * 8, "image/png", ""
+
+    monkeypatch.setattr(vision_input, "fetch_image", fake)

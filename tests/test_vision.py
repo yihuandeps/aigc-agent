@@ -57,7 +57,15 @@ async def test_看本地图片_dataURL_带问题(tmp_path: Path):
     assert parts[1]["image_url"]["detail"] == "high"
 
 
-async def test_看资产图片与链接图片(tmp_path: Path):
+async def test_看资产图片与链接图片(tmp_path: Path, monkeypatch):
+    from aigc_agent.domain.media import vision_input
+
+    async def fake_fetch(url: str) -> tuple[bytes, str, str]:
+        if url == "https://cdn/x.png":
+            return b"\x89PNG\r\n\x1a\nfake", "image/png", ""
+        return b"", "", "HTTP 404"
+
+    monkeypatch.setattr(vision_input, "fetch_image", fake_fetch)
     fns, store, out = _setup(tmp_path)
     (out / "p.jpg").write_bytes(b"jpg")
     a = store.create("", type_=AssetType.IMAGE, summary="主形象")
@@ -68,8 +76,13 @@ async def test_看资产图片与链接图片(tmp_path: Path):
     gw: FakeGateway = fns.gateway  # type: ignore[assignment]
     assert _parts(gw)[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert _parts(gw)[1]["image_url"]["detail"] == "low"
+    # 链接先下载再转 data URL（2026-09-29 审查 1.2：直接发链接，视觉模型多半拉不到）
     r = await fns.invoke("view_image", {"source": "https://cdn/x.png"})
-    assert r.ok and _parts(gw)[1]["image_url"]["url"] == "https://cdn/x.png"
+    assert r.ok and _parts(gw)[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    calls = len(gw.calls)
+    r = await fns.invoke("view_image", {"source": "https://cdn/gone.png"})
+    assert not r.ok and "下载不下来" in r.error and "HTTP 404" in r.error
+    assert len(gw.calls) == calls, "图拿不到就不调视觉模型"
     r = await fns.invoke("view_image", {"source": "as_nope"})
     assert not r.ok and "没有资产" in r.error
 
