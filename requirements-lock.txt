@@ -1,8 +1,8 @@
 # Known-good dependency versions (Python 3.11.9, Windows 11, 2026-10; full test suite passing).
 # Use it as a constraints file: it only pins versions and never installs extra packages.
 #   pip install -e ".[p1]" -c requirements-lock.txt
-# playwright (RPA) is not declared in pyproject; install it on demand:
-#   pip install playwright -c requirements-lock.txt
+# The optional groups (rpa, douyin, dev) are pinned here too, e.g. everything:
+#   pip install -e ".[p1,rpa,douyin,dev]" -c requirements-lock.txt
 # Keep this file ASCII-only: pip reads it with the locale encoding (GBK on Chinese Windows).
 
 annotated-doc==0.0.5
@@ -13,7 +13,6 @@ cffi==2.1.1
 click==8.5.0
 colorama==0.4.6
 cryptography==50.0.1
-fastapi==0.142.2
 greenlet==3.5.5
 grimp==3.17
 h11==0.16.0
@@ -25,6 +24,7 @@ iniconfig==2.3.0
 jiter==0.16.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
+Markdown==3.11
 markdown-it-py==4.2.0
 mcp==2.2.0
 mcp-types==2.2.0
@@ -38,14 +38,12 @@ pluggy==1.6.0
 prompt_toolkit==3.0.53
 pycparser==3.0
 pydantic==2.13.5
-pydantic-settings==2.15.0
 pydantic_core==2.46.5
 pyee==13.0.1
 Pygments==2.21.0
 PyJWT==2.13.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
-python-dotenv==1.2.3
 python-multipart==0.0.32
 pywin32==312; sys_platform == "win32"
 PyYAML==6.0.3
@@ -64,3 +62,4 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.52.4
 wcwidth==0.8.4
+yt-dlp==2026.8.19
