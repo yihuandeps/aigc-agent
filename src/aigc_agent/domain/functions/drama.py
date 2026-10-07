@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import hashlib
 import json
 import math
@@ -2606,10 +2605,8 @@ class DramaFunctions:
             # 人定的声音在本地永久存一份（2026-09-27）；存不成的当场说（存到哪在定音的问题里说过了）
             bad = [r for r in self._keep_anchor_files(keep) if r.startswith("⚠")]
             if bad and self.bus is not None:
-                with contextlib.suppress(RuntimeError):
-                    asyncio.get_running_loop().create_task(
-                        self.bus.emit(EventType.WARNING, message="定音：" + "；".join(bad))
-                    )
+                # 总线替任务留着引用：之前 create_task 不留引用，任务可能半路被回收（审查 1.9）
+                self.bus.emit_soon(EventType.WARNING, message="定音：" + "；".join(bad))
 
     async def registry_invoke(self, name: str, args: dict[str, Any]) -> Any:
         if self.registry is None:

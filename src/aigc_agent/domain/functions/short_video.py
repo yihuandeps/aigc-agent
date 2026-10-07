@@ -1291,7 +1291,7 @@ class ShortVideoFunctions:
         out_dir = (
             self.output.dir_for("videos")
             if self.output is not None and hasattr(self.output, "dir_for")
-            else (self.store.root or Path(".")) / "blobs"
+            else self.store.blob_dir
         )
         out = Path(out_dir) / f"{safe_name(a.summary or asset_id)}_镜{shot_no:02d}.mp4"
         # 多做 3 秒（全局快切上限）：排刀在素材里错开取，素材刚好等长时取不满、成片缩水、

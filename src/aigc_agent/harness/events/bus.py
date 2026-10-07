@@ -114,6 +114,9 @@ class EventBus:
         self.session_id = session_id or uuid.uuid4().hex[:8]
         self._handlers: list[Handler] = []
         self.history: list[Event] = []
+        # emit_soon 发出去、还没跑完的任务。事件循环对任务只持弱引用，这里不留一份的话
+        # 任务可能跑到一半被回收，事件就丢了
+        self._soon: set[asyncio.Task[Event]] = set()
 
     def subscribe(self, handler: Handler) -> None:
         self._handlers.append(handler)
@@ -129,6 +132,39 @@ class EventBus:
             except Exception:  # noqa: BLE001 — 事件总线不能因为某个订阅者崩溃而挂掉
                 pass
         return ev
+
+    def emit_soon(self, type_: EventType, **data: Any) -> asyncio.Task[Event] | None:
+        """同步代码里发事件、不等它发完：在当前运行的事件循环上建任务，引用留到跑完为止。
+
+        之前各处 `create_task(bus.emit(...))` 不留返回值 —— 事件循环对任务只持弱引用，
+        任务理论上可能中途被回收，资产事件就丢了、按集流水漏接（2026-09-29 审查 1.9）。
+
+        当前线程没有运行中的事件循环（纯同步上下文）就不发、返回 None —— 没有循环也没有
+        订阅者能消费。别的线程要发，先投回主循环：
+        `loop.call_soon_threadsafe(lambda: bus.emit_soon(...))`，任务就建在主循环上。
+
+        订阅者崩了 emit 里已经兜住；任务本身出错（比如事件类型不对）交给事件循环的异常处理
+        记一笔（CLI 里是打到终端的那份日志），不静默丢，也不会拖到任务被回收时才冒出一句
+        「Task exception was never retrieved」。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        task = loop.create_task(self.emit(type_, **data), name=f"emit_soon:{type_}")
+        self._soon.add(task)
+        task.add_done_callback(self._soon_done)
+        return task
+
+    def _soon_done(self, task: asyncio.Task[Event]) -> None:
+        self._soon.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()  # 取过就不会再报「never retrieved」
+        if exc is not None:
+            task.get_loop().call_exception_handler(
+                {"message": f"事件总线：{task.get_name()} 没发成", "exception": exc, "task": task}
+            )
 
     def total_cost(self) -> float:
         return sum(e.data.get("cost", 0.0) or 0.0 for e in self.history if e.type == EventType.COST)

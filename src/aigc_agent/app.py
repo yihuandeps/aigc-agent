@@ -544,12 +544,8 @@ class Agent:
                 return
 
     def _length_note(self, what: str) -> None:
-        with contextlib.suppress(RuntimeError):
-            asyncio.get_running_loop().create_task(
-                self.bus.emit(
-                    EventType.WARNING, message=f"这个项目的集长设为{what}，/length 可改"
-                )
-            )
+        # 总线回调是同步的：不等它发完（没有运行中的事件循环就不发）
+        self.bus.emit_soon(EventType.WARNING, message=f"这个项目的集长设为{what}，/length 可改")
 
     # ---------- 项目（缺口 A：产物目录 = 项目） ----------
 

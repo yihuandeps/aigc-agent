@@ -945,7 +945,7 @@ async def _chat(verbose: bool, role: str, session: str = "") -> None:
 
     def _on_stop(how: str) -> None:
         # 复盘时分得清是人停的（之前 /stop 不发任何事件）
-        asyncio.get_running_loop().create_task(agent.bus.emit(EventType.USER_STOP, how=how))
+        agent.bus.emit_soon(EventType.USER_STOP, how=how)
 
     hub.on_stop = _on_stop
     agent.bus.subscribe(make_renderer(verbose))

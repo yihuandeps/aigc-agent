@@ -14,9 +14,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import StrEnum
@@ -133,9 +136,27 @@ class AssetStore:
         # 自动往用户目录写一份可读的 .md —— 这里存的是系统记录（JSON），
         # 不是给人读的。
         self.mirror: Any = None
+        self._tmp_blobs: Path | None = None  # 没 root 时 blob_dir 用的临时目录（头一次用才建）
         if root:
             root.mkdir(parents=True, exist_ok=True)
             self._load()
+
+    @property
+    def blob_dir(self) -> Path:
+        """二进制产物（配音、下载回来的图/视频、图片转的镜头）落在哪 —— 全系统只认这一个出处。
+
+        有 root 就是 root/blobs；没 root 的内存库（测试、一次性脚本）用一个临时目录，
+        库被回收或进程退出时删掉。之前三处各拼 `(root or Path(".")) / "blobs"`，内存库的字节
+        就写进了当前目录 —— 跑测试时是仓库根目录的 blobs/，每跑一次全量测试重写一遍
+        （2026-09-29 审查 4.5）。
+        """
+        if self.root is not None:
+            return self.root / "blobs"
+        if self._tmp_blobs is None:
+            d = Path(tempfile.mkdtemp(prefix="aigc-blobs-"))
+            weakref.finalize(self, shutil.rmtree, d, ignore_errors=True)
+            self._tmp_blobs = d
+        return self._tmp_blobs
 
     def bind_loop(self) -> None:
         """记下当前事件循环（装配时在主循环里调）：线程里建的资产要往它上面发事件。"""
@@ -237,46 +258,34 @@ class AssetStore:
     def _emit_created(self, asset: Asset) -> None:
         """资产落库事件：按集流水管线靠它做环节间的实时交接。
 
-        fire-and-forget：put 是同步方法，事件用 create_task 发出，不阻塞落库；
-        没有运行中的事件循环（纯同步上下文）就跳过 —— 没有循环也没有订阅者能消费。
-        create_blob 会 put 两次（入库、补 uri），同一 id 来两条事件，
-        消费方必须按 id 幂等。
+        fire-and-forget：put 是同步方法，事件用 bus.emit_soon 发出（总线留着任务引用，
+        跑完才放），不阻塞落库；没有运行中的事件循环（纯同步上下文）就跳过 ——
+        没有循环也没有订阅者能消费。create_blob 会 put 两次（入库、补 uri），
+        同一 id 来两条事件，消费方必须按 id 幂等。
         """
         if self.bus is None:
             return
+        # 载荷当场拍快照：事件晚一拍才发，到时资产可能又被改过（create_blob 补 uri）
+        snapshot = dict(
+            id=asset.id, type=asset.type.value, summary=asset.summary,
+            gen_params=dict(asset.gen_params), parent_ids=list(asset.parent_ids),
+            seq=asset.seq, project=asset.project, status=asset.status.value,
+            creator=asset.creator,
+        )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # 在线程里建的（fs_import 走 to_thread）：之前事件直接丢了，按集流水漏接这批资产。
-            # 投回主事件循环去发（2026-09-23 审查）
+            # 投回主事件循环去发（2026-09-23 审查）：回调在主循环上跑，任务也就建在主循环上
             main = self._loop
             if main is None or main.is_closed():
                 return
-            snapshot = dict(
-                id=asset.id, type=asset.type.value, summary=asset.summary,
-                gen_params=dict(asset.gen_params), parent_ids=list(asset.parent_ids),
-                seq=asset.seq, project=asset.project, status=asset.status.value,
-                creator=asset.creator,
-            )
             main.call_soon_threadsafe(
-                lambda: main.create_task(self.bus.emit(EventType.ASSET_CREATED, **snapshot))
+                lambda: self.bus.emit_soon(EventType.ASSET_CREATED, **snapshot)
             )
             return
         self._loop = loop  # 记住主循环，线程里建资产时往这里投
-        loop.create_task(
-            self.bus.emit(
-                EventType.ASSET_CREATED,
-                id=asset.id,
-                type=asset.type.value,
-                summary=asset.summary,
-                gen_params=dict(asset.gen_params),
-                parent_ids=list(asset.parent_ids),
-                seq=asset.seq,
-                project=asset.project,
-                status=asset.status.value,
-                creator=asset.creator,
-            )
-        )
+        self.bus.emit_soon(EventType.ASSET_CREATED, **snapshot)
 
     def _mirror_text(self, asset: Asset) -> None:
         """文本类资产往用户产物目录写一份可读的 .md（纯内容，不带元数据）。
@@ -340,7 +349,7 @@ class AssetStore:
     ) -> Asset:
         """存二进制产物（TTS 音频、下载回来的图/视频）。
 
-        文件落到 blobs/ 下，Asset 只记路径 —— 上下文里永远不出现字节。
+        文件落到 blob_dir 下，Asset 只记路径 —— 上下文里永远不出现字节。
         """
         asset = Asset(
             type=type_,
@@ -351,7 +360,7 @@ class AssetStore:
             gen_params=gen_params or {},
         )
         self.put(asset)  # 先入库拿到 seq
-        blob_dir = (self.root or Path(".")) / "blobs"
+        blob_dir = self.blob_dir
         blob_dir.mkdir(parents=True, exist_ok=True)
         path = blob_dir / f"{asset.id}{ext if ext.startswith('.') else '.' + ext}"
         path.write_bytes(data)

@@ -16,6 +16,20 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _TMP_WORKSPACE = Path(tempfile.mkdtemp(prefix="aigc-test-ws-"))
 os.environ["AIGC_WORKSPACE"] = str(_TMP_WORKSPACE)
 atexit.register(shutil.rmtree, _TMP_WORKSPACE, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _cwd_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """兜底：每个测试都在自己的临时目录里跑（2026-09-29 审查 4.5）。
+
+    当前目录默认是仓库根目录，哪段代码按相对路径写当前目录，就写进了仓库 ——
+    没传 root 的资产库往 ./blobs 写，blobs/板卡照片_镜02.mp4 每跑一次全量测试被重写一遍。
+    读 config/、skills/ 的地方都按 PROJECT_ROOT / __file__ 走绝对路径，不受影响。
+    Agent.create 的默认产物目录取当前目录（default_root），所以装配层测试的产物也落在这里。
+    """
+    monkeypatch.chdir(tmp_path)

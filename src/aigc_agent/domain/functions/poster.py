@@ -173,8 +173,7 @@ class PosterFunctions:
         uri = a.uri or ""
         if uri.startswith(("http://", "https://")):
             ext = Path(urlparse(uri).path).suffix.lower()
-            target = (self.assets.root or Path(".")) / "blobs"
-            target = target / f"{a.id}{ext if ext in _IMAGE_EXT else '.png'}"
+            target = self.assets.blob_dir / f"{a.id}{ext if ext in _IMAGE_EXT else '.png'}"
             ok, err = await download(uri, target)
             if not ok:
                 raise RuntimeError(
