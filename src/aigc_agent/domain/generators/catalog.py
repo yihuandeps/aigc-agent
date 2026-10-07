@@ -56,7 +56,9 @@ class Voice(BaseModel):
     note: str = ""
 
     def brief(self) -> str:
-        return f"{self.name}（{self.lang}）：{self.note}"
+        # MiniMax 的音色没填 lang，别留一对空括号
+        lang = f"（{self.lang}）" if self.lang else ""
+        return f"{self.name}{lang}：{self.note}"
 
 
 class AudioModel(MediaModel):
@@ -217,22 +219,38 @@ class MediaCatalog(BaseModel):
         return any(v.name == name for v in self.speech_voices)
 
     def render_audio(self) -> str:
+        """list_voices 给模型看的语音目录。音色只列**当前 TTS provider** 那一套，和
+        has_voice 校验用的是同一张表，每节标出走哪家。
+
+        2026-09-29 审查：之前这里列的是 voices（OpenAI 那套）、默认 nova，而 TTS 实际走
+        MiniMax、tts 只认 speech_voices —— 9-23 模型照着目录传了 nova，被拒。
+        """
         nl = "\n"
         parts: list[str] = []
+        speech = self.speech_provider
 
         tts = self.audio_models("tts")
         if tts:
-            parts.append("## TTS 模型" + nl + nl.join(f"- {m.brief()}" for m in tts))
+            parts.append(
+                f"## TTS 模型（走 {speech}）" + nl + nl.join(f"- {m.brief()}" for m in tts)
+            )
 
-        if self.voices:
-            block = "## 音色" + nl + nl.join(f"- {v.brief()}" for v in self.voices)
-            if self.default_voice:
-                block += nl + f"默认：{self.default_voice}"
+        voices = self.speech_voices
+        if voices:
+            block = (
+                f"## 音色（{speech} 的，tts 的 voice 只认下面这些 id）"
+                + nl
+                + nl.join(f"- {v.brief()}" for v in voices)
+            )
+            if self.speech_default_voice:
+                block += nl + f"默认：{self.speech_default_voice}"
             parts.append(block)
 
         asr = self.audio_models("asr")
         if asr:
-            parts.append("## 转写模型" + nl + nl.join(f"- {m.brief()}" for m in asr))
+            parts.append(
+                f"## 转写模型（走 {self.provider}）" + nl + nl.join(f"- {m.brief()}" for m in asr)
+            )
 
         return (nl + nl).join(parts) or "语音目录为空"
 

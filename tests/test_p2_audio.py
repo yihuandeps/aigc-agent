@@ -88,9 +88,13 @@ def test_tts与asr分别选型互不干扰():
 
 
 def test_目录渲染包含音色说明():
-    text = MediaCatalog.load(CATALOG_PATH).render_audio()
+    c = MediaCatalog.load(CATALOG_PATH)
+    text = c.render_audio()
     assert "## TTS 模型" in text and "## 音色" in text and "## 转写模型" in text
-    assert "onyx" in text and "默认：nova" in text
+    # 音色只列当前 TTS provider 那一套（2026-09-29：这里原来断言 onyx / 默认 nova ——
+    # 把 bug 锁死了：TTS 走 MiniMax，tts 只认 speech_voices，模型照着目录传 nova 被拒）
+    assert all(v.name in text for v in c.speech_voices)
+    assert f"默认：{c.speech_default_voice}" in text
 
 
 async def test_三个function注册且权限正确(tmp_path: Path):

@@ -75,7 +75,13 @@ class AudioFunctions:
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "要念的文本，≤4096 字"},
-                    "voice": {"type": "string", "description": "音色名，见 list_voices"},
+                    "voice": {
+                        "type": "string",
+                        "description": (
+                            "音色 id，照 list_voices 列的填（只认当前 TTS provider 那一套）；"
+                            "留空用默认"
+                        ),
+                    },
                     "model": {"type": "string", "description": "留空则用默认 TTS 模型"},
                     "language": {"type": "string", "description": "如 Chinese / English / Auto"},
                     "speed": {"type": "number", "description": "0.5-2.0，默认 1.0"},
@@ -131,8 +137,13 @@ class AudioFunctions:
         return self._specs[tool].to_openai(tool)
 
     async def health(self) -> ProviderHealth:
+        # 数当前 provider 能用的（2026-09-29 审查：之前数的是 voices 那套 OpenAI 音色和全部
+        # 模型，TTS 换到 MiniMax 之后就对不上了）
+        c = self.catalog
+        models = len(c.audio_models("tts")) + len(c.audio_models("asr"))
         return ProviderHealth(
-            ok=True, detail=f"{len(self.catalog.voices)} 个音色 / {len(self.catalog.audio)} 个模型"
+            ok=True,
+            detail=f"TTS 走 {c.speech_provider}：{len(c.speech_voices)} 个音色 / {models} 个模型",
         )
 
     async def invoke(self, tool: str, args: dict[str, Any]) -> ToolResult:
@@ -168,7 +179,13 @@ class AudioFunctions:
         picked_voice = voice or self.catalog.speech_default_voice
         if voice and not self.catalog.has_voice(voice):
             names = ", ".join(v.name for v in self.catalog.speech_voices)
-            return ToolResult(ok=False, error=f"未知音色 {voice!r}。可用：{names}")
+            return ToolResult(
+                ok=False,
+                error=(
+                    f"未知音色 {voice!r}：TTS 现在走 {self.catalog.speech_provider}，只认它家的音色"
+                    f"（换过 provider 音色名整套都换了，别家的名字这里用不了）。可用：{names}"
+                ),
+            )
 
         r = await self.gateway.speak(
             self.catalog.speech_provider,
