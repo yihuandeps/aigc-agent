@@ -240,6 +240,16 @@ class ToolRegistry:
                 est = None
             if est:
                 update["estimate"] = dict(est)
+        # 超时按参数放宽：批量渲染要生成多少张事先数得出来，写死的超时撞上就是已付费的白丢
+        # （2026-09-29 审查 1.4）。只放宽、不收紧
+        to_hook = getattr(provider, "timeout_for", None)
+        if to_hook is not None:
+            try:
+                t = to_hook(orig, args)
+            except Exception:  # noqa: BLE001 — 钩子出错按目录里的超时走
+                t = None
+            if t and t > (meta.timeout or 0):
+                update["timeout"] = float(t)
         hook = getattr(provider, "permission_for", None)
         raised = None
         if hook is not None:

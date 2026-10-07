@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import math
@@ -183,6 +184,25 @@ async def _run_parallel(items: list[Any], fn: Any, limit: int) -> list[Any]:
     return await asyncio.gather(*(one(it) for it in items))
 
 
+# drama_render_assets 的 only → 要生成哪几类（服装依赖主形象，要服装就连带主形象）
+_RENDER_ONLY: dict[str, set[str]] = {
+    "all": {"characters", "costumes", "scenes", "props"},
+    "characters": {"characters"},
+    "costumes": {"characters", "costumes"},
+    "scenes": {"scenes"},
+    "props": {"props"},
+}
+# 渲参考图的超时按张数给（2026-09-29 审查 1.4）：9-21 实测 58 张 1843 秒、约 32 秒一张，
+# 每张按 60 秒给，留出质检重生成的余量；不少于工具声明的 1 小时
+_RENDER_ASSETS_PER_IMAGE_S = 60.0
+
+
+def _batch_key(messages: list[dict[str, Any]]) -> str:
+    """一批的输入指纹：发给模型的完整消息一样，上次出好的结果就能沿用。"""
+    raw = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
 class DramaFunctions:
     name = "drama"
     namespaced = False
@@ -222,6 +242,8 @@ class DramaFunctions:
         # 镜头超 3 秒拦不拦成片（项目设置，/cut，2026-09-27 用户定的：先只标 ⚠，第 1 集看过
         # 检测准不准再定）。True = 超了自动重生成、仍超 ⛔ 不进成片
         self.cut_block = False
+        # 做到一半的进度（分批出的提示词、渲好的参考图）：(类别, 键) → 内容，见 _scratch_*
+        self._scratch: dict[tuple[str, str], Any] = {}
         self._specs: dict[str, ToolSpec] = {}
         self._build()
 
@@ -231,6 +253,48 @@ class DramaFunctions:
             await self.bus.emit(
                 EventType.BATCH_PROGRESS, stage=stage, done=done, total=total, item=item
             )
+
+    # ---------- 做到一半的进度：下次接着用，不重付（2026-09-29 审查 1.4、2.4） ----------
+    # 分批出提示词一批失败、渲参考图撞上超时 / 被 /stop，之前已经付过钱的那部分全丢，重跑全部
+    # 重付。这里按 (类别, 键) 记下做完的部分：内存一份；资产库有目录时再落一份 JSON，换了会话
+    # 也接得上。不进资产库：半成品进了库，流水线会当成「参考图渲完了」去渲视频。
+
+    def _scratch_file(self, kind: str, key: str) -> Path | None:
+        root = getattr(self.store, "root", None)
+        return Path(root) / "progress" / kind / f"{key}.json" if root else None
+
+    def _scratch_load(self, kind: str, key: str) -> Any:
+        if (kind, key) in self._scratch:
+            return self._scratch[(kind, key)]
+        p = self._scratch_file(kind, key)
+        if p is None:
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        self._scratch[(kind, key)] = data
+        return data
+
+    def _scratch_save(self, kind: str, key: str, data: Any) -> None:
+        self._scratch[(kind, key)] = data
+        p = self._scratch_file(kind, key)
+        if p is None:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(p)
+        except OSError:
+            pass  # 落不了盘只是换了会话接不上，这次照常
+
+    def _scratch_drop(self, kind: str, key: str) -> None:
+        self._scratch.pop((kind, key), None)
+        p = self._scratch_file(kind, key)
+        if p is not None:
+            with contextlib.suppress(OSError):
+                p.unlink(missing_ok=True)
 
     def _build(self) -> None:
         self._specs["drama_intake"] = ToolSpec(
@@ -2654,6 +2718,32 @@ class DramaFunctions:
         r.duration_ms = int((time.perf_counter() - started) * 1000)
         return r
 
+    def timeout_for(self, tool: str, args: dict[str, Any]) -> float | None:
+        """这一次调用的超时按参数放宽（注册表的钩子）。只管渲参考图：张数事先数得出来。
+
+        2026-09-29 审查 1.4：工具超时写死 1 小时，《不渡》174 张按实测速度要 50–90 分钟。
+        按资产库里要生成的张数给（上限估计：不扣复用的），不少于工具声明的超时。"""
+        if tool != "drama_render_assets":
+            return None
+        try:
+            lib, err = parse_assets(self.store.content(str(args.get("assets_id") or "")))
+        except KeyError:
+            return None
+        if err or lib is None:
+            return None
+        want = _RENDER_ONLY.get(str(args.get("only") or "all"), _RENDER_ONLY["all"])
+        n = 0
+        if "characters" in want:
+            n += len(lib.characters)
+        if "costumes" in want:
+            n += sum(len(c.costumes) for c in lib.characters)
+        if "scenes" in want:
+            n += len(lib.scenes)
+        if "props" in want:
+            n += len(lib.props)
+        base = self._specs["drama_render_assets"].timeout
+        return max(base, _RENDER_ASSETS_PER_IMAGE_S * n)
+
 
     # ---------- 入口判断：想法 还是 剧本 ----------
 
@@ -3286,12 +3376,20 @@ class DramaFunctions:
         note_fmt = self.fmt
         # 分镜从哪份剧本拆的：分镜里丢了的上屏字（字幕卡）按剧本补回来（2026-09-26）
         script_of = self._storyboard_script(storyboard_id)
+        # 各批的输入指纹：出好的批先存着，这次没成、再跑只补没出好的（2026-09-29 审查 2.4）
+        batch_keys: list[str] = []
         for e in eps:
             script = script_of.get(e.index) or (script_of.get(0, "") if len(eps) == 1 else "")
             got, probs, err, info, n_chunks, used = await self._episode_shots(
-                e, lib, opts, note, script
+                e, lib, opts, note, script, batch_keys=batch_keys
             )
             if err:
+                kept = sum(1 for k in set(batch_keys) if self._scratch_load("shots", k))
+                if kept:
+                    err += (
+                        f"\n\n已经出好的 {kept} 批提示词先存着：参数不变再跑一次 drama_shots，"
+                        "只补没出好的，出好的不重付"
+                    )
                 return ToolResult(ok=False, error=err)
             shots += got
             problems += probs
@@ -3341,6 +3439,9 @@ class DramaFunctions:
             creator="tool:drama_shots",
             gen_params=gp,
         )
+        # 整份落库了，各批的半成品不用再留：之后再跑是要重出，不该拿到原样的旧结果
+        for k in set(batch_keys):
+            self._scratch_drop("shots", k)
         lines = []
         for s in shots:
             carry = f"　引入 {'/'.join(s.carries())}" if s.carries() else ""
@@ -3504,11 +3605,17 @@ class DramaFunctions:
         return ""
 
     async def _episode_shots(
-        self, e: Any, lib: Any, opts: Any, note: str, script: str = ""
+        self,
+        e: Any,
+        lib: Any,
+        opts: Any,
+        note: str,
+        script: str = "",
+        batch_keys: list[str] | None = None,
     ) -> tuple[list[Any], list[str], str, str, int, EpisodeFormat]:
         """一集的视频提示词：分镜太长就按场分批并行生成，漏掉的镜头补写一次，最后按集检查。
         分镜里的上屏字（字幕卡）不给模型看、排进 screen_text 成片后叠；script 给了就把分镜
-        丢掉的卡按剧本补回来。
+        丢掉的卡按剧本补回来。batch_keys 给了就把各批的输入指纹记进去（调用方落库后清缓存）。
 
         返回 (提示词, 规格问题, 错误, 给人看的说明, 分了几批, 检查用的规格)。
         """
@@ -3539,7 +3646,7 @@ class DramaFunctions:
             *(
                 self._chunk_shots(
                     e, g, k, len(groups), lib, opts, note, secs_by_no, target, faithful,
-                    strip=card_texts,
+                    strip=card_texts, used=batch_keys,
                 )
                 for k, g in enumerate(groups)
             ),
@@ -3549,7 +3656,12 @@ class DramaFunctions:
         softened = 0
         for r in results:
             if isinstance(r, BaseException):
-                raise r
+                if not isinstance(r, Exception):
+                    raise r  # /stop、超时的取消照样往上抛
+                # 出好的批已经各自存下了（_chunk_shots），这里如实报是哪一类错
+                return [], [], (
+                    f"{e.title} 有一批视频提示词调用失败（{type(r).__name__}: {str(r)[:200]}）"
+                ), "", len(groups), fmt
             got, err, soft = r
             softened += soft
             if err:
@@ -3564,7 +3676,7 @@ class DramaFunctions:
             touched = [b for b in blocks if any(b.first <= n <= b.last for n in keep)]
             got, fill_err, soft = await self._chunk_shots(
                 e, touched, -1, len(groups), lib, opts, note, secs_by_no, target, faithful,
-                keep=keep, strip=card_texts,
+                keep=keep, strip=card_texts, used=batch_keys,
             )
             softened += soft
             if not fill_err:
@@ -3636,9 +3748,11 @@ class DramaFunctions:
         faithful: bool,
         keep: set[int] | None = None,
         strip: list[str] | None = None,
+        used: list[str] | None = None,
     ) -> tuple[list[Any], str, bool]:
         """一批（或补写）的视频提示词：一次模型调用，这一批自己不合格就改一次。
         分镜里的上屏字（字幕卡）先剥掉再给模型看 —— 画面里不许有字，字卡成片后叠。
+        出好的批按输入指纹存一份，同样的输入再跑直接沿用（used 给了就把指纹记进去）。
         返回 (提示词, 错误, 被内容过滤拦过又自动重试通过了没有)。"""
         text = strip_cards("\n".join(b.text for b in group), strip)
         if keep is not None:
@@ -3681,6 +3795,16 @@ class DramaFunctions:
             },
             {"role": "user", "content": user},
         ]
+        # 同一批上次出好了、只是别的批失败了：直接沿用，不再付一次（2026-09-29 审查 2.4：
+        # 之前任一批失败，已经成功的批全部丢掉，重跑整集重付，日志里白付了 21 次调用）
+        key = _batch_key(messages)
+        if used is not None:
+            used.append(key)
+        hit = self._scratch_load("shots", key)
+        if isinstance(hit, dict) and hit.get("shots"):
+            cached, err = parse_shots(json.dumps(hit["shots"], ensure_ascii=False))
+            if not err:
+                return cached, "", bool(hit.get("softened"))
         resp, softened = await self._chat_soft(messages)
         stop = _finish_problem(resp, "视频提示词")
         if stop:
@@ -3709,6 +3833,9 @@ class DramaFunctions:
                 after = (len(coverage_gaps(shots2, nums)), len(problems2))
                 if after < before:
                     shots = shots2
+        self._scratch_save(
+            "shots", key, {"shots": [as_dict(s) for s in shots], "softened": softened}
+        )
         return shots, "", softened
 
     async def _chat_soft(self, messages: list[dict[str, Any]]) -> tuple[Any, bool]:
@@ -4112,13 +4239,7 @@ class DramaFunctions:
         # 四类图、两层依赖（2026-09-22 去掉了三视图层）：
         #   主形象（3:4 证件照，脸）→ 各场景服装（参考主形象保脸，纯白底单张全身）
         #   场景 / 道具 无依赖，和主形象同层
-        want = {
-            "all": {"characters", "costumes", "scenes", "props"},
-            "characters": {"characters"},
-            "costumes": {"characters", "costumes"},  # 服装依赖主形象
-            "scenes": {"scenes"},
-            "props": {"props"},
-        }.get(only, {"characters", "costumes", "scenes", "props"})
+        want = _RENDER_ONLY.get(only, _RENDER_ONLY["all"])
         # 本地文件名：类别-序号_名字，按资产库原序编号，后期按名字就能排
         names = library_reference_names(lib)
 
@@ -4131,6 +4252,14 @@ class DramaFunctions:
         # 这套库自己没渲过包的（增量补新集 / 整份重做出的新一版）：沿血缘拿上一版的包，
         # 名字和描述都没变的图接着用，描述改了的重生成（2026-09-26）
         prev_id, prev, desc_changed = self._inherited_pack(assets_id, lib)
+        # 上次渲到一半断了（超时 / /stop / 关了窗口）：出好的图记在进度里，这次接着用、不重付
+        # （2026-09-29 审查 1.4：之前要到整批渲完才落包，一超时已付费的图不进任何包，重跑全部
+        # 重付）。进度按资产库 id 记，资产库内容不会变，名字对上就是同一个条目
+        resumed_from = self._scratch_load("refpack", assets_id)
+        if not isinstance(resumed_from, dict):
+            resumed_from = {}
+        if resumed_from:
+            prev = {**prev, **{k: dict(v) for k, v in resumed_from.items() if isinstance(v, dict)}}
         images: dict[str, dict[str, str]] = {}
         reused: list[str] = []
         failed: list[str] = []
@@ -4144,6 +4273,12 @@ class DramaFunctions:
                 reused.append(name)
                 return True
             return False
+
+        def remember(name: str, entry: dict[str, str]) -> None:
+            """出好一张就记进进度（不进资产库：半成品包会被流水线当成渲完了去渲视频）。"""
+            so_far = dict(self._scratch_load("refpack", assets_id) or {})
+            so_far[name] = entry
+            self._scratch_save("refpack", assets_id, so_far)
 
         # 并发 + 依赖排队（用户 2026-09-17 定的顺序约束）：
         # **所有无前置依赖的图（角色/场景/道具）全部生成完成后**，
@@ -4226,16 +4361,19 @@ class DramaFunctions:
             await self._progress("渲染参考图", done, total, f"{label}·{name}")
             return r
 
+        async def one_a(p: tuple[str, str, str, str, bool]) -> Any:
+            r = await gen_tracked(
+                p[0], p[1], p[2], p[3], f"{p[0]}·{p[1]}",
+                person=p[4], local_name=names.get(p[1], ""),
+            )
+            aid, url, e = r
+            if not e:
+                remember(p[1], {"asset": aid, "url": url, "kind": p[0]})
+            return r
+
         await self._progress("渲染参考图", 0, total)
         with batch_scope(bp):
-            res_a = await _run_parallel(
-                phase_a,
-                lambda p: gen_tracked(
-                    p[0], p[1], p[2], p[3], f"{p[0]}·{p[1]}",
-                    person=p[4], local_name=names.get(p[1], ""),
-                ),
-                limit,
-            )
+            res_a = await _run_parallel(phase_a, one_a, limit)
         for (label, name, *_), (aid, url, e) in zip(phase_a, res_a, strict=True):
             if e:
                 failed.append(f"{label} {name}：{e[:70]}")
@@ -4263,15 +4401,24 @@ class DramaFunctions:
                     cos.name, cos.prompt(), [portrait], str(face.get("asset") or ""),
                     is_minor(c.body),
                 ))
-            with batch_scope(bp):
-                res_b = await _run_parallel(
-                    phase_b,
-                    lambda p: gen_tracked(
-                        "服装", p[0], p[1], "16:9", f"服装·{p[0]}",
-                        ref=p[2], person=True, local_name=names.get(p[0], ""), minor=p[4],
-                    ),
-                    limit,
+            async def one_b(p: tuple[str, str, list[str], str, bool]) -> Any:
+                r = await gen_tracked(
+                    "服装", p[0], p[1], "16:9", f"服装·{p[0]}",
+                    ref=p[2], person=True, local_name=names.get(p[0], ""), minor=p[4],
                 )
+                aid, url, e = r
+                verdict = next(
+                    (x.get("identity") or {} for x in gate_log
+                     if isinstance(x, dict) and x.get("asset") == aid),
+                    {},
+                )
+                # 和主形象不像的不记（下面也不进包），其余的出好一张记一张
+                if not e and verdict.get("pass") is not False:
+                    remember(p[0], {"asset": aid, "url": url, "kind": "服装", "portrait": p[3]})
+                return r
+
+            with batch_scope(bp):
+                res_b = await _run_parallel(phase_b, one_b, limit)
             idcheck = {
                 str(x.get("asset")): x.get("identity") or {}
                 for x in gate_log if isinstance(x, dict) and x.get("asset")
@@ -4364,10 +4511,14 @@ class DramaFunctions:
                 "realism_checked": len(by_asset),
             },
         )
+        # 整批落进包里了，进度不用再留
+        self._scratch_drop("refpack", assets_id)
 
         fresh = len(images) - len(reused)
+        resumed = [n for n in reused if n in resumed_from]
         head = (
             f"参考图包共 {len(merged)} 张（本次新生成 {fresh}，复用 {len(reused)}"
+            + (f"，其中 {len(resumed)} 张是上次渲到一半留下的、接着用没重付" if resumed else "")
             + (f"，沿用上一个包 {len(kept)}" if kept else "")
             + "）：\n"
         )
