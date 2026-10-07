@@ -14,6 +14,7 @@ from rich.panel import Panel
 
 from ...domain.rpa.browser import (
     BrowserSession,
+    BrowserUnavailable,
     have_playwright,
     is_logged_in,
     system_browser,
@@ -60,36 +61,45 @@ async def _login(site: str, wait: int) -> None:
         )
     )
 
-    async with BrowserSession(profile) as s:
-        await s.goto(url, settle_ms=3000)
-        t0 = time.perf_counter()
-        was_login_wall = False
-        last = ""
+    try:
+        async with BrowserSession(profile) as s:
+            await _wait_login(s, site, name, url, wait)
+    except BrowserUnavailable as e:
+        # 浏览器目录被另一个窗口占着 / 起不来：消息本身就是人话，不甩 traceback（09-29 审查 1.5）
+        console.print(f"[red]✗ {e}[/]")
+        raise typer.Exit(1) from None
 
-        while time.perf_counter() - t0 < wait:
-            ok, why = await is_logged_in(s, site)
-            was_login_wall = was_login_wall or not ok
-            state = ("已登录 — " if ok else "等待登录 — ") + why
-            if state != last:
-                console.print(f"  [dim]{int(time.perf_counter() - t0):3}s  {state}[/]")
-                last = state
 
-            if ok:
-                # 连续两次确认，避免页面还没渲染完就误判
-                await asyncio.sleep(4)
-                again, _ = await is_logged_in(s, site)
-                if again:
-                    console.print(
-                        f"\n[green]✓ {name} 已登录[/]（用时 {time.perf_counter() - t0:.0f}s）"
-                    )
-                    console.print("[dim]登录态已保存，现在可以跑采集了：[/]")
-                    console.print(f'  agent rpa collect --site {site} --keyword "关键词"')
-                    return
-            await asyncio.sleep(3)
+async def _wait_login(s: BrowserSession, site: str, name: str, url: str, wait: int) -> None:
+    await s.goto(url, settle_ms=3000)
+    t0 = time.perf_counter()
+    was_login_wall = False
+    last = ""
 
-        console.print(f"\n[yellow]等了 {wait}s 还没检测到登录[/]")
-        if not was_login_wall:
-            console.print("[dim]（页面上没出现登录提示，可能本来就登录着，直接试采集看看）[/]")
+    while time.perf_counter() - t0 < wait:
+        ok, why = await is_logged_in(s, site)
+        was_login_wall = was_login_wall or not ok
+        state = ("已登录 — " if ok else "等待登录 — ") + why
+        if state != last:
+            console.print(f"  [dim]{int(time.perf_counter() - t0):3}s  {state}[/]")
+            last = state
+
+        if ok:
+            # 连续两次确认，避免页面还没渲染完就误判
+            await asyncio.sleep(4)
+            again, _ = await is_logged_in(s, site)
+            if again:
+                console.print(
+                    f"\n[green]✓ {name} 已登录[/]（用时 {time.perf_counter() - t0:.0f}s）"
+                )
+                console.print("[dim]登录态已保存，现在可以跑采集了：[/]")
+                console.print(f'  agent rpa collect --site {site} --keyword "关键词"')
+                return
+        await asyncio.sleep(3)
+
+    console.print(f"\n[yellow]等了 {wait}s 还没检测到登录[/]")
+    if not was_login_wall:
+        console.print("[dim]（页面上没出现登录提示，可能本来就登录着，直接试采集看看）[/]")
 
 
 @app.command()

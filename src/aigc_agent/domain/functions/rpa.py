@@ -23,10 +23,22 @@ from ...harness.tools.provider import (
     ToolSpec,
 )
 from ..assets.store import AssetStore, AssetType
-from ..rpa.browser import BrowserSession, have_playwright
+from ..rpa.browser import QUEUE_WAIT, BrowserSession, BrowserUnavailable, have_playwright
 from ..rpa.collectors import collect_douyin_hot, collect_xiaohongshu
 from ..rpa.humanize import load_pace
 from ..rpa.interact import browse_and_capture, grant_clipboard
+
+# 调度超时：同一进程的 RPA 调用按浏览器目录排队（最多等 QUEUE_WAIT），轮到之后单次采集
+# 按 config/rpa.yaml 最多再跑 8–10 分钟。不给够，排在后面的会被调度器判超时，
+# 报的还是「生成任务可能仍在服务端计费」那句，和浏览器八竿子打不着（2026-09-29 审查 1.5）
+RPA_TIMEOUT = QUEUE_WAIT + 900
+
+# 采集中途浏览器没了（窗口被手动关掉、浏览器崩了）：playwright 抛 TargetClosedError，
+# 原样甩给模型它会说成「环境配置问题」
+_CLOSED_MIDWAY = (
+    "浏览器窗口在采集中途被关掉了（手动关了窗口，或者浏览器崩了），这次没抓完。"
+    "不是环境配置问题：再调一次就行，采集时别关那个浏览器窗口。"
+)
 
 
 class RpaFunctions:
@@ -45,6 +57,7 @@ class RpaFunctions:
                 name="browse_and_copy",
                 summary="真实点开内容、复制分享链接、抓详情（不走任何数据接口）",
                 permission=PermissionLevel.EXTERNAL,
+                timeout=RPA_TIMEOUT,
                 description=(
                     "**全程真实点击**：打开列表 → 逐个点进详情 → 点分享 → 复制链接 → 退回。\n"
                     "同时抓详情页上肉眼可见的互动数据和热评，所以**不依赖任何数据接口**。\n"
@@ -77,6 +90,7 @@ class RpaFunctions:
                 name="xhs_collect",
                 summary="只读小红书列表卡片（快，但没有详情和分享链接）",
                 permission=PermissionLevel.EXTERNAL,
+                timeout=RPA_TIMEOUT,
                 description=(
                     "只抠列表页的标题/作者/赞数，**不点进去**，所以快。\n"
                     "要分享链接和详情数据请用 browse_and_copy。"
@@ -99,6 +113,7 @@ class RpaFunctions:
                 name="douyin_hot_rpa",
                 summary="用浏览器抓抖音热榜页词条（全站热榜；带 keyword 只保留相关的）",
                 permission=PermissionLevel.EXTERNAL,
+                timeout=RPA_TIMEOUT,
                 description=(
                     "只读热榜词条，是**全站热榜**，不按关键词搜 —— "
                     "带 keyword 时只保留和它相关的条目，"
@@ -136,8 +151,12 @@ class RpaFunctions:
         started = time.perf_counter()
         try:
             r = await getattr(self, f"_fn_{tool}")(**args)
+        except BrowserUnavailable as e:
+            # 浏览器目录被占 / 排不上 / 起不来：消息本来就是人话，原样给模型
+            r = ToolResult(ok=False, error=str(e))
         except Exception as e:  # noqa: BLE001
-            r = ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
+            closed = type(e).__name__ == "TargetClosedError"
+            r = ToolResult(ok=False, error=_CLOSED_MIDWAY if closed else f"{type(e).__name__}: {e}")
         r.duration_ms = int((time.perf_counter() - started) * 1000)
         return r
 
