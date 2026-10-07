@@ -5,7 +5,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-1401%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-1486%20passed-brightgreen)
 
 它由两部分组成：一个**自己写的 Agent 运行时**（harness：主循环、上下文管理、工具运行时、权限闸门、成本护栏、事件流，没有用 LangChain 之类的框架），加上**长在它上面的内容生产领域层**（短剧、短视频、广告、海报的 40 多个工具）。内核不认识「短剧」「抖音」，领域能力全部以工具（function）、方法论文档（skill）和可选流程图（graph）的形式挂上去。
 
@@ -196,7 +196,7 @@ src/aigc_agent/
   capabilities/    L1 能力：Skill Hub、记忆、MCP Hub、子代理、检索
   domain/          L2 领域：内容工具、资产、短剧、流水线、媒体、机审、分发、数据回流
   interfaces/      L3 入口：agent 命令行、自带的 MCP Server
-tests/             1401 个测试（含真 ffmpeg、真 MCP stdio）
+tests/             1486 个测试（含真 ffmpeg、真 MCP stdio）
 scripts/           辅助脚本（如从上游生成 seedance skill）
 ```
 
